@@ -31,6 +31,19 @@ flowchart TD
 
 ---
 
+## 📚 User Documentation & Usage Guides
+
+Comprehensive step-by-step guides, code recipes, and tutorials are available in the [**`docs/`**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/README.md) directory:
+
+- [**01. Prompt Customization Guide**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/01_prompt_customization.md) — In-memory string/dict overrides, YAML templates, guidelines, and system prompts.
+- [**02. Jupyter Notebook Guide**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/02_jupyter_notebooks.md) — Interactive workflows, in-cell Pydantic schemas, Pandas DataFrames, and dry-run previews.
+- [**03. Python Package API Reference**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/03_python_package_usage.md) — Complete Python SDK reference for `PrismPipeline`, `SchemaMappingPipeline`, chunkers, and parsers.
+- [**04. Standalone & CLI Reference**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/04_standalone_and_cli.md) — Standalone `python main.py` execution, CLI subcommands, flags, and shell recipes.
+- [**05. Custom Schemas & Catalogs**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/05_custom_schemas_and_catalogs.md) — Writing Pydantic v2 schemas, dynamic string schemas, catalogs, and SQLite/wide-table exports.
+- [**06. Configuration & Hardware Tuning**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/06_configuration_and_hardware.md) — Hardware acceleration (MPS, CUDA, CPU), VRAM batch sizing, and context budgeting.
+
+---
+
 ## Key Core Innovations & Architectural Guarantees
 
 ### 1. Native ChatML Framing & Vectorized Batching
