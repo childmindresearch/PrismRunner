@@ -23,23 +23,50 @@ class TriageResult(BaseModel):
     )
 
 
+import yaml
+from pathlib import Path
+
+
 class SchemaTriageFilter:
     """Pre-screens dataset chunks against a schema catalog to eliminate redundant LLM calls."""
 
-    def __init__(self, catalog: SchemaCatalog):
+    def __init__(
+        self,
+        catalog: SchemaCatalog,
+        prompt_file: Optional[Union[str, Path]] = "prompts/triage.yaml",
+    ):
         self.catalog = catalog
+        self.prompt_file = Path(prompt_file) if prompt_file else Path("prompts/triage.yaml")
         self.compiled_schema = compile_schema_to_prompt(TriageResult)
 
     def build_triage_prompt(self, text: str) -> str:
-        """Construct a lightweight triage classification prompt."""
+        """Construct a lightweight triage classification prompt using prompts/triage.yaml."""
         catalog_summary = self.catalog.build_triage_summary()
+        schema_block = self.compiled_schema.render_prompt_block(as_array=False)
 
+        if self.prompt_file.exists():
+            with open(self.prompt_file, "r", encoding="utf-8") as f:
+                tmpl = yaml.safe_load(f) or {}
+
+            raw_prompt = tmpl.get("prompt", "")
+            variables = dict(tmpl.get("variables", {}))
+            variables["instruction"] = tmpl.get("instruction", "")
+            variables["catalog_summary"] = catalog_summary
+            variables["schema_block"] = schema_block
+
+            rendered = raw_prompt
+            for k, v in variables.items():
+                rendered = rendered.replace(f"{{{k}}}", str(v))
+            rendered = rendered.replace("{{ text }}", text).replace("{{ text}}", text)
+            return rendered
+
+        # Built-in fallback if YAML is absent
         return (
             "You are an expert data triage classifier. Your task is to analyze the text excerpt and "
             "identify which of the candidate schemas have concrete, factual evidence present.\n\n"
             f"Candidate Schemas Catalog:\n{catalog_summary}\n\n"
             f'Source Content Excerpt:\n"""\n{text}\n"""\n\n'
-            f"{self.compiled_schema.render_prompt_block(as_array=False)}\n"
+            f"{schema_block}\n"
             "Rule: If no factual evidence exists for any schema in this excerpt, return an empty list."
         )
 

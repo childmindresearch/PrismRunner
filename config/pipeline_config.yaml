@@ -25,6 +25,8 @@ prompts:
   classify: "prompts/classify.yaml"
   extract: "prompts/extract.yaml"
   summarize: "prompts/summarize.yaml"
+  triage: "prompts/triage.yaml"
+  schema_extract: "prompts/schema_extract.yaml"
 
 io:
   default_id_column: "id"

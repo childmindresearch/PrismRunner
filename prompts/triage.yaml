@@ -1,0 +1,23 @@
+version: "1.0"
+task: triage
+
+instruction: "You are an expert data triage classifier. Your task is to analyze the text excerpt and identify which candidate schemas have concrete, factual evidence present."
+
+variables:
+  guidelines: "Select only the exact schema class names from the catalog that have factual evidence in the excerpt. If no evidence exists for any schema, return an empty list."
+
+prompt: |
+  {instruction}
+
+  Candidate Schemas Catalog:
+  {catalog_summary}
+
+  Guidelines:
+  {guidelines}
+
+  Source Content Excerpt:
+  """
+  {{ text }}
+  """
+
+  {schema_block}

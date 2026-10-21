@@ -165,15 +165,38 @@ class SchemaMappingPipeline:
                 compiled_schema = compile_schema_to_prompt(meta.schema_cls)
                 schema_directive = compiled_schema.render_prompt_block(as_array=True)
 
+                # Load centralized prompt template from prompts/schema_extract.yaml
+                extract_tmpl_path = Path("prompts/schema_extract.yaml")
+                extract_tmpl: Dict[str, Any] = {}
+                if extract_tmpl_path.exists():
+                    import yaml
+                    with open(extract_tmpl_path, "r", encoding="utf-8") as f:
+                        extract_tmpl = yaml.safe_load(f) or {}
+
                 payloads: List[Dict[str, Any]] = []
                 for t in tasks:
                     ch: ChunkRecord = t["chunk"]
-                    prompt_str = (
-                        f"Extract all factual instances of {meta.name} from the following text.\n"
-                        f"Scope: {meta.description}\n\n"
-                        f'Source Content:\n"""\n{ch.text}\n"""\n\n'
-                        f"{schema_directive}"
-                    )
+                    if extract_tmpl:
+                        raw_tmpl = extract_tmpl.get("prompt", "")
+                        variables = dict(extract_tmpl.get("variables", {}))
+                        raw_inst = extract_tmpl.get("instruction", "Extract all factual instances of {schema_name}.")
+                        variables["instruction"] = raw_inst.replace("{schema_name}", meta.name)
+                        variables["schema_name"] = meta.name
+                        variables["schema_description"] = meta.description
+                        variables["schema_block"] = schema_directive
+
+                        prompt_str = raw_tmpl
+                        for vk, vv in variables.items():
+                            prompt_str = prompt_str.replace(f"{{{vk}}}", str(vv))
+                        prompt_str = prompt_str.replace("{{ text }}", ch.text).replace("{{ text}}", ch.text)
+                    else:
+                        prompt_str = (
+                            f"Extract all factual instances of {meta.name} from the following text.\n"
+                            f"Scope: {meta.description}\n\n"
+                            f'Source Content:\n"""\n{ch.text}\n"""\n\n'
+                            f"{schema_directive}"
+                        )
+
                     payloads.append({
                         "record_id": ch.record_id,
                         "chunk_index": ch.chunk_index,
