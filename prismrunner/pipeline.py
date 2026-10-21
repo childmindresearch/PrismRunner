@@ -90,6 +90,11 @@ class PrismPipeline:
 
         # Check for config file
         target_path = Path(config_path) if config_path else Path("config/pipeline_config.yaml")
+        if not target_path.exists():
+            pkg_fallback = Path(__file__).resolve().parent.parent / target_path
+            if pkg_fallback.exists():
+                target_path = pkg_fallback
+
         if target_path.exists():
             try:
                 with open(target_path, "r", encoding="utf-8") as f:
@@ -184,9 +189,14 @@ class PrismPipeline:
             if default_rel:
                 prompt_path = Path(default_rel)
 
-        if prompt_path and prompt_path.exists():
-            with open(prompt_path, "r", encoding="utf-8") as f:
-                return yaml.safe_load(f) or {}
+        if prompt_path:
+            if not prompt_path.exists():
+                pkg_fallback = Path(__file__).resolve().parent.parent / prompt_path
+                if pkg_fallback.exists():
+                    prompt_path = pkg_fallback
+            if prompt_path.exists():
+                with open(prompt_path, "r", encoding="utf-8") as f:
+                    return yaml.safe_load(f) or {}
 
         # Fallback inline templates
         return {

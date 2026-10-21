@@ -36,8 +36,11 @@ class SchemaMeta:
 class SchemaCatalog:
     """Registry managing a collection of Pydantic models for multi-schema extraction and triage."""
 
-    def __init__(self):
+    def __init__(self, schemas_dir: Optional[Union[str, Path]] = None):
         self._schemas: Dict[str, SchemaMeta] = {}
+        if schemas_dir is not None:
+            loaded = SchemaCatalog.from_directory(schemas_dir)
+            self._schemas = loaded._schemas
 
     def register(
         self,

@@ -179,6 +179,10 @@ class SchemaMappingPipeline:
                     }
             else:
                 extract_tmpl_path = Path(extract_prompt_file) if extract_prompt_file else Path("prompts/schema_extract.yaml")
+                if not extract_tmpl_path.exists():
+                    pkg_fallback = Path(__file__).resolve().parent.parent / extract_tmpl_path
+                    if pkg_fallback.exists():
+                        extract_tmpl_path = pkg_fallback
                 if extract_tmpl_path.exists():
                     import yaml
                     with open(extract_tmpl_path, "r", encoding="utf-8") as f:

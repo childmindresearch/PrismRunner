@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 import logging
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Union
+import yaml
 from pydantic import BaseModel, Field
 
 from prismrunner.catalog.registry import SchemaCatalog, SchemaMeta
@@ -23,10 +25,6 @@ class TriageResult(BaseModel):
     )
 
 
-import yaml
-from pathlib import Path
-
-
 class SchemaTriageFilter:
     """Pre-screens dataset chunks against a schema catalog to eliminate redundant LLM calls."""
 
@@ -36,7 +34,12 @@ class SchemaTriageFilter:
         prompt_file: Optional[Union[str, Path]] = "prompts/triage.yaml",
     ):
         self.catalog = catalog
-        self.prompt_file = Path(prompt_file) if prompt_file else Path("prompts/triage.yaml")
+        t_path = Path(prompt_file) if prompt_file else Path("prompts/triage.yaml")
+        if not t_path.exists():
+            pkg_fallback = Path(__file__).resolve().parent.parent.parent / t_path
+            if pkg_fallback.exists():
+                t_path = pkg_fallback
+        self.prompt_file = t_path
         self.compiled_schema = compile_schema_to_prompt(TriageResult)
 
     def build_triage_prompt(self, text: str) -> str:

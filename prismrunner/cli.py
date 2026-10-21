@@ -52,6 +52,7 @@ def common_options(f):
         click.option("--chunk-size", type=int, default=1024, help="Tokens per chunk window."),
         click.option("--chunk-overlap", type=int, default=64, help="Tokens overlap between chunks."),
         click.option("--chunk-strategy", type=click.Choice(["sentence", "token"], case_sensitive=False), default="sentence", help="Boundary strategy."),
+        click.option("--schema", "-s", "schema_spec", type=str, help="Custom schema class spec: 'path/to/file.py:ClassName'."),
         click.option("--prompt-file", type=click.Path(exists=True), help="Path to custom prompt template YAML."),
         click.option("--instruction", type=str, help="Instruction override for prompt template."),
         click.option("--var", "variables", multiple=True, help="Inject prompt variable as KEY=VALUE."),
@@ -199,9 +200,15 @@ def _run_task_cli(task: str, kwargs: dict):
 
     vars_dict = _parse_vars(kwargs.get("variables") or ())
 
+    schema_cls = None
+    if kwargs.get("schema_spec"):
+        from prismrunner.schemas.compiler import load_schema_from_string
+        schema_cls = load_schema_from_string(kwargs["schema_spec"])
+
     results = pipeline.run(
         task=task,
         input_data=input_source,
+        schema_cls=schema_cls,
         text_column=kwargs.get("text_column"),
         id_column=kwargs.get("id_column"),
         limit=kwargs.get("limit"),
