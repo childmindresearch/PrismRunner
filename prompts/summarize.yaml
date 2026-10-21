@@ -1,0 +1,24 @@
+version: "1.0"
+task: summarize
+
+instruction: "Summarize the primary message and extract essential takeaway points from the text."
+
+variables:
+  audience: "Executive and technical stakeholders"
+  guidelines: "Provide a concise, faithful narrative summary followed by distinct key bullet points."
+
+prompt: |
+  {instruction}
+
+  Target Audience:
+  {audience}
+
+  Guidelines:
+  {guidelines}
+
+  Source Content:
+  """
+  {{ text }}
+  """
+
+  {schema_block}

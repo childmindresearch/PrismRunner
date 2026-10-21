@@ -1,0 +1,24 @@
+version: "1.0"
+task: extract
+
+instruction: "Extract all distinct key items, entities, or action items from the provided text."
+
+variables:
+  target: "Named entities, organizations, key technical terms, action items, and deliverables"
+  guidelines: "Extract clear, distinct entities with their category and relevant details. Avoid duplicate items."
+
+prompt: |
+  {instruction}
+
+  Target Elements:
+  {target}
+
+  Guidelines:
+  {guidelines}
+
+  Source Content:
+  """
+  {{ text }}
+  """
+
+  {schema_block}

@@ -1,0 +1,33 @@
+# PrismRunner Pipeline Configuration
+
+model:
+  name: "Qwen/Qwen2.5-3B-Instruct"
+  device: "auto"             # auto, mps, cuda, cpu
+  torch_dtype: "auto"        # auto, float16, bfloat16, float32
+  load_in_4bit: false
+  load_in_8bit: false
+  trust_remote_code: true
+
+inference:
+  batch_size: 4
+  max_new_tokens: 512
+  temperature: 0.0
+  top_p: 0.95
+  system_prompt: "You are PrismRunner, an accurate local inference engine. Follow structured format instructions strictly."
+
+chunking:
+  enabled: false
+  chunk_size: 1024
+  chunk_overlap: 64
+  strategy: "sentence"       # sentence or token
+
+prompts:
+  classify: "prompts/classify.yaml"
+  extract: "prompts/extract.yaml"
+  summarize: "prompts/summarize.yaml"
+
+io:
+  default_id_column: "id"
+  default_text_column: "text"
+  output_format: "json"      # json, csv, parquet
+  output_dir: "outputs"
