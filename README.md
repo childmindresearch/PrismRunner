@@ -124,7 +124,18 @@ prismrunner summarize \
   --output-path outputs/summaries.csv
 ```
 
-### 5. Dry-Run Prompt Inspection
+### 5. Multi-Schema Extraction & Relational Mapping (SchemaMap Mode)
+Extract across an entire catalog of Pydantic models with fast relevance triage, checkpoint resume, and relational aggregation into SQLite, normalized CSVs, and a 1-row-per-document wide table:
+```bash
+prismrunner map \
+  --input-path data/clinical_notes.parquet \
+  --schemas-dir schemas/clinical/ \
+  --output-dir outputs/clinical_run/ \
+  --export sqlite,csv,wide \
+  --batch-size 8
+```
+
+### 6. Dry-Run Prompt Inspection
 Verify prompt rendering, variable substitution, and schema injection without loading the model weights:
 ```bash
 prismrunner classify \

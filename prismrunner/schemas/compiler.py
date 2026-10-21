@@ -178,3 +178,42 @@ def compile_schema_to_prompt(model_cls: Type[BaseModel]) -> CompiledPromptSchema
         schema_directive=directive_str,
         model_class=model_cls,
     )
+
+
+def load_schema_from_string(schema_spec: str) -> Type[BaseModel]:
+    """Dynamically load a Pydantic model class from 'path/to/file.py:ClassName' or 'module.path:ClassName'."""
+    import importlib
+    import importlib.util
+    from pathlib import Path
+
+    if ":" not in schema_spec:
+        raise ValueError(
+            f"Invalid schema specification '{schema_spec}'. "
+            f"Expected format 'path/to/file.py:ClassName' or 'module.path:ClassName'."
+        )
+
+    module_path, class_name = schema_spec.split(":", 1)
+    module_path = module_path.strip()
+    class_name = class_name.strip()
+
+    if module_path.endswith(".py") or "/" in module_path or "\\" in module_path:
+        file_path = Path(module_path).resolve()
+        if not file_path.exists():
+            raise FileNotFoundError(f"Schema file not found: {file_path}")
+        spec = importlib.util.spec_from_file_location(file_path.stem, file_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load module from {file_path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    else:
+        mod = importlib.import_module(module_path)
+
+    if not hasattr(mod, class_name):
+        raise AttributeError(f"Module '{module_path}' has no attribute '{class_name}'")
+
+    cls = getattr(mod, class_name)
+    if not isinstance(cls, type) or not issubclass(cls, BaseModel):
+        raise TypeError(f"'{class_name}' must be a subclass of pydantic.BaseModel")
+
+    return cls
+

@@ -87,6 +87,41 @@ def summarize(**kwargs):
     _run_task_cli("summarize", kwargs)
 
 
+@main.command("map")
+@click.option("--input-path", "-i", required=True, type=click.Path(exists=True), help="Input dataset path (.parquet, .csv, .json, .txt).")
+@click.option("--schemas-dir", "-s", required=True, type=click.Path(exists=True), help="Directory containing Pydantic schema files.")
+@click.option("--output-dir", "-o", default="outputs", type=click.Path(), help="Output directory for relational tables and databases.")
+@click.option("--export", default="sqlite,csv,wide", help="Comma-separated exports: sqlite,csv,wide.")
+@click.option("--column", "--text-column", "text_column", type=str, help="Column name containing text to process.")
+@click.option("--id-column", type=str, help="Column name for unique record identifier.")
+@click.option("--batch-size", "-b", type=int, default=4, help="Inference batch size.")
+@click.option("--triage/--no-triage", default=True, help="Enable fast schema relevance triage filter.")
+@click.option("--resume/--no-resume", default=True, help="Enable fault-tolerant checkpoint resume.")
+@click.option("--chunk-size", type=int, default=1024, help="Tokens per chunk window.")
+@click.option("--chunk-overlap", type=int, default=64, help="Tokens overlap between chunks.")
+@click.option("--limit", "-l", type=int, help="Limit number of input records.")
+@click.option("--dry-run", is_flag=True, help="Inspect schema catalog and execution plan without running inference.")
+def map_cmd(**kwargs):
+    """Multi-schema extraction with relevance triage and relational aggregation."""
+    from prismrunner.mapping_pipeline import SchemaMappingPipeline
+    pipeline = SchemaMappingPipeline(schemas_dir=kwargs["schemas_dir"])
+    export_formats = [f.strip().lower() for f in kwargs["export"].split(",") if f.strip()]
+    pipeline.run(
+        input_data=kwargs["input_path"],
+        output_dir=kwargs["output_dir"],
+        text_column=kwargs.get("text_column"),
+        id_column=kwargs.get("id_column"),
+        limit=kwargs.get("limit"),
+        batch_size=kwargs.get("batch_size"),
+        use_triage=kwargs.get("triage", True),
+        resume=kwargs.get("resume", True),
+        export_formats=export_formats,
+        dry_run=kwargs.get("dry_run", False),
+        chunk_size=kwargs.get("chunk_size", 1024),
+        chunk_overlap=kwargs.get("chunk_overlap", 64),
+    )
+
+
 @main.command("inspect-model")
 @click.option("--model", "-m", default="Qwen/Qwen2.5-3B-Instruct", help="Model name or local directory.")
 @click.option("--device", "-d", default="auto", help="Target device (auto, mps, cuda, cpu).")
