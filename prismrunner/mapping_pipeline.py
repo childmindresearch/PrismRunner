@@ -54,6 +54,11 @@ class SchemaMappingPipeline:
         dry_run: bool = False,
         chunk_size: int = 1024,
         chunk_overlap: int = 64,
+        triage_prompt_file: Optional[Union[str, Path]] = None,
+        extract_prompt_file: Optional[Union[str, Path]] = None,
+        extract_prompt_template: Optional[Union[str, Dict[str, Any]]] = None,
+        system_prompt: Optional[str] = None,
+        variables: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Execute full multi-schema triage, extraction, and relational aggregation workflow."""
         out_dir = Path(output_dir)
@@ -112,7 +117,7 @@ class SchemaMappingPipeline:
 
         if use_triage:
             console.print("\n[bold blue]Running Vectorized ChatML Batch Triage...[/bold blue]")
-            triage_filter = SchemaTriageFilter(self.catalog)
+            triage_filter = SchemaTriageFilter(self.catalog, prompt_file=triage_prompt_file)
             chunk_active_map = triage_filter.triage_batch(chunks, engine)
 
             for ch in chunks:
@@ -160,33 +165,46 @@ class SchemaMappingPipeline:
             for t in scheduled_tasks:
                 tasks_by_schema.setdefault(t["schema_meta"].name, []).append(t)
 
-            for schema_name, tasks in tasks_by_schema.items():
-                meta = tasks[0]["schema_meta"]
-                compiled_schema = compile_schema_to_prompt(meta.schema_cls)
-                schema_directive = compiled_schema.render_prompt_block(as_array=True)
-
-                # Load centralized prompt template from prompts/schema_extract.yaml
-                extract_tmpl_path = Path("prompts/schema_extract.yaml")
-                extract_tmpl: Dict[str, Any] = {}
+            # Determine extraction template
+            extract_tmpl: Dict[str, Any] = {}
+            if extract_prompt_template is not None:
+                if isinstance(extract_prompt_template, dict):
+                    extract_tmpl = dict(extract_prompt_template)
+                elif isinstance(extract_prompt_template, str):
+                    extract_tmpl = {
+                        "version": "custom",
+                        "instruction": "Extract all factual instances of {schema_name}.",
+                        "variables": {},
+                        "prompt": extract_prompt_template,
+                    }
+            else:
+                extract_tmpl_path = Path(extract_prompt_file) if extract_prompt_file else Path("prompts/schema_extract.yaml")
                 if extract_tmpl_path.exists():
                     import yaml
                     with open(extract_tmpl_path, "r", encoding="utf-8") as f:
                         extract_tmpl = yaml.safe_load(f) or {}
+
+            for schema_name, tasks in tasks_by_schema.items():
+                meta = tasks[0]["schema_meta"]
+                compiled_schema = compile_schema_to_prompt(meta.schema_cls)
+                schema_directive = compiled_schema.render_prompt_block(as_array=True)
 
                 payloads: List[Dict[str, Any]] = []
                 for t in tasks:
                     ch: ChunkRecord = t["chunk"]
                     if extract_tmpl:
                         raw_tmpl = extract_tmpl.get("prompt", "")
-                        variables = dict(extract_tmpl.get("variables", {}))
+                        vars_dict = dict(extract_tmpl.get("variables", {}))
+                        if variables:
+                            vars_dict.update(variables)
                         raw_inst = extract_tmpl.get("instruction", "Extract all factual instances of {schema_name}.")
-                        variables["instruction"] = raw_inst.replace("{schema_name}", meta.name)
-                        variables["schema_name"] = meta.name
-                        variables["schema_description"] = meta.description
-                        variables["schema_block"] = schema_directive
+                        vars_dict["instruction"] = raw_inst.replace("{schema_name}", meta.name)
+                        vars_dict["schema_name"] = meta.name
+                        vars_dict["schema_description"] = meta.description
+                        vars_dict["schema_block"] = schema_directive
 
                         prompt_str = raw_tmpl
-                        for vk, vv in variables.items():
+                        for vk, vv in vars_dict.items():
                             prompt_str = prompt_str.replace(f"{{{vk}}}", str(vv))
                         prompt_str = prompt_str.replace("{{ text }}", ch.text).replace("{{ text}}", ch.text)
                     else:
@@ -204,7 +222,11 @@ class SchemaMappingPipeline:
                         "prompt": prompt_str,
                     })
 
-                sys_prompt = extract_tmpl.get("system_prompt") or "You are an exact, verbatim data extraction engine. Output valid JSON array only."
+                sys_prompt = (
+                    system_prompt
+                    or extract_tmpl.get("system_prompt")
+                    or "You are an exact, verbatim data extraction engine. Output valid JSON array only."
+                )
                 raw_results = engine.run_all(
                     items=payloads,
                     system_prompt=sys_prompt,
@@ -271,3 +293,8 @@ class SchemaMappingPipeline:
         console.print(f"[bold green]SchemaMap Extraction & Relational Aggregation Complete![/bold green]")
         console.print(f"Generated {len(relational_tables)} relational tables across {len(records)} documents.")
         return outputs_summary
+
+
+# Convenient alias
+SchemaMapPipeline = SchemaMappingPipeline
+

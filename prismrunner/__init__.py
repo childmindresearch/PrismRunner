@@ -1,7 +1,7 @@
 """PrismRunner: Lightweight, local-first LLM inference engine."""
 
 from prismrunner.pipeline import PrismPipeline
-from prismrunner.mapping_pipeline import SchemaMappingPipeline
+from prismrunner.mapping_pipeline import SchemaMappingPipeline, SchemaMapPipeline
 from prismrunner.loaders.dataset import DatasetLoader, Record
 from prismrunner.chunking.chunker import TokenAwareChunker, ChunkRecord
 from prismrunner.schemas.compiler import compile_schema_to_prompt, CompiledPromptSchema, load_schema_from_string
@@ -20,6 +20,7 @@ __version__ = "0.1.0"
 __all__ = [
     "PrismPipeline",
     "SchemaMappingPipeline",
+    "SchemaMapPipeline",
     "DatasetLoader",
     "Record",
     "TokenAwareChunker",

@@ -161,8 +161,21 @@ class PrismPipeline:
         self,
         task: str,
         custom_prompt_path: Optional[Union[str, Path]] = None,
+        prompt_template: Optional[Union[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """Load YAML prompt template for a specific task."""
+        """Load YAML prompt template for a specific task or use provided in-memory template."""
+        if prompt_template is not None:
+            if isinstance(prompt_template, dict):
+                return dict(prompt_template)
+            elif isinstance(prompt_template, str):
+                return {
+                    "version": "custom",
+                    "task": task,
+                    "instruction": "",
+                    "variables": {},
+                    "prompt": prompt_template,
+                }
+
         prompt_path = None
         if custom_prompt_path:
             prompt_path = Path(custom_prompt_path)
@@ -231,6 +244,8 @@ class PrismPipeline:
         chunk_overlap: Optional[int] = None,
         chunk_strategy: Optional[str] = None,
         prompt_file: Optional[Union[str, Path]] = None,
+        prompt_template: Optional[Union[str, Dict[str, Any]]] = None,
+        system_prompt: Optional[str] = None,
         variables: Optional[Dict[str, str]] = None,
         instruction: Optional[str] = None,
         output_path: Optional[Union[str, Path]] = None,
@@ -258,7 +273,7 @@ class PrismPipeline:
         compiled_schema = compile_schema_to_prompt(target_schema) if target_schema else None
 
         # 3. Load prompt template
-        tmpl = self.load_prompt_template(task, prompt_file)
+        tmpl = self.load_prompt_template(task, prompt_file, prompt_template=prompt_template)
 
         # 4. Handle chunking
         do_chunk = chunk if chunk is not None else self.config["chunking"].get("enabled", False)
@@ -327,7 +342,7 @@ class PrismPipeline:
             temperature=temperature,
         )
 
-        sys_prompt = tmpl.get("system_prompt") or self.config["inference"].get("system_prompt")
+        sys_prompt = system_prompt or tmpl.get("system_prompt") or self.config["inference"].get("system_prompt")
         raw_results = engine.run_all(
             items=payloads,
             system_prompt=sys_prompt,
