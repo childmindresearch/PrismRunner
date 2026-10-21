@@ -1,6 +1,8 @@
 version: "1.0"
 task: classify
 
+system_prompt: "You are PrismRunner, an accurate local classification engine. Follow structured format instructions strictly."
+
 instruction: "Classify the following text into exactly one of the designated categories."
 
 variables:

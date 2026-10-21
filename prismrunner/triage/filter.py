@@ -80,12 +80,18 @@ class SchemaTriageFilter:
             return {}
 
         # Build prompts
+        sys_prompt = "You are a fast, factual schema triage filter. Output valid JSON only."
+        if self.prompt_file.exists():
+            with open(self.prompt_file, "r", encoding="utf-8") as f:
+                tmpl = yaml.safe_load(f) or {}
+            sys_prompt = tmpl.get("system_prompt") or sys_prompt
+
         prompts: List[str] = []
         for ch in chunks:
             raw_prompt = self.build_triage_prompt(ch.text)
             messages = engine.format_chatml_messages(
                 user_prompt=raw_prompt,
-                system_prompt="You are a fast, factual schema triage filter. Output valid JSON only.",
+                system_prompt=sys_prompt,
             )
             formatted = engine.render_chat_prompt(messages)
             prompts.append(formatted)

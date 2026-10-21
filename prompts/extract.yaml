@@ -1,6 +1,8 @@
 version: "1.0"
 task: extract
 
+system_prompt: "You are PrismRunner, an exact information extraction engine. Output valid JSON array only."
+
 instruction: "Extract all distinct key items, entities, or action items from the provided text."
 
 variables:

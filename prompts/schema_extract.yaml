@@ -1,6 +1,8 @@
 version: "1.0"
 task: schema_extract
 
+system_prompt: "You are an exact, verbatim data extraction engine. Output valid JSON array only."
+
 instruction: "Extract all factual instances of {schema_name} from the following text."
 
 variables:

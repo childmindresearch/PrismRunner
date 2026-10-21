@@ -327,7 +327,7 @@ class PrismPipeline:
             temperature=temperature,
         )
 
-        sys_prompt = self.config["inference"].get("system_prompt")
+        sys_prompt = tmpl.get("system_prompt") or self.config["inference"].get("system_prompt")
         raw_results = engine.run_all(
             items=payloads,
             system_prompt=sys_prompt,

@@ -53,6 +53,15 @@ class TestDatasetLoader(unittest.TestCase):
         self.assertEqual(records[0].id, "rec_000001")
         self.assertEqual(records[0].text, raw_text)
 
+    def test_load_markdown_file(self):
+        md_path = os.path.join(self.temp_dir.name, "notes.md")
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write("# Clinical Notes\nPatient reports persistent cough.")
+        records = DatasetLoader.load(md_path)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].id, "notes_0")
+        self.assertIn("persistent cough", records[0].text)
+
     def test_export_results_json_and_csv(self):
         data = [
             {"id": "out_1", "index": 0, "category": "Tech"},

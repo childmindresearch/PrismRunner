@@ -1,6 +1,8 @@
 version: "1.0"
 task: summarize
 
+system_prompt: "You are PrismRunner, an expert document synthesis engine. Output structured JSON only."
+
 instruction: "Summarize the primary message and extract essential takeaway points from the text."
 
 variables:

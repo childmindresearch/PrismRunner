@@ -93,13 +93,12 @@ class DatasetLoader:
             except json.JSONDecodeError:
                 # Attempt reading JSON Lines
                 df = pd.read_json(path, lines=True)
-        elif suffix == ".txt":
+        elif suffix in (".txt", ".md", ".markdown", ".text"):
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
-            # If txt is multiple non-empty lines and no specific instruction, treat whole doc as 1 record
             return [Record(id=f"{path.stem}_0", index=0, text=content.strip(), metadata={"filename": path.name})]
         else:
-            raise ValueError(f"Unsupported file format: '{suffix}'. Supported: .parquet, .csv, .json, .txt")
+            raise ValueError(f"Unsupported file format: '{suffix}'. Supported: .parquet, .csv, .json, .txt, .md")
 
         if limit is not None and limit > 0:
             df = df.iloc[:limit]

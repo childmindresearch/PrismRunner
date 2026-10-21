@@ -204,9 +204,10 @@ class SchemaMappingPipeline:
                         "prompt": prompt_str,
                     })
 
+                sys_prompt = extract_tmpl.get("system_prompt") or "You are an exact, verbatim data extraction engine. Output valid JSON array only."
                 raw_results = engine.run_all(
                     items=payloads,
-                    system_prompt="You are an exact, verbatim data extraction engine. Output valid JSON array only.",
+                    system_prompt=sys_prompt,
                     prompt_key="prompt",
                 )
 
