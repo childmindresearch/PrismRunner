@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 from collections import defaultdict
-import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
@@ -20,20 +19,23 @@ class WideTableBuilder:
         include_counts: bool = True,
         list_join_char: str = "; ",
         source_texts: Optional[Dict[str, str]] = None,
+        id_column_name: str = "source_id",
     ) -> pd.DataFrame:
         """Construct a wide DataFrame containing exactly 1 row per source document ID."""
         # Collect all unique source IDs across tables
         all_source_ids: Set[str] = set()
         for rows in tables.values():
             for r in rows:
-                if "source_id" in r:
+                if id_column_name in r:
+                    all_source_ids.add(str(r[id_column_name]))
+                elif "source_id" in r:
                     all_source_ids.add(str(r["source_id"]))
 
         if source_texts:
             all_source_ids.update(source_texts.keys())
 
         doc_rows: Dict[str, Dict[str, Any]] = {
-            sid: {"source_id": sid} for sid in sorted(all_source_ids)
+            sid: {id_column_name: sid} for sid in sorted(all_source_ids)
         }
 
         # Attach source_text if provided
@@ -43,10 +45,10 @@ class WideTableBuilder:
                     doc_rows[sid]["source_text"] = text
 
         for table_name, rows in tables.items():
-            # Group rows by source_id
+            # Group rows by id_column_name (fallback to source_id)
             by_source: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
             for r in rows:
-                sid = str(r.get("source_id", ""))
+                sid = str(r.get(id_column_name, r.get("source_id", "")))
                 if sid:
                     by_source[sid].append(r)
 
@@ -54,12 +56,12 @@ class WideTableBuilder:
             is_child_table = any("item_index" in r for r in rows)
 
             for sid, s_rows in by_source.items():
-                target_doc = doc_rows.setdefault(sid, {"source_id": sid})
+                target_doc = doc_rows.setdefault(sid, {id_column_name: sid})
 
                 if not is_child_table and len(s_rows) == 1:
                     # 1-to-1 root table: prefix columns with table_name
                     for k, v in s_rows[0].items():
-                        if k in ("source_id", "source_file", "parent_item_index", "item_index"):
+                        if k in (id_column_name, "source_id", "source_file", "parent_item_index", "item_index"):
                             continue
                         col = f"{table_name}_{k}"
                         target_doc[col] = v
@@ -74,7 +76,7 @@ class WideTableBuilder:
                         child_cols.update(r.keys())
 
                     for c in child_cols:
-                        if c in ("source_id", "source_file", "parent_item_index", "item_index"):
+                        if c in (id_column_name, "source_id", "source_file", "parent_item_index", "item_index"):
                             continue
                         vals = [str(r[c]) for r in s_rows if r.get(c) is not None and str(r[c]).strip()]
                         if vals:
@@ -82,9 +84,9 @@ class WideTableBuilder:
 
         # Build DataFrame
         df = pd.DataFrame(list(doc_rows.values()))
-        if "source_id" in df.columns:
-            # Keep source_id as first column
-            cols = ["source_id"] + [c for c in df.columns if c != "source_id"]
+        if id_column_name in df.columns:
+            # Keep id column as first column
+            cols = [id_column_name] + [c for c in df.columns if c != id_column_name]
             df = df[cols]
 
         logger.info(f"Built consolidated wide table: {len(df)} rows × {len(df.columns)} columns")
@@ -97,6 +99,8 @@ class WideTableBuilder:
         output_path: Union[str, Path],
         source_texts: Optional[Dict[str, str]] = None,
         output_format: Optional[str] = None,
+        list_join_char: str = "; ",
+        id_column_name: str = "source_id",
     ) -> Path:
         """Build and export wide table to .parquet or .csv."""
         out = Path(output_path)
@@ -105,7 +109,7 @@ class WideTableBuilder:
         if not fmt:
             fmt = "parquet"
 
-        df = cls.build(tables, source_texts=source_texts)
+        df = cls.build(tables, source_texts=source_texts, list_join_char=list_join_char, id_column_name=id_column_name)
 
         if fmt == "csv":
             if not str(out).endswith(".csv"):

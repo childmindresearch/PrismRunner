@@ -78,6 +78,31 @@ class TestSchemaCompiler(unittest.TestCase):
         rendered_obj = compiled.render_prompt_block(as_array=False)
         self.assertIn("JSON object", rendered_obj)
 
+    def test_nested_list_of_models_and_dict(self):
+        from typing import Dict, Any
+
+        class SubItem(BaseModel):
+            item_name: str
+            quantity: int
+
+        class ParentSchema(BaseModel):
+            title: str
+            items: List[SubItem]
+            metadata: Dict[str, Any]
+
+        compiled = compile_schema_to_prompt(ParentSchema)
+        self.assertIn("SubItem objects with fields:", compiled.field_bullets)
+        self.assertIn("item_name", compiled.field_bullets)
+        self.assertIn("key-value dictionary", compiled.field_bullets)
+
+        import json
+        sample = json.loads(compiled.sample_json)
+        self.assertIsInstance(sample["items"], list)
+        self.assertEqual(len(sample["items"]), 1)
+        self.assertIn("item_name", sample["items"][0])
+        self.assertIn("quantity", sample["items"][0])
+        self.assertIsInstance(sample["metadata"], dict)
+
 
 if __name__ == "__main__":
     unittest.main()

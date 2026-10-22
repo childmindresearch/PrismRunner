@@ -1,23 +1,20 @@
 """Unified PrismRunner Pipeline orchestrating loading, chunking, inference, parsing, and stitching."""
 
 from __future__ import annotations
-import copy
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Type, Union
 import yaml
 from pydantic import BaseModel
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
-from prismrunner.engine.device import get_optimal_device, clear_device_memory
+from prismrunner.engine.device import get_optimal_device
 from prismrunner.engine.model import load_model_and_tokenizer
 from prismrunner.engine.inference import BatchInferenceEngine
-from prismrunner.engine.context import ContextBudget
 from prismrunner.chunking.chunker import TokenAwareChunker, ChunkRecord
-from prismrunner.loaders.dataset import DatasetLoader, Record, export_results
+from prismrunner.loaders.dataset import DatasetLoader, export_results
 from prismrunner.schemas.compiler import compile_schema_to_prompt, CompiledPromptSchema
-from prismrunner.schemas.parser import UniversalOutputParser, ParseResult
+from prismrunner.schemas.parser import UniversalOutputParser
 from prismrunner.schemas.base import ClassificationItem, EntityItem, SummaryItem
 from prismrunner.stitcher.stitcher import DeterministicStitcher
 
@@ -124,6 +121,10 @@ class PrismPipeline:
         batch_size: Optional[int] = None,
         max_new_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        repetition_penalty: Optional[float] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
     ) -> BatchInferenceEngine:
         """Initialize or reuse the batch inference engine."""
         if self.engine is not None:
@@ -138,6 +139,10 @@ class PrismPipeline:
         b_size = batch_size or i_cfg["batch_size"]
         m_tokens = max_new_tokens or i_cfg["max_new_tokens"]
         temp = temperature if temperature is not None else i_cfg["temperature"]
+        tp = top_p if top_p is not None else i_cfg.get("top_p", 0.95)
+        tk = top_k if top_k is not None else i_cfg.get("top_k", None)
+        rp = repetition_penalty if repetition_penalty is not None else i_cfg.get("repetition_penalty", None)
+        gk = generation_kwargs or i_cfg.get("generation_kwargs", {})
 
         target_device = get_optimal_device(d_pref)
 
@@ -157,7 +162,10 @@ class PrismPipeline:
             batch_size=b_size,
             max_new_tokens=m_tokens,
             temperature=temp,
-            top_p=i_cfg.get("top_p", 0.95),
+            top_p=tp,
+            top_k=tk,
+            repetition_penalty=rp,
+            generation_kwargs=gk,
         )
 
         return self.engine
@@ -214,6 +222,7 @@ class PrismPipeline:
         compiled_schema: Optional[CompiledPromptSchema] = None,
         variable_overrides: Optional[Dict[str, str]] = None,
         instruction_override: Optional[str] = None,
+        as_array: Optional[bool] = None,
     ) -> str:
         """Render prompt text substituting variables, instructions, schema directives, and text."""
         raw_tmpl = template_yaml.get("prompt", "{{ text }}")
@@ -224,7 +233,8 @@ class PrismPipeline:
         instruction = instruction_override or template_yaml.get("instruction", "")
         variables["instruction"] = instruction
 
-        schema_block = compiled_schema.render_prompt_block(as_array=True) if compiled_schema else ""
+        target_as_array = as_array if as_array is not None else True
+        schema_block = compiled_schema.render_prompt_block(as_array=target_as_array) if compiled_schema else ""
         variables["schema_block"] = schema_block
 
         # Interpolate {variables}
@@ -232,23 +242,29 @@ class PrismPipeline:
         for var_name, var_val in variables.items():
             rendered = rendered.replace(f"{{{var_name}}}", str(var_val))
 
-        # Interpolate {{ text }} / {{ item }} slot
-        rendered = rendered.replace("{{ text }}", text).replace("{{ text}}", text)
-        rendered = rendered.replace("{{ item }}", text).replace("{{ item}}", text)
+        # Interpolate flexible text slots
+        for slot in ["{{ text }}", "{{ text}}", "{{ item }}", "{{ item}}", "{{ document }}", "{text}", "{item}", "{document}", "{content}"]:
+            rendered = rendered.replace(slot, text)
 
         return rendered
 
     def run(
         self,
         task: str,
-        input_data: Union[str, Path, List[Record]],
+        input_data: Union[str, Path, Any],
         schema_cls: Optional[Type[BaseModel]] = None,
         text_column: Optional[str] = None,
         id_column: Optional[str] = None,
+        metadata_columns: Optional[List[str]] = None,
+        exclude_columns: Optional[List[str]] = None,
         limit: Optional[int] = None,
         batch_size: Optional[int] = None,
         max_new_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        repetition_penalty: Optional[float] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
         chunk: Optional[bool] = None,
         chunk_size: Optional[int] = None,
         chunk_overlap: Optional[int] = None,
@@ -258,21 +274,30 @@ class PrismPipeline:
         system_prompt: Optional[str] = None,
         variables: Optional[Dict[str, str]] = None,
         instruction: Optional[str] = None,
+        as_array: Optional[bool] = None,
+        dedup: bool = True,
+        dedup_key: Optional[Union[str, Callable]] = None,
+        category_field: Optional[str] = None,
+        confidence_field: Optional[str] = None,
+        reasoning_field: Optional[str] = None,
+        tie_breaker: str = "earliest",
+        summary_field: Optional[str] = None,
+        points_field: Optional[str] = None,
+        part_header_template: Optional[str] = "--- [Part {index}/{total}] ---",
         output_path: Optional[Union[str, Path]] = None,
         output_format: Optional[str] = None,
         dry_run: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Execute the end-to-end pipeline."""
+        """Execute the end-to-end pipeline with fully dynamic and configurable parameters."""
         # 1. Load input dataset
-        if isinstance(input_data, list) and all(isinstance(r, Record) for r in input_data):
-            records = input_data[:limit] if limit else input_data
-        else:
-            records = DatasetLoader.load(
-                file_path_or_text=input_data,
-                text_column=text_column or self.config["io"].get("default_text_column"),
-                id_column=id_column or self.config["io"].get("default_id_column"),
-                limit=limit,
-            )
+        records = DatasetLoader.load(
+            file_path_or_data=input_data,
+            text_column=text_column or self.config["io"].get("default_text_column"),
+            id_column=id_column or self.config["io"].get("default_id_column"),
+            metadata_columns=metadata_columns,
+            exclude_columns=exclude_columns,
+            limit=limit,
+        )
 
         if not records:
             logger.warning("No records found to process.")
@@ -324,6 +349,7 @@ class PrismPipeline:
                 compiled_schema=compiled_schema,
                 variable_overrides=variables,
                 instruction_override=instruction,
+                as_array=as_array,
             )
             payloads.append({
                 "record_id": ch.record_id,
@@ -350,6 +376,10 @@ class PrismPipeline:
             batch_size=batch_size,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            generation_kwargs=generation_kwargs,
         )
 
         sys_prompt = system_prompt or tmpl.get("system_prompt") or self.config["inference"].get("system_prompt")
@@ -359,6 +389,10 @@ class PrismPipeline:
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             prompt_key="prompt",
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            **(generation_kwargs or {}),
         )
 
         # 7. Parse outputs with UniversalOutputParser
@@ -370,14 +404,30 @@ class PrismPipeline:
             res["parsed_items"] = parse_res.items
             res["parse_success"] = parse_res.success
             res["parsing_strategy"] = parse_res.parsing_strategy
+            res["parse_error"] = parse_res.error
 
         # 8. Deterministic Stitching
         if task == "classify":
-            stitched = DeterministicStitcher.stitch_classification(raw_results)
+            stitched = DeterministicStitcher.stitch_classification(
+                raw_results,
+                category_field=category_field,
+                confidence_field=confidence_field,
+                reasoning_field=reasoning_field,
+                tie_breaker=tie_breaker,
+            )
         elif task == "extract":
-            stitched = DeterministicStitcher.stitch_extraction(raw_results)
+            stitched = DeterministicStitcher.stitch_extraction(
+                raw_results,
+                dedup=dedup,
+                dedup_key=dedup_key,
+            )
         elif task == "summarize":
-            stitched = DeterministicStitcher.stitch_summarization(raw_results)
+            stitched = DeterministicStitcher.stitch_summarization(
+                raw_results,
+                summary_field=summary_field,
+                points_field=points_field,
+                part_header_template=part_header_template,
+            )
         else:
             stitched = raw_results
 

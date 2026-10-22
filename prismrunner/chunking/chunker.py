@@ -12,6 +12,9 @@ from prismrunner.loaders.dataset import Record
 logger = logging.getLogger(__name__)
 
 
+SENTENCE_PATTERN = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'\(])")
+
+
 @dataclass
 class ChunkRecord:
     """Represents a chunk slice of a parent record with deterministic lineage tracking."""
@@ -53,9 +56,7 @@ class TokenAwareChunker:
 
     def _split_sentences(self, text: str) -> List[str]:
         """Split text into sentences preserving boundary punctuation."""
-        # Regex splits on sentence-ending punctuation followed by whitespace and uppercase/number
-        sentence_pattern = r"(?<=[.!?])\s+(?=[A-Z0-9\"'\(])"
-        raw_sentences = re.split(sentence_pattern, text)
+        raw_sentences = SENTENCE_PATTERN.split(text)
         sentences = [s.strip() for s in raw_sentences if s.strip()]
         return sentences if sentences else [text]
 

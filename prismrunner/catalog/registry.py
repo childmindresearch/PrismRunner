@@ -59,8 +59,19 @@ class SchemaCatalog:
         logger.debug(f"Registered schema: {schema_name}")
 
     def get(self, name: str) -> Optional[SchemaMeta]:
-        """Retrieve schema metadata by name."""
-        return self._schemas.get(name)
+        """Retrieve schema metadata by name, supporting exact match and normalized fallback."""
+        if not name or not isinstance(name, str):
+            return None
+        clean_name = name.strip().strip("'\"")
+        if clean_name in self._schemas:
+            return self._schemas[clean_name]
+
+        # Case-insensitive / normalized fallback
+        norm_target = clean_name.lower().replace("_", "").replace("-", "")
+        for k, meta in self._schemas.items():
+            if k.lower().replace("_", "").replace("-", "") == norm_target:
+                return meta
+        return None
 
     def list_schemas(self) -> List[SchemaMeta]:
         """List all registered schemas."""

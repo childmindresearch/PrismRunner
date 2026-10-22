@@ -84,7 +84,7 @@ Load datasets deterministically across Parquet, CSV, JSON, TXT, and Markdown fil
 from prismrunner import DatasetLoader, Record
 
 records = DatasetLoader.load(
-    file_path_or_text="data/corpus.parquet",
+    file_path_or_data="data/corpus.parquet",
     text_column="notes",
     id_column="patient_id",
     limit=50,
@@ -183,8 +183,7 @@ Turns multi-schema extraction outputs into relational tables, SQLite `.db` datab
 from prismrunner import RelationalNormalizer, SQLiteExporter, WideTableBuilder
 
 # 1. Normalize into relational dictionaries
-normalizer = RelationalNormalizer()
-relational_tables = normalizer.normalize_batch(extraction_records)
+relational_tables = RelationalNormalizer.normalize_dataset(extraction_records)
 
 # 2. Export to SQLite with foreign keys and indexes
 SQLiteExporter.export(relational_tables, "outputs/database.db")

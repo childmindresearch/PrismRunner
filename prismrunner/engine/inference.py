@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 import logging
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
@@ -23,6 +23,9 @@ class BatchInferenceEngine:
         max_new_tokens: int = 512,
         temperature: float = 0.0,
         top_p: float = 0.95,
+        top_k: Optional[int] = None,
+        repetition_penalty: Optional[float] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -31,6 +34,9 @@ class BatchInferenceEngine:
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
+        self.top_k = top_k
+        self.repetition_penalty = repetition_penalty
+        self.generation_kwargs = dict(generation_kwargs or {})
 
         # Enforce left-padding on the tokenizer
         self.tokenizer.padding_side = "left"
@@ -85,6 +91,10 @@ class BatchInferenceEngine:
         formatted_prompts: List[str],
         max_new_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        repetition_penalty: Optional[float] = None,
+        **extra_gen_kwargs,
     ) -> List[str]:
         """Generate completions for a list of pre-formatted ChatML prompts using left-padding."""
         if not formatted_prompts:
@@ -92,6 +102,9 @@ class BatchInferenceEngine:
 
         tokens_to_gen = max_new_tokens if max_new_tokens is not None else self.max_new_tokens
         temp = temperature if temperature is not None else self.temperature
+        curr_top_p = top_p if top_p is not None else self.top_p
+        curr_top_k = top_k if top_k is not None else self.top_k
+        curr_rep_penalty = repetition_penalty if repetition_penalty is not None else self.repetition_penalty
 
         # Tokenize with left padding and aligned attention masks
         encoded = self.tokenizer(
@@ -112,12 +125,24 @@ class BatchInferenceEngine:
             "eos_token_id": self.tokenizer.eos_token_id,
         }
 
+        # Base generation kwargs configured on the engine instance
+        gen_kwargs.update(self.generation_kwargs)
+
         if temp > 0.0:
             gen_kwargs["do_sample"] = True
             gen_kwargs["temperature"] = temp
-            gen_kwargs["top_p"] = self.top_p
+            if curr_top_p is not None:
+                gen_kwargs["top_p"] = curr_top_p
+            if curr_top_k is not None:
+                gen_kwargs["top_k"] = curr_top_k
         else:
             gen_kwargs["do_sample"] = False
+
+        if curr_rep_penalty is not None:
+            gen_kwargs["repetition_penalty"] = curr_rep_penalty
+
+        # Apply call-specific overrides
+        gen_kwargs.update(extra_gen_kwargs)
 
         # Run forward generation
         output_ids = self.model.generate(**gen_kwargs)
@@ -144,6 +169,10 @@ class BatchInferenceEngine:
         max_new_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         prompt_key: str = "prompt",
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        repetition_penalty: Optional[float] = None,
+        **extra_gen_kwargs,
     ) -> List[Dict[str, Any]]:
         """Run batch inference over all items, returning results mapped to original records."""
         results: List[Dict[str, Any]] = []
@@ -163,6 +192,10 @@ class BatchInferenceEngine:
                 formatted_batch,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                **extra_gen_kwargs,
             )
 
             for item, comp in zip(batch_items, completions):

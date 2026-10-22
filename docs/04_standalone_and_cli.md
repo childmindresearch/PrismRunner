@@ -143,21 +143,49 @@ prismrunner map \
 | :--- | :--- | :--- |
 | `--input-path`, `-i` | File Path | Path to Parquet, CSV, JSON, TXT, or Markdown dataset. |
 | `--input-text`, `-t` | String | Raw text string for quick ad-hoc testing. |
-| `--column`, `-c` | String | Name of the text column to process. |
+| `--column`, `--text-column` | String | Name of the text column to process. |
 | `--id-column` | String | Name of the unique identifier column. |
+| `--metadata-columns` | String | Comma-separated list of metadata columns to preserve. |
+| `--exclude-columns` | String | Comma-separated list of columns to exclude from metadata. |
 | `--schema`, `-s` | String | Path to custom schema (`file.py:ClassName`). |
 | `--prompt-file` | File Path | Custom YAML prompt template path. |
 | `--instruction` | String | Task instruction override. |
+| `--system-prompt` | String | Custom system prompt override for chatML format. |
+| `--as-array / --single-object` | Flag | Toggle whether model outputs JSON array or single object. |
+| `--dedup / --no-dedup` | Flag | Enable/disable post-inference deduplication across chunks. |
+| `--dedup-key` | String | Key or field name for deduplicating extracted items. |
+| `--category-field` | String | Custom field name for classification category/label. |
+| `--confidence-field` | String | Custom field name for classification confidence score. |
+| `--reasoning-field` | String | Custom field name for classification justification. |
+| `--summary-field` | String | Custom field name for narrative summary text. |
+| `--points-field` | String | Custom field name for bulleted takeaways list. |
 | `--var` | Key=Val | Custom variable override (can be repeated). |
 | `--batch-size`, `-b` | Integer | Inference batch size (default: 4). |
+| `--max-tokens` | Integer | Maximum new tokens to generate (default: 512). |
+| `--temperature` | Float | Sampling temperature (0.0 for deterministic). |
+| `--top-p` | Float | Nucleus sampling probability threshold. |
+| `--top-k` | Integer | Top-k sampling threshold. |
+| `--repetition-penalty` | Float | Penalize repetitive token generation. |
 | `--chunk / --no-chunk` | Boolean | Enable/disable token sliding-window chunking. |
 | `--chunk-size` | Integer | Max token size per chunk (default: 1024). |
 | `--chunk-overlap` | Integer | Token overlap between chunks (default: 64). |
+| `--chunk-strategy` | Choice | `sentence` or `token` boundary strategy. |
 | `--dry-run` | Flag | Preview rendered prompts without loading model. |
 | `--output-path`, `-o` | File Path | Destination file for results. |
 | `--output-format` | String | `json`, `csv`, or `parquet`. |
 | `--device` | String | `auto`, `mps`, `cuda`, or `cpu`. |
 | `--json` | Flag | Output raw JSON directly to stdout for Unix pipes. |
+
+### SchemaMap `map` Options
+
+| Flag | Type | Description |
+| :--- | :--- | :--- |
+| `--id-column-name` | String | Foreign key column name linking parent records (default: `source_id`). |
+| `--wide-table-name` | String | Base filename for denormalized wide table (default: `consolidated_wide_table`). |
+| `--sqlite-db-name` | String | SQLite database filename (default: `extracted_database.db`). |
+| `--wide-separator` | String | Delimiter for joined multi-value lists in wide table (default: `; `). |
+| `--triage-max-tokens` | Integer | Maximum tokens generated during relevance triage pass (default: 256). |
+
 
 ---
 

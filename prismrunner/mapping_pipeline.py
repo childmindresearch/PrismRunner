@@ -3,11 +3,13 @@
 from __future__ import annotations
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Union
+import pandas as pd
+import yaml
 from rich.console import Console
 
 from prismrunner.pipeline import PrismPipeline
-from prismrunner.loaders.dataset import DatasetLoader, Record
+from prismrunner.loaders.dataset import DatasetLoader
 from prismrunner.chunking.chunker import TokenAwareChunker, ChunkRecord
 from prismrunner.catalog.registry import SchemaCatalog, SchemaMeta
 from prismrunner.triage.filter import SchemaTriageFilter
@@ -42,38 +44,54 @@ class SchemaMappingPipeline:
 
     def run(
         self,
-        input_data: Union[str, Path, List[Record]],
+        input_data: Union[str, Path, Any],
         output_dir: Union[str, Path] = "outputs",
         text_column: Optional[str] = None,
         id_column: Optional[str] = None,
+        metadata_columns: Optional[List[str]] = None,
+        exclude_columns: Optional[List[str]] = None,
         limit: Optional[int] = None,
         batch_size: Optional[int] = None,
+        max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        repetition_penalty: Optional[float] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
         use_triage: bool = True,
         resume: bool = True,
         export_formats: Optional[List[str]] = None,  # "sqlite", "csv", "wide"
         dry_run: bool = False,
         chunk_size: int = 1024,
         chunk_overlap: int = 64,
+        chunk_strategy: str = "sentence",
         triage_prompt_file: Optional[Union[str, Path]] = None,
+        triage_prompt_template: Optional[Union[str, Dict[str, Any]]] = None,
+        triage_system_prompt: Optional[str] = None,
+        triage_max_tokens: int = 256,
         extract_prompt_file: Optional[Union[str, Path]] = None,
         extract_prompt_template: Optional[Union[str, Dict[str, Any]]] = None,
         system_prompt: Optional[str] = None,
         variables: Optional[Dict[str, str]] = None,
+        id_column_name: str = "source_id",
+        sqlite_db_name: str = "extracted_database.db",
+        wide_table_name: str = "consolidated_wide_table",
+        relational_csv_dir: str = "relational_csv",
+        wide_list_separator: str = "; ",
     ) -> Dict[str, Any]:
         """Execute full multi-schema triage, extraction, and relational aggregation workflow."""
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. Load Dataset
-        if isinstance(input_data, list) and all(isinstance(r, Record) for r in input_data):
-            records = input_data[:limit] if limit else input_data
-        else:
-            records = DatasetLoader.load(
-                file_path_or_text=input_data,
-                text_column=text_column,
-                id_column=id_column,
-                limit=limit,
-            )
+        # 1. Load Dataset dynamically
+        records = DatasetLoader.load(
+            file_path_or_data=input_data,
+            text_column=text_column,
+            id_column=id_column,
+            metadata_columns=metadata_columns,
+            exclude_columns=exclude_columns,
+            limit=limit,
+        )
 
         if not records:
             logger.warning("No records to process.")
@@ -90,7 +108,7 @@ class SchemaMappingPipeline:
         chunker = TokenAwareChunker(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
-            strategy="sentence",
+            strategy=chunk_strategy,
         )
         chunks: List[ChunkRecord] = chunker.chunk_dataset(records)
         console.print(f"Segmented into {len(chunks)} token-budgeted chunks.")
@@ -109,7 +127,15 @@ class SchemaMappingPipeline:
             return {"total_records": len(records), "total_chunks": len(chunks), "schemas": len(self.catalog)}
 
         # 5. Initialize Engine
-        engine = self.base_pipeline.init_engine(batch_size=batch_size)
+        engine = self.base_pipeline.init_engine(
+            batch_size=batch_size,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            generation_kwargs=generation_kwargs,
+        )
 
         # 6. Schema Relevance Triage
         scheduled_tasks: List[Dict[str, Any]] = []
@@ -117,8 +143,13 @@ class SchemaMappingPipeline:
 
         if use_triage:
             console.print("\n[bold blue]Running Vectorized ChatML Batch Triage...[/bold blue]")
-            triage_filter = SchemaTriageFilter(self.catalog, prompt_file=triage_prompt_file)
-            chunk_active_map = triage_filter.triage_batch(chunks, engine)
+            triage_filter = SchemaTriageFilter(
+                self.catalog,
+                prompt_file=triage_prompt_file,
+                prompt_template=triage_prompt_template,
+                system_prompt=triage_system_prompt,
+            )
+            chunk_active_map = triage_filter.triage_batch(chunks, engine, max_new_tokens=triage_max_tokens)
 
             for ch in chunks:
                 chunk_key = f"{ch.record_id}_{ch.chunk_index}"
@@ -184,7 +215,6 @@ class SchemaMappingPipeline:
                     if pkg_fallback.exists():
                         extract_tmpl_path = pkg_fallback
                 if extract_tmpl_path.exists():
-                    import yaml
                     with open(extract_tmpl_path, "r", encoding="utf-8") as f:
                         extract_tmpl = yaml.safe_load(f) or {}
 
@@ -234,7 +264,13 @@ class SchemaMappingPipeline:
                 raw_results = engine.run_all(
                     items=payloads,
                     system_prompt=sys_prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
                     prompt_key="prompt",
+                    **(generation_kwargs or {}),
                 )
 
                 for res in raw_results:
@@ -261,7 +297,11 @@ class SchemaMappingPipeline:
 
         # 8. Relational Normalization
         console.print("\n[bold green]Normalizing into Relational Tables...[/bold green]")
-        relational_tables = RelationalNormalizer.normalize_dataset(extraction_records)
+        relational_tables = RelationalNormalizer.normalize_dataset(
+            extraction_records,
+            id_column_name=id_column_name,
+            child_separator=wide_list_separator,
+        )
 
         # 9. Output Exports
         formats = export_formats or ["sqlite", "csv", "wide"]
@@ -272,27 +312,42 @@ class SchemaMappingPipeline:
 
         # Export Relational CSVs
         if "csv" in formats:
-            csv_dir = out_dir / "relational_csv"
+            csv_dir = out_dir / relational_csv_dir
             csv_dir.mkdir(parents=True, exist_ok=True)
             for t_name, rows in relational_tables.items():
-                import pandas as pd
                 df = pd.DataFrame(rows)
                 df.to_csv(csv_dir / f"{t_name}.csv", index=False)
             outputs_summary["relational_csv_dir"] = str(csv_dir)
 
         # Export SQLite DB
         if "sqlite" in formats:
-            db_path = out_dir / "extracted_database.db"
-            SQLiteExporter.export(relational_tables, db_path)
+            db_path = out_dir / sqlite_db_name
+            SQLiteExporter.export(relational_tables, db_path, id_column_name=id_column_name)
             outputs_summary["sqlite_db"] = str(db_path)
 
         # Export Consolidated Wide Table
         if "wide" in formats:
-            wide_path = out_dir / "consolidated_wide_table.parquet"
-            WideTableBuilder.export(relational_tables, wide_path, source_texts=source_texts, output_format="parquet")
-            # Also save CSV version for easy inspection
-            WideTableBuilder.export(relational_tables, out_dir / "consolidated_wide_table.csv", source_texts=source_texts, output_format="csv")
-            outputs_summary["wide_table"] = str(wide_path)
+            wide_base = out_dir / wide_table_name
+            wide_parquet = wide_base.with_suffix(".parquet") if not str(wide_base).endswith(".parquet") else wide_base
+            wide_csv = wide_base.with_suffix(".csv") if not str(wide_base).endswith(".csv") else wide_base
+
+            WideTableBuilder.export(
+                relational_tables,
+                wide_parquet,
+                source_texts=source_texts,
+                output_format="parquet",
+                list_join_char=wide_list_separator,
+                id_column_name=id_column_name,
+            )
+            WideTableBuilder.export(
+                relational_tables,
+                wide_csv,
+                source_texts=source_texts,
+                output_format="csv",
+                list_join_char=wide_list_separator,
+                id_column_name=id_column_name,
+            )
+            outputs_summary["wide_table"] = str(wide_parquet)
 
         console.print(f"[bold green]SchemaMap Extraction & Relational Aggregation Complete![/bold green]")
         console.print(f"Generated {len(relational_tables)} relational tables across {len(records)} documents.")

@@ -5,7 +5,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 # Ensure project root is in sys.path when cli.py is executed directly
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -18,7 +18,6 @@ from rich.table import Table
 
 from prismrunner.pipeline import PrismPipeline
 from prismrunner.engine.device import get_optimal_device, get_memory_info
-from prismrunner.engine.model import load_model_and_tokenizer
 from prismrunner.engine.context import generate_hardware_advisory
 
 console = Console()
@@ -44,10 +43,15 @@ def common_options(f):
         click.option("--output-format", "-f", type=click.Choice(["json", "csv", "parquet"], case_sensitive=False), default="json", help="Output format."),
         click.option("--column", "--text-column", "text_column", type=str, help="Name of column containing input text."),
         click.option("--id-column", type=str, help="Name of column containing unique record ID."),
+        click.option("--metadata-columns", type=str, help="Comma-separated list of metadata columns to include."),
+        click.option("--exclude-columns", type=str, help="Comma-separated list of columns to exclude from metadata."),
         click.option("--limit", "-l", type=int, help="Maximum number of records to process."),
         click.option("--batch-size", "-b", type=int, default=4, help="Inference batch size."),
         click.option("--max-tokens", type=int, default=512, help="Maximum new tokens to generate."),
         click.option("--temperature", type=float, default=0.0, help="Sampling temperature (0.0 for deterministic)."),
+        click.option("--top-p", type=float, default=None, help="Top-p nucleus sampling probability threshold."),
+        click.option("--top-k", type=int, default=None, help="Top-k sampling threshold."),
+        click.option("--repetition-penalty", type=float, default=None, help="Repetition penalty parameter."),
         click.option("--chunk/--no-chunk", default=False, help="Enable token-aware sliding window chunking."),
         click.option("--chunk-size", type=int, default=1024, help="Tokens per chunk window."),
         click.option("--chunk-overlap", type=int, default=64, help="Tokens overlap between chunks."),
@@ -55,6 +59,15 @@ def common_options(f):
         click.option("--schema", "-s", "schema_spec", type=str, help="Custom schema class spec: 'path/to/file.py:ClassName'."),
         click.option("--prompt-file", type=click.Path(exists=True), help="Path to custom prompt template YAML."),
         click.option("--instruction", type=str, help="Instruction override for prompt template."),
+        click.option("--system-prompt", type=str, help="System prompt override for chat format."),
+        click.option("--as-array/--single-object", "as_array", default=None, help="Instruct model to output JSON array vs single object."),
+        click.option("--dedup/--no-dedup", default=True, help="Enable deduplication of extracted items across chunks."),
+        click.option("--dedup-key", type=str, help="Field or key name used to identify unique extracted items."),
+        click.option("--category-field", type=str, help="Field name containing category for classification."),
+        click.option("--confidence-field", type=str, help="Field name containing confidence for classification."),
+        click.option("--reasoning-field", type=str, help="Field name containing reasoning for classification."),
+        click.option("--summary-field", type=str, help="Field name containing summary text for summarization."),
+        click.option("--points-field", type=str, help="Field name containing bullet points for summarization."),
         click.option("--var", "variables", multiple=True, help="Inject prompt variable as KEY=VALUE."),
         click.option("--model", "-m", type=str, help="Hugging Face model repository ID or local path."),
         click.option("--device", "-d", type=str, help="Compute device (auto, mps, cuda, cpu)."),
@@ -102,11 +115,24 @@ def summarize(**kwargs):
 @click.option("--export", default="sqlite,csv,wide", help="Comma-separated exports: sqlite,csv,wide.")
 @click.option("--column", "--text-column", "text_column", type=str, help="Column name containing text to process.")
 @click.option("--id-column", type=str, help="Column name for unique record identifier.")
+@click.option("--metadata-columns", type=str, help="Comma-separated list of metadata columns to include.")
+@click.option("--exclude-columns", type=str, help="Comma-separated list of columns to exclude from metadata.")
 @click.option("--batch-size", "-b", type=int, default=4, help="Inference batch size.")
+@click.option("--max-tokens", type=int, default=512, help="Maximum new tokens to generate.")
+@click.option("--temperature", type=float, default=0.0, help="Sampling temperature.")
+@click.option("--top-p", type=float, default=None, help="Top-p nucleus sampling probability threshold.")
+@click.option("--top-k", type=int, default=None, help="Top-k sampling threshold.")
+@click.option("--repetition-penalty", type=float, default=None, help="Repetition penalty parameter.")
 @click.option("--triage/--no-triage", default=True, help="Enable fast schema relevance triage filter.")
+@click.option("--triage-max-tokens", type=int, default=256, help="Maximum tokens for triage classification.")
 @click.option("--resume/--no-resume", default=True, help="Enable fault-tolerant checkpoint resume.")
 @click.option("--chunk-size", type=int, default=1024, help="Tokens per chunk window.")
 @click.option("--chunk-overlap", type=int, default=64, help="Tokens overlap between chunks.")
+@click.option("--chunk-strategy", type=click.Choice(["sentence", "token"], case_sensitive=False), default="sentence", help="Boundary strategy.")
+@click.option("--id-column-name", default="source_id", help="Foreign key column name linking parent records in normalized tables.")
+@click.option("--wide-table-name", default="consolidated_wide_table", help="Base file name for wide denormalized export.")
+@click.option("--sqlite-db-name", default="extracted_database.db", help="SQLite database file name.")
+@click.option("--wide-separator", default="; ", help="Separator used when concatenating multi-value fields in wide tables.")
 @click.option("--limit", "-l", type=int, help="Limit number of input records.")
 @click.option("--dry-run", is_flag=True, help="Inspect schema catalog and execution plan without running inference.")
 def map_cmd(**kwargs):
@@ -114,19 +140,34 @@ def map_cmd(**kwargs):
     from prismrunner.mapping_pipeline import SchemaMappingPipeline
     pipeline = SchemaMappingPipeline(schemas_dir=kwargs["schemas_dir"])
     export_formats = [f.strip().lower() for f in kwargs["export"].split(",") if f.strip()]
+    meta_cols = [c.strip() for c in kwargs["metadata_columns"].split(",") if c.strip()] if kwargs.get("metadata_columns") else None
+    excl_cols = [c.strip() for c in kwargs["exclude_columns"].split(",") if c.strip()] if kwargs.get("exclude_columns") else None
     pipeline.run(
         input_data=kwargs["input_path"],
         output_dir=kwargs["output_dir"],
         text_column=kwargs.get("text_column"),
         id_column=kwargs.get("id_column"),
+        metadata_columns=meta_cols,
+        exclude_columns=excl_cols,
         limit=kwargs.get("limit"),
         batch_size=kwargs.get("batch_size"),
+        max_new_tokens=kwargs.get("max_tokens"),
+        temperature=kwargs.get("temperature"),
+        top_p=kwargs.get("top_p"),
+        top_k=kwargs.get("top_k"),
+        repetition_penalty=kwargs.get("repetition_penalty"),
         use_triage=kwargs.get("triage", True),
+        triage_max_tokens=kwargs.get("triage_max_tokens", 256),
         resume=kwargs.get("resume", True),
         export_formats=export_formats,
         dry_run=kwargs.get("dry_run", False),
         chunk_size=kwargs.get("chunk_size", 1024),
         chunk_overlap=kwargs.get("chunk_overlap", 64),
+        chunk_strategy=kwargs.get("chunk_strategy", "sentence"),
+        id_column_name=kwargs.get("id_column_name", "source_id"),
+        sqlite_db_name=kwargs.get("sqlite_db_name", "extracted_database.db"),
+        wide_table_name=kwargs.get("wide_table_name", "consolidated_wide_table"),
+        wide_list_separator=kwargs.get("wide_separator", "; "),
     )
 
 
@@ -192,6 +233,12 @@ def _run_task_cli(task: str, kwargs: dict):
         overrides.setdefault("inference", {})["max_new_tokens"] = kwargs["max_tokens"]
     if kwargs.get("temperature") is not None:
         overrides.setdefault("inference", {})["temperature"] = kwargs["temperature"]
+    if kwargs.get("top_p") is not None:
+        overrides.setdefault("inference", {})["top_p"] = kwargs["top_p"]
+    if kwargs.get("top_k") is not None:
+        overrides.setdefault("inference", {})["top_k"] = kwargs["top_k"]
+    if kwargs.get("repetition_penalty") is not None:
+        overrides.setdefault("inference", {})["repetition_penalty"] = kwargs["repetition_penalty"]
 
     pipeline = PrismPipeline(
         config_path=kwargs.get("config"),
@@ -205,21 +252,38 @@ def _run_task_cli(task: str, kwargs: dict):
         from prismrunner.schemas.compiler import load_schema_from_string
         schema_cls = load_schema_from_string(kwargs["schema_spec"])
 
+    meta_cols = [c.strip() for c in kwargs["metadata_columns"].split(",") if c.strip()] if kwargs.get("metadata_columns") else None
+    excl_cols = [c.strip() for c in kwargs["exclude_columns"].split(",") if c.strip()] if kwargs.get("exclude_columns") else None
+
     results = pipeline.run(
         task=task,
         input_data=input_source,
         schema_cls=schema_cls,
         text_column=kwargs.get("text_column"),
         id_column=kwargs.get("id_column"),
+        metadata_columns=meta_cols,
+        exclude_columns=excl_cols,
         limit=kwargs.get("limit"),
         batch_size=kwargs.get("batch_size"),
         max_new_tokens=kwargs.get("max_tokens"),
         temperature=kwargs.get("temperature"),
+        top_p=kwargs.get("top_p"),
+        top_k=kwargs.get("top_k"),
+        repetition_penalty=kwargs.get("repetition_penalty"),
         chunk=kwargs.get("chunk"),
         chunk_size=kwargs.get("chunk_size"),
         chunk_overlap=kwargs.get("chunk_overlap"),
         chunk_strategy=kwargs.get("chunk_strategy"),
         prompt_file=kwargs.get("prompt_file"),
+        system_prompt=kwargs.get("system_prompt"),
+        as_array=kwargs.get("as_array"),
+        dedup=kwargs.get("dedup", True),
+        dedup_key=kwargs.get("dedup_key"),
+        category_field=kwargs.get("category_field"),
+        confidence_field=kwargs.get("confidence_field"),
+        reasoning_field=kwargs.get("reasoning_field"),
+        summary_field=kwargs.get("summary_field"),
+        points_field=kwargs.get("points_field"),
         variables=vars_dict,
         instruction=kwargs.get("instruction"),
         output_path=kwargs.get("output_path"),

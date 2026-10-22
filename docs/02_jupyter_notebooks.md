@@ -49,7 +49,8 @@ print(compiled.render_prompt_block(as_array=True))
 
 You can run PrismRunner directly on Pandas DataFrames or Parquet/CSV files.
 
-### Option A: From an Existing DataFrame
+### Option A: Directly from a Pandas DataFrame
+You can pass a DataFrame directly into `pipeline.run` with `text_column` and `id_column`:
 ```python
 df = pd.DataFrame({
     "patient_id": ["PT-101", "PT-102", "PT-103"],
@@ -60,16 +61,22 @@ df = pd.DataFrame({
     ]
 })
 
-# Convert to PrismRunner Record objects
+# You can pass df directly:
+# pipeline.run(task="extract", input_data=df, text_column="clinical_note", id_column="patient_id", ...)
+```
+
+### Option B: From Record Objects or Lists
+You can also pass pre-constructed `Record` objects, a list of dicts, or a list of raw strings:
+```python
 records = [
     Record(id=row["patient_id"], index=i, text=row["clinical_note"])
     for i, row in df.iterrows()
 ]
 ```
 
-### Option B: Directly from File Path
+### Option C: Directly from File Path
 ```python
-# Parquet, CSV, JSON, TXT, or Markdown
+# Parquet, CSV, TSV, JSON, JSONL, TXT, or Markdown
 input_path = "data/patient_notes.parquet"
 ```
 

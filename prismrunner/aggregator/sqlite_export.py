@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 import sqlite3
-from typing import Any, Dict, List, Set, Union
+from typing import Any, Dict, List, Union
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,7 @@ class SQLiteExporter:
     def export(
         tables: Dict[str, List[Dict[str, Any]]],
         db_path: Union[str, Path],
+        id_column_name: str = "source_id",
     ) -> Path:
         """Create or update SQLite database with normalized relational tables."""
         target_path = Path(db_path)
@@ -59,11 +60,12 @@ class SQLiteExporter:
                     create_stmt = f'CREATE TABLE IF NOT EXISTS "{table_name}" ({", ".join(cols_def)});'
                     cursor.execute(create_stmt)
 
-                    # Create index on source_id for relational joins
-                    if "source_id" in col_types:
-                        idx_name = f"idx_{table_name}_source_id"
+                    # Create index on the primary document ID column for relational joins
+                    target_id_col = id_column_name if id_column_name in col_types else ("source_id" if "source_id" in col_types else None)
+                    if target_id_col:
+                        idx_name = f"idx_{table_name}_{target_id_col}"
                         cursor.execute(
-                            f'CREATE INDEX IF NOT EXISTS "{idx_name}" ON "{table_name}" ("source_id");'
+                            f'CREATE INDEX IF NOT EXISTS "{idx_name}" ON "{table_name}" ("{target_id_col}");'
                         )
 
                     # Insert rows

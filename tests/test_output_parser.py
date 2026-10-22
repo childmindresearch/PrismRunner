@@ -83,6 +83,36 @@ Hope this helps!"""
         self.assertEqual(result.items[1], "Second item")
         self.assertEqual(result.items[2], "Third item")
 
+    def test_container_dict_unwrapping(self):
+        raw = '{"items": [{"name": "Delta", "value": 40}, {"name": "Epsilon", "value": 50}]}'
+        result = UniversalOutputParser.parse(raw, model_cls=StrictSchema)
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.items), 2)
+        self.assertEqual(result.items[0].name, "Delta")
+        self.assertEqual(result.items[1].name, "Epsilon")
+
+    def test_markdown_bullet_json_strings(self):
+        raw = """Here are the items:
+- {"name": "ItemA", "value": 1}
+- {"name": "ItemB", "value": 2}"""
+        result = UniversalOutputParser.parse(raw, model_cls=StrictSchema)
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.items), 2)
+        self.assertEqual(result.items[0].name, "ItemA")
+        self.assertEqual(result.items[1].name, "ItemB")
+
+    def test_single_field_scalar_mapping(self):
+        class Diagnosis(BaseModel):
+            condition: str
+
+        raw = """- Type 2 Diabetes
+- Essential Hypertension"""
+        result = UniversalOutputParser.parse(raw, model_cls=Diagnosis)
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.items), 2)
+        self.assertEqual(result.items[0].condition, "Type 2 Diabetes")
+        self.assertEqual(result.items[1].condition, "Essential Hypertension")
+
 
 if __name__ == "__main__":
     unittest.main()

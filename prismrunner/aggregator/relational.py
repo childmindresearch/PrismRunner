@@ -52,6 +52,8 @@ class RelationalNormalizer:
         root_schema_name: str,
         source_id: str,
         metadata: Optional[Dict[str, Any]] = None,
+        id_column_name: str = "source_id",
+        child_separator: str = "_",
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Decompose a single extracted payload (dict, BaseModel, or list) into normalized relational tables."""
         tables: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -76,7 +78,7 @@ class RelationalNormalizer:
                 foreign_keys = {}
 
             row_data = dict(foreign_keys)
-            row_data.setdefault("source_id", source_id)
+            row_data.setdefault(id_column_name, source_id)
             for mk, mv in base_meta.items():
                 row_data.setdefault(mk, mv)
 
@@ -106,9 +108,9 @@ class RelationalNormalizer:
             # Process 1-to-many child list items
             parent_idx = row_data.get("item_index")
             for list_key, items in list_fields.items():
-                child_table = f"{table_name}_{list_key}"
+                child_table = f"{table_name}{child_separator}{list_key}"
                 for idx, child_item in enumerate(items):
-                    child_fk = {"source_id": source_id}
+                    child_fk = {id_column_name: source_id}
                     if parent_idx is not None:
                         child_fk["parent_item_index"] = parent_idx
                     child_fk["item_index"] = idx
@@ -123,10 +125,10 @@ class RelationalNormalizer:
 
         if isinstance(payload, list):
             for idx, item in enumerate(payload):
-                fk = {"source_id": source_id, "item_index": idx}
+                fk = {id_column_name: source_id, "item_index": idx}
                 process_object(item, root_schema_name, foreign_keys=fk)
         else:
-            process_object(payload, root_schema_name, foreign_keys={"source_id": source_id})
+            process_object(payload, root_schema_name, foreign_keys={id_column_name: source_id})
 
         return dict(tables)
 
@@ -134,12 +136,14 @@ class RelationalNormalizer:
     def normalize_dataset(
         cls,
         extractions: List[Dict[str, Any]],
+        id_column_name: str = "source_id",
+        child_separator: str = "_",
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Aggregate multiple extracted records across all schemas into consolidated relational tables."""
         all_tables: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
         for record in extractions:
-            src_id = str(record.get("source_id", record.get("id", "unknown")))
+            src_id = str(record.get(id_column_name, record.get("source_id", record.get("record_id", record.get("id", "unknown")))))
             schema_name = record.get("schema_name", "Extraction")
             data = record.get("data", record.get("result", record.get("extracted_items", {})))
             meta = {k: v for k, v in record.items() if k not in ("data", "result", "extracted_items", "raw_output")}
@@ -149,6 +153,8 @@ class RelationalNormalizer:
                 root_schema_name=schema_name,
                 source_id=src_id,
                 metadata=meta,
+                id_column_name=id_column_name,
+                child_separator=child_separator,
             )
 
             for t_name, rows in rec_tables.items():

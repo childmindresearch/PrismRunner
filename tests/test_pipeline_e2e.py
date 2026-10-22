@@ -92,6 +92,37 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertAlmostEqual(stitched[0]["confidence"], 0.925, places=2)
         self.assertEqual(stitched[0]["num_chunks_evaluated"], 2)
 
+    def test_pipeline_run_forwards_sampling_and_generation_kwargs(self):
+        mock_engine = MagicMock()
+        mock_engine.run_all.return_value = [
+            {
+                "record_id": "rec_1",
+                "record_index": 0,
+                "chunk_index": 0,
+                "total_chunks": 1,
+                "text": "Sample clinical text",
+                "raw_output": '```json\n[{"category": "Health", "confidence": 0.99, "reasoning": "Clinical"}]\n```',
+                "metadata": {},
+            }
+        ]
+        self.pipeline.engine = mock_engine
+
+        res = self.pipeline.run(
+            task="classify",
+            input_data=[Record(id="rec_1", index=0, text="Sample clinical text")],
+            top_p=0.85,
+            top_k=40,
+            repetition_penalty=1.15,
+            generation_kwargs={"min_length": 10},
+        )
+        self.assertEqual(len(res), 1)
+        mock_engine.run_all.assert_called_once()
+        _, call_kwargs = mock_engine.run_all.call_args
+        self.assertEqual(call_kwargs.get("top_p"), 0.85)
+        self.assertEqual(call_kwargs.get("top_k"), 40)
+        self.assertEqual(call_kwargs.get("repetition_penalty"), 1.15)
+        self.assertEqual(call_kwargs.get("min_length"), 10)
+
 
 if __name__ == "__main__":
     unittest.main()

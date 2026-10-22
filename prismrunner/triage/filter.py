@@ -3,7 +3,7 @@
 from __future__ import annotations
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 import yaml
 from pydantic import BaseModel, Field
 
@@ -32,8 +32,13 @@ class SchemaTriageFilter:
         self,
         catalog: SchemaCatalog,
         prompt_file: Optional[Union[str, Path]] = "prompts/triage.yaml",
+        prompt_template: Optional[Union[str, Dict[str, Any]]] = None,
+        system_prompt: Optional[str] = None,
     ):
         self.catalog = catalog
+        self.prompt_template = prompt_template
+        self.system_prompt_override = system_prompt
+
         t_path = Path(prompt_file) if prompt_file else Path("prompts/triage.yaml")
         if not t_path.exists():
             pkg_fallback = Path(__file__).resolve().parent.parent.parent / t_path
@@ -43,14 +48,21 @@ class SchemaTriageFilter:
         self.compiled_schema = compile_schema_to_prompt(TriageResult)
 
     def build_triage_prompt(self, text: str) -> str:
-        """Construct a lightweight triage classification prompt using prompts/triage.yaml."""
+        """Construct a lightweight triage classification prompt."""
         catalog_summary = self.catalog.build_triage_summary()
         schema_block = self.compiled_schema.render_prompt_block(as_array=False)
 
-        if self.prompt_file.exists():
+        tmpl: Dict[str, Any] = {}
+        if self.prompt_template is not None:
+            if isinstance(self.prompt_template, dict):
+                tmpl = dict(self.prompt_template)
+            elif isinstance(self.prompt_template, str):
+                tmpl = {"prompt": self.prompt_template, "variables": {}}
+        elif self.prompt_file.exists():
             with open(self.prompt_file, "r", encoding="utf-8") as f:
                 tmpl = yaml.safe_load(f) or {}
 
+        if tmpl:
             raw_prompt = tmpl.get("prompt", "")
             variables = dict(tmpl.get("variables", {}))
             variables["instruction"] = tmpl.get("instruction", "")
@@ -63,7 +75,7 @@ class SchemaTriageFilter:
             rendered = rendered.replace("{{ text }}", text).replace("{{ text}}", text)
             return rendered
 
-        # Built-in fallback if YAML is absent
+        # Built-in fallback if no template configured
         return (
             "You are an expert data triage classifier. Your task is to analyze the text excerpt and "
             "identify which of the candidate schemas have concrete, factual evidence present.\n\n"
@@ -77,14 +89,15 @@ class SchemaTriageFilter:
         self,
         chunks: List[ChunkRecord],
         engine: BatchInferenceEngine,
+        max_new_tokens: int = 256,
     ) -> Dict[str, List[SchemaMeta]]:
         """Run vectorized batch triage over chunks to determine active schemas per chunk."""
         if not chunks or len(self.catalog) == 0:
             return {}
 
         # Build prompts
-        sys_prompt = "You are a fast, factual schema triage filter. Output valid JSON only."
-        if self.prompt_file.exists():
+        sys_prompt = self.system_prompt_override or "You are a fast, factual schema triage filter. Output valid JSON only."
+        if not self.system_prompt_override and self.prompt_file.exists():
             with open(self.prompt_file, "r", encoding="utf-8") as f:
                 tmpl = yaml.safe_load(f) or {}
             sys_prompt = tmpl.get("system_prompt") or sys_prompt
@@ -100,7 +113,7 @@ class SchemaTriageFilter:
             prompts.append(formatted)
 
         # Batch inference
-        completions = engine.generate_batch(prompts, max_new_tokens=128, temperature=0.0)
+        completions = engine.generate_batch(prompts, max_new_tokens=max_new_tokens, temperature=0.0)
 
         chunk_active_schemas: Dict[str, List[SchemaMeta]] = {}
 

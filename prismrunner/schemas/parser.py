@@ -12,6 +12,10 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+FENCE_PATTERN = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
+TRAILING_COMMA_PATTERN = re.compile(r",\s*([\]}])")
+BULLET_PATTERN = re.compile(r"^[-*•]\s+(.*)$|^\d+[\.\)]\s+(.*)$")
+
 
 @dataclass
 class ParseResult(Generic[T]):
@@ -36,7 +40,7 @@ def is_phantom_object(data: Any) -> bool:
 def _strip_markdown_fences(text: str) -> str:
     """Remove markdown ```json ... ``` or ``` ... ``` wrappers."""
     # Look for code block contents
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+    match = FENCE_PATTERN.search(text)
     if match:
         return match.group(1).strip()
     return text.strip()
@@ -45,8 +49,7 @@ def _strip_markdown_fences(text: str) -> str:
 def _repair_common_json_glitches(text: str) -> str:
     """Fix common LLM JSON syntax errors like trailing commas."""
     # Remove trailing commas before closing braces or brackets: , \s* } -> }
-    repaired = re.sub(r",\s*([\]}])", r"\1", text)
-    return repaired
+    return TRAILING_COMMA_PATTERN.sub(r"\1", text)
 
 
 def _extract_bracket_substring(text: str) -> Optional[str]:
@@ -116,7 +119,7 @@ def parse_raw_text(text: str) -> Any:
         if not line:
             continue
         # Strip bullet prefixes like "- ", "* ", "1. "
-        bullet_match = re.match(r"^[-*•]\s+(.*)$|^\d+[\.\)]\s+(.*)$", line)
+        bullet_match = BULLET_PATTERN.match(line)
         if bullet_match:
             item = bullet_match.group(1) or bullet_match.group(2)
             if item:
@@ -179,15 +182,44 @@ class UniversalOutputParser:
         if isinstance(raw_parsed, list):
             candidates = raw_parsed
         elif isinstance(raw_parsed, dict):
-            candidates = [raw_parsed]
+            # Check if LLM wrapped array in an outer container dict e.g. {"items": [...]}
+            wrapper_keys = ("items", "results", "data", "extractions", "entities", "records", "output", "elements")
+            found_wrapped_list = None
+            for wk in wrapper_keys:
+                if wk in raw_parsed and isinstance(raw_parsed[wk], list) and wk not in model_cls.model_fields:
+                    found_wrapped_list = raw_parsed[wk]
+                    break
+            if found_wrapped_list is not None:
+                candidates = found_wrapped_list
+            else:
+                candidates = [raw_parsed]
         else:
-            # If string or lines, try to adapt if single string field
-            candidates = [{"item": raw_parsed}]
+            candidates = [raw_parsed]
 
         validated_items: List[BaseModel] = []
         errors: List[str] = []
 
         for cand in candidates:
+            # If candidate is a string starting with '{' and ending with '}', attempt json parsing
+            if isinstance(cand, str) and cand.strip().startswith("{") and cand.strip().endswith("}"):
+                try:
+                    cand = json.loads(cand)
+                except Exception:
+                    pass
+
+            # If candidate is a scalar (string, int, etc.) and model expects fields
+            if not isinstance(cand, dict) and isinstance(cand, (str, int, float, bool)):
+                # If model has exactly 1 field, map directly to that field
+                if len(model_cls.model_fields) == 1:
+                    single_field = next(iter(model_cls.model_fields.keys()))
+                    cand = {single_field: cand}
+                elif "item" in model_cls.model_fields:
+                    cand = {"item": cand}
+                elif "name" in model_cls.model_fields:
+                    cand = {"name": cand}
+                elif "text" in model_cls.model_fields:
+                    cand = {"text": cand}
+
             # CRITICAL REQUIREMENT: Discard phantom objects where all fields are None
             if is_phantom_object(cand):
                 logger.debug(f"Discarded phantom object with all None fields: {cand}")

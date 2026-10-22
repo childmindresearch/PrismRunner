@@ -130,13 +130,20 @@ def _inspect_field(
     # Check List
     if origin in (list, List):
         inner_args = get_args(unwrapped)
-        if inner_args and inner_args[0] in (str, int, float):
-            inner_name = inner_args[0].__name__
-            spec = f"- \"{name}\": list of {inner_name}s{desc_str}"
-            sample = ["example_item_1", "example_item_2"]
-        else:
-            spec = f"- \"{name}\": list of items{desc_str}"
-            sample = ["item_1", "item_2"]
+        if inner_args:
+            inner_type = _unwrap_type(inner_args[0])
+            if isinstance(inner_type, type) and issubclass(inner_type, BaseModel):
+                sub_compiled = compile_schema_to_prompt(inner_type)
+                spec = f"- \"{name}\": list of {inner_type.__name__} objects with fields:\n  " + sub_compiled.field_bullets.replace("\n", "\n  ") + desc_str
+                sample = [json.loads(sub_compiled.sample_json)]
+                return spec, sample
+            elif inner_type in (str, int, float, bool):
+                inner_name = "string" if inner_type is str else ("integer" if inner_type is int else ("number" if inner_type is float else "boolean"))
+                spec = f"- \"{name}\": list of {inner_name}s{desc_str}"
+                sample = ["example_item_1", "example_item_2"] if inner_type is str else ([1, 2] if inner_type is int else ([1.0, 2.0] if inner_type is float else [True, False]))
+                return spec, sample
+        spec = f"- \"{name}\": list of items{desc_str}"
+        sample = ["item_1", "item_2"]
         return spec, sample
 
     # Check Nested BaseModel
@@ -144,6 +151,12 @@ def _inspect_field(
         sub_compiled = compile_schema_to_prompt(unwrapped)
         spec = f"- \"{name}\": object with fields:\n  " + sub_compiled.field_bullets.replace("\n", "\n  ") + desc_str
         sample = json.loads(sub_compiled.sample_json)
+        return spec, sample
+
+    # Check Dict / Mapping
+    if origin in (dict, Dict) or unwrapped is dict:
+        spec = f"- \"{name}\": key-value dictionary{desc_str}"
+        sample = {"key": "value"}
         return spec, sample
 
     # Default: String

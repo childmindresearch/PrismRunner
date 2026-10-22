@@ -107,6 +107,20 @@ class TestRelationalAggregator(unittest.TestCase):
         self.assertEqual(med_row[0], "Ibuprofen")
         conn.close()
 
+    def test_sqlite_exporter_custom_id_column(self):
+        tables = {
+            "Patient": [{"mrn": "12345", "diagnosis": "Hypertension"}]
+        }
+        db_path = os.path.join(self.temp_dir.name, "custom_id.db")
+        SQLiteExporter.export(tables, db_path, id_column_name="mrn")
+
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='Patient'")
+        indexes = [row[0] for row in cursor.fetchall()]
+        self.assertIn("idx_Patient_mrn", indexes)
+        conn.close()
+
     def test_wide_table_builder(self):
         enc1 = PatientEncounter(
             patient_id="P_001",
@@ -148,6 +162,53 @@ class TestRelationalAggregator(unittest.TestCase):
         self.assertEqual(doc2_row["num_Encounter_medications"], 2)
         self.assertIn("Guaifenesin", doc2_row["Encounter_medications_name"])
         self.assertIn("Honey", doc2_row["Encounter_medications_name"])
+
+    def test_relational_normalizer_custom_id_column_and_separator(self):
+        enc = PatientEncounter(
+            patient_id="P_005",
+            chief_complaint="Migraine",
+            medications=[MedicationItem(name="Sumatriptan", dosage="50mg")],
+        )
+
+        dataset = [
+            {
+                "mrn": "patient_99",
+                "schema_name": "Encounter",
+                "data": enc,
+            }
+        ]
+
+        tables = RelationalNormalizer.normalize_dataset(
+            dataset,
+            id_column_name="mrn",
+            child_separator="__",
+        )
+
+        self.assertIn("Encounter", tables)
+        self.assertIn("Encounter__medications", tables)
+        self.assertEqual(tables["Encounter"][0]["mrn"], "patient_99")
+        self.assertEqual(tables["Encounter__medications"][0]["mrn"], "patient_99")
+        self.assertEqual(tables["Encounter__medications"][0]["name"], "Sumatriptan")
+
+    def test_wide_table_builder_custom_id_column_and_separator(self):
+        tables = {
+            "Encounter": [{"mrn": "rec_1", "chief_complaint": "Allergy"}],
+            "Encounter_meds": [
+                {"mrn": "rec_1", "item_index": 0, "name": "Claritin"},
+                {"mrn": "rec_1", "item_index": 1, "name": "Flonase"},
+            ],
+        }
+
+        df = WideTableBuilder.build(
+            tables,
+            id_column_name="mrn",
+            list_join_char=" /// ",
+        )
+
+        self.assertEqual(len(df), 1)
+        self.assertIn("mrn", df.columns)
+        self.assertEqual(df.iloc[0]["mrn"], "rec_1")
+        self.assertEqual(df.iloc[0]["Encounter_meds_name"], "Claritin /// Flonase")
 
 
 if __name__ == "__main__":
