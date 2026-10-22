@@ -38,24 +38,21 @@ class LabFinding(BaseModel):
 
 ---
 
-## 2. Dynamic Runtime Schemas (`load_schema_from_string`)
+## 2. Dynamic Schema Loading (`load_schema_from_string`)
 
-You can compile schemas dynamically from Python code strings at runtime without saving a `.py` file to disk:
+You can load schemas dynamically from a file path or Python module specifier at runtime:
 
 ```python
 from prismrunner.schemas.compiler import load_schema_from_string
 
-schema_code = """
-from pydantic import BaseModel, Field
+# Load from a local Python file:
+MedicationModel = load_schema_from_string("schemas/clinical_records.py:Medication")
 
-class HardwareComponent(BaseModel):
-    name: str = Field(description="Component name (CPU, GPU, RAM, etc.)")
-    architecture: str = Field(description="Architecture or fabrication node")
-    tdp_watts: int = Field(description="Thermal design power in watts")
-"""
-
-DynamicModel = load_schema_from_string(schema_code, "HardwareComponent")
+# Or load from an importable Python module:
+DiagnosticModel = load_schema_from_string("my_package.models:Diagnosis")
 ```
+
+This is also utilized by the CLI `--schema` flag (`--schema schemas/clinical_records.py:Medication`).
 
 ---
 

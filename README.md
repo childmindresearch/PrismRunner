@@ -161,7 +161,10 @@ prismrunner classify \
 
 ## Python API
 
+PrismRunner natively accepts Pandas DataFrames, lists of dictionaries, raw text strings, or file paths with zero conversion boilerplate:
+
 ```python
+import pandas as pd
 from pydantic import BaseModel, Field
 from typing import Literal
 from prismrunner import PrismPipeline
@@ -172,15 +175,28 @@ class TechAssessment(BaseModel):
     maturity_level: Literal["experimental", "beta", "production"] = Field(description="Deployment maturity")
     score: float = Field(ge=0.0, le=10.0, description="Readiness score from 0 to 10")
 
-# Initialize pipeline
+# Initialize pipeline (auto-detects Apple Silicon MPS, NVIDIA CUDA, or CPU)
 pipeline = PrismPipeline()
 
-# Run extraction into custom schema
+# Ingest directly from Pandas DataFrame or in-memory data
+df = pd.DataFrame({
+    "service_id": ["SRV-01", "SRV-02"],
+    "system_report": [
+        "Migrated monolith to event-driven microservices using Kafka. Production ready.",
+        "Prototyping serverless edge functions for latency-critical routing.",
+    ]
+})
+
 results = pipeline.run(
     task="extract",
-    input_data="Sample system report describing microservices transition...",
+    input_data=df,
+    text_column="system_report",
+    id_column="service_id",
     schema_cls=TechAssessment,
+    instruction="Extract system architecture details and readiness level.",
     batch_size=4,
+    temperature=0.0,
+    top_p=0.95,
 )
 
 print(results)
