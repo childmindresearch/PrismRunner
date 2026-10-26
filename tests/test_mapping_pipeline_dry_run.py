@@ -41,6 +41,43 @@ class TestMappingPipelineDryRun(unittest.TestCase):
         self.assertEqual(summary["total_records"], 2)
         self.assertEqual(summary["schemas"], 2)
 
+    def test_mapping_cross_chunk_deduplication(self):
+        from unittest.mock import MagicMock
+        import tempfile
+        from pathlib import Path
+
+        catalog = SchemaCatalog()
+        catalog.register(Diagnosis)
+
+        pipeline = SchemaMappingPipeline(catalog=catalog)
+        # Mock engine to return duplicate diagnosis from two chunks of the same doc
+        mock_engine = MagicMock()
+        mock_engine.run_all.return_value = [
+            {"record_id": "doc_001", "chunk_index": 0, "raw_output": '[{"condition": "Asthma"}]'},
+            {"record_id": "doc_001", "chunk_index": 1, "raw_output": '[{"condition": "Asthma"}]'},
+        ]
+        pipeline.base_pipeline.engine = mock_engine
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            records = [
+                Record(id="doc_001", index=0, text="Patient has asthma. More notes about asthma."),
+            ]
+            summary = pipeline.run(
+                input_data=records,
+                output_dir=tmp_dir,
+                use_triage=False,
+                resume=False,
+                chunk_size=10,
+                export_formats=["csv"],
+            )
+            # Check the relational CSV has exactly 1 row for Asthma, not 2
+            diag_csv = Path(tmp_dir) / "relational_csv" / "Diagnosis.csv"
+            self.assertTrue(diag_csv.exists())
+            import pandas as pd
+            df = pd.read_csv(diag_csv)
+            self.assertEqual(len(df), 1)
+            self.assertEqual(df.iloc[0]["condition"], "Asthma")
+
 
 if __name__ == "__main__":
     unittest.main()

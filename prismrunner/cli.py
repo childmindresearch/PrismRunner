@@ -5,7 +5,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Tuple
 
 # Ensure project root is in sys.path when cli.py is executed directly
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -34,50 +34,107 @@ def _parse_vars(var_tuples: Tuple[str, ...]) -> dict:
     return parsed
 
 
+def apply_options(options):
+    """Apply a list of Click option decorators in reverse order."""
+    def decorator(f):
+        for opt in reversed(options):
+            f = opt(f)
+        return f
+    return decorator
+
+
+SHARED_ENGINE_OPTIONS = [
+    click.option("--model", "-m", type=str, help="Hugging Face model repository ID or local path."),
+    click.option("--device", "-d", type=str, help="Compute device (auto, mps, cuda, cpu)."),
+    click.option("--batch-size", "-b", type=int, default=4, help="Inference batch size."),
+    click.option("--max-tokens", type=int, default=512, help="Maximum new tokens to generate."),
+    click.option("--temperature", type=float, default=0.0, help="Sampling temperature (0.0 for deterministic)."),
+    click.option("--top-p", type=float, default=None, help="Top-p nucleus sampling probability threshold."),
+    click.option("--top-k", type=int, default=None, help="Top-k sampling threshold."),
+    click.option("--repetition-penalty", type=float, default=None, help="Repetition penalty parameter."),
+    click.option("--config", "-c", type=click.Path(exists=True), help="Pipeline config YAML path."),
+]
+
+SHARED_IO_OPTIONS = [
+    click.option("--column", "--text-column", "text_column", type=str, help="Name of column containing input text."),
+    click.option("--id-column", type=str, help="Name of column containing unique record ID."),
+    click.option("--metadata-columns", type=str, help="Comma-separated list of metadata columns to include."),
+    click.option("--exclude-columns", type=str, help="Comma-separated list of columns to exclude from metadata."),
+    click.option("--limit", "-l", type=int, help="Maximum number of records to process."),
+    click.option("--dry-run", is_flag=True, help="Render prompt and inspect pipeline without loading model."),
+]
+
+SHARED_CHUNKING_OPTIONS = [
+    click.option("--chunk-size", type=int, default=1024, help="Tokens per chunk window."),
+    click.option("--chunk-overlap", type=int, default=64, help="Tokens overlap between chunks."),
+    click.option("--chunk-strategy", type=click.Choice(["sentence", "token"], case_sensitive=False), default="sentence", help="Boundary strategy."),
+]
+
+TASK_IO_OPTIONS = [
+    click.option("--input-path", "-i", type=click.Path(exists=False), help="Path to input dataset (.parquet, .csv, .json, .txt)."),
+    click.option("--input-text", "-t", type=str, help="Single raw text string to process directly."),
+    click.option("--output-path", "-o", type=click.Path(), help="Output file destination."),
+    click.option("--output-format", "-f", type=click.Choice(["json", "csv", "parquet"], case_sensitive=False), default="json", help="Output format."),
+    click.option("--json", "json_stdout", is_flag=True, help="Output raw JSON to stdout."),
+]
+
+PROMPT_OPTIONS = [
+    click.option("--schema", "-s", "schema_spec", type=str, help="Custom schema class spec: 'path/to/file.py:ClassName'."),
+    click.option("--prompt-file", type=click.Path(exists=True), help="Path to custom prompt template YAML."),
+    click.option("--instruction", type=str, help="Instruction override for prompt template."),
+    click.option("--system-prompt", type=str, help="System prompt override for chat format."),
+    click.option("--var", "variables", multiple=True, help="Inject prompt variable as KEY=VALUE."),
+]
+
+TASK_SPECIFIC_OPTIONS = [
+    click.option("--chunk/--no-chunk", default=False, help="Enable token-aware sliding window chunking."),
+    click.option("--as-array/--single-object", "as_array", default=None, help="Instruct model to output JSON array vs single object."),
+    click.option("--dedup/--no-dedup", default=True, help="Enable deduplication of extracted items across chunks."),
+    click.option("--dedup-key", type=str, help="Field or key name used to identify unique extracted items."),
+    click.option("--category-field", type=str, help="Field name containing category for classification."),
+    click.option("--confidence-field", type=str, help="Field name containing confidence for classification."),
+    click.option("--reasoning-field", type=str, help="Field name containing reasoning for classification."),
+    click.option("--summary-field", type=str, help="Field name containing summary text for summarization."),
+    click.option("--points-field", type=str, help="Field name containing bullet points for summarization."),
+]
+
+MAP_OPTIONS = [
+    click.option("--input-path", "-i", required=True, type=click.Path(exists=True), help="Input dataset path (.parquet, .csv, .json, .txt)."),
+    click.option("--schemas-dir", "-s", required=True, type=click.Path(exists=True), help="Directory containing Pydantic schema files."),
+    click.option("--output-dir", "-o", default="outputs", type=click.Path(), help="Output directory for relational tables and databases."),
+    click.option("--export", default="sqlite,csv,wide", help="Comma-separated exports: sqlite,csv,wide."),
+    click.option("--triage/--no-triage", default=True, help="Enable fast schema relevance triage filter."),
+    click.option("--triage-max-tokens", type=int, default=256, help="Maximum tokens for triage classification."),
+    click.option("--resume/--no-resume", default=True, help="Enable fault-tolerant checkpoint resume."),
+    click.option("--id-column-name", default="source_id", help="Foreign key column name linking parent records in normalized tables."),
+    click.option("--wide-table-name", default="consolidated_wide_table", help="Base file name for wide denormalized export."),
+    click.option("--sqlite-db-name", default="extracted_database.db", help="SQLite database file name."),
+    click.option("--wide-separator", default="; ", help="Separator used when concatenating multi-value fields in wide tables."),
+]
+
+
 def common_options(f):
-    """Reusable CLI options across all task commands."""
-    options = [
-        click.option("--input-path", "-i", type=click.Path(exists=False), help="Path to input dataset (.parquet, .csv, .json, .txt)."),
-        click.option("--input-text", "-t", type=str, help="Single raw text string to process directly."),
-        click.option("--output-path", "-o", type=click.Path(), help="Output file destination."),
-        click.option("--output-format", "-f", type=click.Choice(["json", "csv", "parquet"], case_sensitive=False), default="json", help="Output format."),
-        click.option("--column", "--text-column", "text_column", type=str, help="Name of column containing input text."),
-        click.option("--id-column", type=str, help="Name of column containing unique record ID."),
-        click.option("--metadata-columns", type=str, help="Comma-separated list of metadata columns to include."),
-        click.option("--exclude-columns", type=str, help="Comma-separated list of columns to exclude from metadata."),
-        click.option("--limit", "-l", type=int, help="Maximum number of records to process."),
-        click.option("--batch-size", "-b", type=int, default=4, help="Inference batch size."),
-        click.option("--max-tokens", type=int, default=512, help="Maximum new tokens to generate."),
-        click.option("--temperature", type=float, default=0.0, help="Sampling temperature (0.0 for deterministic)."),
-        click.option("--top-p", type=float, default=None, help="Top-p nucleus sampling probability threshold."),
-        click.option("--top-k", type=int, default=None, help="Top-k sampling threshold."),
-        click.option("--repetition-penalty", type=float, default=None, help="Repetition penalty parameter."),
-        click.option("--chunk/--no-chunk", default=False, help="Enable token-aware sliding window chunking."),
-        click.option("--chunk-size", type=int, default=1024, help="Tokens per chunk window."),
-        click.option("--chunk-overlap", type=int, default=64, help="Tokens overlap between chunks."),
-        click.option("--chunk-strategy", type=click.Choice(["sentence", "token"], case_sensitive=False), default="sentence", help="Boundary strategy."),
-        click.option("--schema", "-s", "schema_spec", type=str, help="Custom schema class spec: 'path/to/file.py:ClassName'."),
-        click.option("--prompt-file", type=click.Path(exists=True), help="Path to custom prompt template YAML."),
-        click.option("--instruction", type=str, help="Instruction override for prompt template."),
-        click.option("--system-prompt", type=str, help="System prompt override for chat format."),
-        click.option("--as-array/--single-object", "as_array", default=None, help="Instruct model to output JSON array vs single object."),
-        click.option("--dedup/--no-dedup", default=True, help="Enable deduplication of extracted items across chunks."),
-        click.option("--dedup-key", type=str, help="Field or key name used to identify unique extracted items."),
-        click.option("--category-field", type=str, help="Field name containing category for classification."),
-        click.option("--confidence-field", type=str, help="Field name containing confidence for classification."),
-        click.option("--reasoning-field", type=str, help="Field name containing reasoning for classification."),
-        click.option("--summary-field", type=str, help="Field name containing summary text for summarization."),
-        click.option("--points-field", type=str, help="Field name containing bullet points for summarization."),
-        click.option("--var", "variables", multiple=True, help="Inject prompt variable as KEY=VALUE."),
-        click.option("--model", "-m", type=str, help="Hugging Face model repository ID or local path."),
-        click.option("--device", "-d", type=str, help="Compute device (auto, mps, cuda, cpu)."),
-        click.option("--config", "-c", type=click.Path(exists=True), help="Pipeline config YAML path."),
-        click.option("--dry-run", is_flag=True, help="Render prompt and inspect pipeline without loading model."),
-        click.option("--json", "json_stdout", is_flag=True, help="Output raw JSON to stdout."),
-    ]
-    for opt in reversed(options):
-        f = opt(f)
-    return f
+    """Reusable CLI options across standard task commands."""
+    all_task_options = (
+        TASK_IO_OPTIONS
+        + SHARED_IO_OPTIONS
+        + SHARED_ENGINE_OPTIONS
+        + SHARED_CHUNKING_OPTIONS
+        + PROMPT_OPTIONS
+        + TASK_SPECIFIC_OPTIONS
+    )
+    return apply_options(all_task_options)(f)
+
+
+def map_options(f):
+    """Composable CLI options for multi-schema map command."""
+    all_map_options = (
+        MAP_OPTIONS
+        + SHARED_IO_OPTIONS
+        + SHARED_ENGINE_OPTIONS
+        + SHARED_CHUNKING_OPTIONS
+    )
+    return apply_options(all_map_options)(f)
 
 
 @click.group()
@@ -109,32 +166,7 @@ def summarize(**kwargs):
 
 
 @main.command("map")
-@click.option("--input-path", "-i", required=True, type=click.Path(exists=True), help="Input dataset path (.parquet, .csv, .json, .txt).")
-@click.option("--schemas-dir", "-s", required=True, type=click.Path(exists=True), help="Directory containing Pydantic schema files.")
-@click.option("--output-dir", "-o", default="outputs", type=click.Path(), help="Output directory for relational tables and databases.")
-@click.option("--export", default="sqlite,csv,wide", help="Comma-separated exports: sqlite,csv,wide.")
-@click.option("--column", "--text-column", "text_column", type=str, help="Column name containing text to process.")
-@click.option("--id-column", type=str, help="Column name for unique record identifier.")
-@click.option("--metadata-columns", type=str, help="Comma-separated list of metadata columns to include.")
-@click.option("--exclude-columns", type=str, help="Comma-separated list of columns to exclude from metadata.")
-@click.option("--batch-size", "-b", type=int, default=4, help="Inference batch size.")
-@click.option("--max-tokens", type=int, default=512, help="Maximum new tokens to generate.")
-@click.option("--temperature", type=float, default=0.0, help="Sampling temperature.")
-@click.option("--top-p", type=float, default=None, help="Top-p nucleus sampling probability threshold.")
-@click.option("--top-k", type=int, default=None, help="Top-k sampling threshold.")
-@click.option("--repetition-penalty", type=float, default=None, help="Repetition penalty parameter.")
-@click.option("--triage/--no-triage", default=True, help="Enable fast schema relevance triage filter.")
-@click.option("--triage-max-tokens", type=int, default=256, help="Maximum tokens for triage classification.")
-@click.option("--resume/--no-resume", default=True, help="Enable fault-tolerant checkpoint resume.")
-@click.option("--chunk-size", type=int, default=1024, help="Tokens per chunk window.")
-@click.option("--chunk-overlap", type=int, default=64, help="Tokens overlap between chunks.")
-@click.option("--chunk-strategy", type=click.Choice(["sentence", "token"], case_sensitive=False), default="sentence", help="Boundary strategy.")
-@click.option("--id-column-name", default="source_id", help="Foreign key column name linking parent records in normalized tables.")
-@click.option("--wide-table-name", default="consolidated_wide_table", help="Base file name for wide denormalized export.")
-@click.option("--sqlite-db-name", default="extracted_database.db", help="SQLite database file name.")
-@click.option("--wide-separator", default="; ", help="Separator used when concatenating multi-value fields in wide tables.")
-@click.option("--limit", "-l", type=int, help="Limit number of input records.")
-@click.option("--dry-run", is_flag=True, help="Inspect schema catalog and execution plan without running inference.")
+@map_options
 def map_cmd(**kwargs):
     """Multi-schema extraction with relevance triage and relational aggregation."""
     from prismrunner.mapping_pipeline import SchemaMappingPipeline

@@ -14,6 +14,7 @@ from prismrunner.tracker.checkpoint import CheckpointTracker
 from prismrunner.aggregator.relational import RelationalNormalizer, has_extracted_content
 from prismrunner.aggregator.sqlite_export import SQLiteExporter
 from prismrunner.aggregator.wide_table import WideTableBuilder
+from prismrunner.prompt import PromptTemplate
 
 __version__ = "0.1.0"
 
@@ -44,5 +45,6 @@ __all__ = [
     "has_extracted_content",
     "SQLiteExporter",
     "WideTableBuilder",
+    "PromptTemplate",
 ]
 

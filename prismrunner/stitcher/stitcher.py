@@ -4,23 +4,10 @@ from __future__ import annotations
 import collections
 import json
 import logging
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Union
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class StitchedRecord:
-    """Consolidated record result after deterministic aggregation."""
-
-    id: str
-    index: int
-    task: str
-    result: Any
-    num_chunks: int
-    metadata: Dict[str, Any]
 
 
 class DeterministicStitcher:

@@ -17,6 +17,7 @@ from prismrunner.schemas.compiler import compile_schema_to_prompt, CompiledPromp
 from prismrunner.schemas.parser import UniversalOutputParser
 from prismrunner.schemas.base import ClassificationItem, EntityItem, SummaryItem
 from prismrunner.stitcher.stitcher import DeterministicStitcher
+from prismrunner.prompt import PromptTemplate
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -177,43 +178,8 @@ class PrismPipeline:
         prompt_template: Optional[Union[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Load YAML prompt template for a specific task or use provided in-memory template."""
-        if prompt_template is not None:
-            if isinstance(prompt_template, dict):
-                return dict(prompt_template)
-            elif isinstance(prompt_template, str):
-                return {
-                    "version": "custom",
-                    "task": task,
-                    "instruction": "",
-                    "variables": {},
-                    "prompt": prompt_template,
-                }
-
-        prompt_path = None
-        if custom_prompt_path:
-            prompt_path = Path(custom_prompt_path)
-        else:
-            default_rel = self.config["prompts"].get(task)
-            if default_rel:
-                prompt_path = Path(default_rel)
-
-        if prompt_path:
-            if not prompt_path.exists():
-                pkg_fallback = Path(__file__).resolve().parent.parent / prompt_path
-                if pkg_fallback.exists():
-                    prompt_path = pkg_fallback
-            if prompt_path.exists():
-                with open(prompt_path, "r", encoding="utf-8") as f:
-                    return yaml.safe_load(f) or {}
-
-        # Fallback inline templates
-        return {
-            "version": "1.0",
-            "task": task,
-            "instruction": f"Perform {task} accurately on the text below.",
-            "variables": {},
-            "prompt": "Source Content:\n\"\"\"\n{{ text }}\n\"\"\"\n\n{schema_block}",
-        }
+        source = prompt_template or custom_prompt_path or self.config["prompts"].get(task)
+        return PromptTemplate.load(source=source, default_task=task)
 
     def render_prompt(
         self,
@@ -225,28 +191,15 @@ class PrismPipeline:
         as_array: Optional[bool] = None,
     ) -> str:
         """Render prompt text substituting variables, instructions, schema directives, and text."""
-        raw_tmpl = template_yaml.get("prompt", "{{ text }}")
-        variables = dict(template_yaml.get("variables", {}))
-        if variable_overrides:
-            variables.update(variable_overrides)
-
-        instruction = instruction_override or template_yaml.get("instruction", "")
-        variables["instruction"] = instruction
-
         target_as_array = as_array if as_array is not None else True
         schema_block = compiled_schema.render_prompt_block(as_array=target_as_array) if compiled_schema else ""
-        variables["schema_block"] = schema_block
-
-        # Interpolate {variables}
-        rendered = raw_tmpl
-        for var_name, var_val in variables.items():
-            rendered = rendered.replace(f"{{{var_name}}}", str(var_val))
-
-        # Interpolate flexible text slots
-        for slot in ["{{ text }}", "{{ text}}", "{{ item }}", "{{ item}}", "{{ document }}", "{text}", "{item}", "{document}", "{content}"]:
-            rendered = rendered.replace(slot, text)
-
-        return rendered
+        return PromptTemplate.render(
+            template=template_yaml,
+            text=text,
+            schema_block=schema_block,
+            variables=variable_overrides,
+            instruction=instruction_override,
+        )
 
     def run(
         self,
@@ -317,9 +270,18 @@ class PrismPipeline:
         c_strat = chunk_strategy or self.config["chunking"].get("strategy", "sentence")
 
         if do_chunk:
-            tok = self.tokenizer if self.tokenizer else None
+            if not dry_run and self.engine is None:
+                self.init_engine(
+                    batch_size=batch_size,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    generation_kwargs=generation_kwargs,
+                )
             chunker = TokenAwareChunker(
-                tokenizer=tok,
+                tokenizer=self.tokenizer,
                 chunk_size=c_size,
                 chunk_overlap=c_overlap,
                 strategy=c_strat,

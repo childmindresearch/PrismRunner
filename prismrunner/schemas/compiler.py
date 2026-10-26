@@ -10,7 +10,7 @@ import enum
 import json
 import typing
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Type, Union, get_args, get_origin
+from typing import Any, Dict, List, Type, Union, get_args, get_origin
 from pydantic import BaseModel
 from pydantic.fields import FieldInfo
 

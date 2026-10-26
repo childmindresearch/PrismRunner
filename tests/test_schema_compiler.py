@@ -15,6 +15,7 @@ class StatusEnum(str, enum.Enum):
 
 
 class TestSchema(BaseModel):
+    __test__ = False
     category: StatusEnum = Field(description="Operational status")
     priority: Literal["low", "medium", "high"] = Field(description="Priority ranking")
     confidence: float = Field(ge=0.0, le=1.0, description="Confidence metric")

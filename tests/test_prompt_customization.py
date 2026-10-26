@@ -104,6 +104,26 @@ class TestPromptCustomization(unittest.TestCase):
         _, kwargs = mock_engine.run_all.call_args
         self.assertEqual(kwargs.get("system_prompt"), "Custom System Prompt: Return strict JSON only.")
 
+    def test_prompt_template_direct(self):
+        from prismrunner.prompt import PromptTemplate
+
+        # Test in-memory string load
+        tmpl_str = PromptTemplate.load("Source: {{ text }}\n{schema_block}", default_task="test")
+        self.assertEqual(tmpl_str["task"], "test")
+
+        # Test render with variable substitution and slot replacement
+        rendered = PromptTemplate.render(
+            template=tmpl_str,
+            text="Document sample text.",
+            schema_block="[JSON_SCHEMA]",
+        )
+        self.assertIn("Source: Document sample text.", rendered)
+        self.assertIn("[JSON_SCHEMA]", rendered)
+
+        # Test fallback path resolution
+        resolved = PromptTemplate.resolve_template_path("prompts/classify.yaml")
+        self.assertTrue(resolved.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

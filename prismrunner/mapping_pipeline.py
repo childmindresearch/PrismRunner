@@ -1,17 +1,16 @@
 """SchemaMappingPipeline: End-to-end multi-schema triage, batch extraction, and relational aggregation."""
 
 from __future__ import annotations
+import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
-import pandas as pd
-import yaml
+from typing import Any, Dict, List, Optional, Set, Union
 from rich.console import Console
 
 from prismrunner.pipeline import PrismPipeline
-from prismrunner.loaders.dataset import DatasetLoader
+from prismrunner.loaders.dataset import DatasetLoader, export_results
 from prismrunner.chunking.chunker import TokenAwareChunker, ChunkRecord
-from prismrunner.catalog.registry import SchemaCatalog, SchemaMeta
+from prismrunner.catalog.registry import SchemaCatalog
 from prismrunner.triage.filter import SchemaTriageFilter
 from prismrunner.tracker.checkpoint import CheckpointTracker
 from prismrunner.schemas.compiler import compile_schema_to_prompt
@@ -19,6 +18,7 @@ from prismrunner.schemas.parser import UniversalOutputParser
 from prismrunner.aggregator.relational import RelationalNormalizer
 from prismrunner.aggregator.sqlite_export import SQLiteExporter
 from prismrunner.aggregator.wide_table import WideTableBuilder
+from prismrunner.prompt import PromptTemplate
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -104,8 +104,21 @@ class SchemaMappingPipeline:
         console.print(f"[bold cyan]PrismRunner SchemaMap Pipeline[/bold cyan]")
         console.print(f"Loaded {len(records)} documents and {len(self.catalog)} candidate schemas.")
 
-        # 3. Chunking
+        # 3. Initialize Engine (if not dry run) & Token-Aware Chunking
+        engine = None
+        if not dry_run:
+            engine = self.base_pipeline.init_engine(
+                batch_size=batch_size,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                generation_kwargs=generation_kwargs,
+            )
+
         chunker = TokenAwareChunker(
+            tokenizer=self.base_pipeline.tokenizer,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             strategy=chunk_strategy,
@@ -125,17 +138,6 @@ class SchemaMappingPipeline:
                 console.print(f"  • [bold]{meta.name}[/bold]: {meta.description}")
             console.print(f"\nTotal potential extraction passes without triage: {len(chunks) * len(self.catalog)}")
             return {"total_records": len(records), "total_chunks": len(chunks), "schemas": len(self.catalog)}
-
-        # 5. Initialize Engine
-        engine = self.base_pipeline.init_engine(
-            batch_size=batch_size,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            repetition_penalty=repetition_penalty,
-            generation_kwargs=generation_kwargs,
-        )
 
         # 6. Schema Relevance Triage
         scheduled_tasks: List[Dict[str, Any]] = []
@@ -197,26 +199,16 @@ class SchemaMappingPipeline:
                 tasks_by_schema.setdefault(t["schema_meta"].name, []).append(t)
 
             # Determine extraction template
-            extract_tmpl: Dict[str, Any] = {}
-            if extract_prompt_template is not None:
-                if isinstance(extract_prompt_template, dict):
-                    extract_tmpl = dict(extract_prompt_template)
-                elif isinstance(extract_prompt_template, str):
-                    extract_tmpl = {
-                        "version": "custom",
-                        "instruction": "Extract all factual instances of {schema_name}.",
-                        "variables": {},
-                        "prompt": extract_prompt_template,
-                    }
-            else:
-                extract_tmpl_path = Path(extract_prompt_file) if extract_prompt_file else Path("prompts/schema_extract.yaml")
-                if not extract_tmpl_path.exists():
-                    pkg_fallback = Path(__file__).resolve().parent.parent / extract_tmpl_path
-                    if pkg_fallback.exists():
-                        extract_tmpl_path = pkg_fallback
-                if extract_tmpl_path.exists():
-                    with open(extract_tmpl_path, "r", encoding="utf-8") as f:
-                        extract_tmpl = yaml.safe_load(f) or {}
+            extract_tmpl = PromptTemplate.load(
+                source=extract_prompt_template or extract_prompt_file or "prompts/schema_extract.yaml",
+                default_task="schema_extract",
+                fallback_prompt=(
+                    "Extract all factual instances of {schema_name} from the following text.\n"
+                    "Scope: {schema_description}\n\n"
+                    "Source Content:\n\"\"\"\n{{ text }}\n\"\"\"\n\n"
+                    "{schema_block}"
+                ),
+            )
 
             for schema_name, tasks in tasks_by_schema.items():
                 meta = tasks[0]["schema_meta"]
@@ -226,28 +218,18 @@ class SchemaMappingPipeline:
                 payloads: List[Dict[str, Any]] = []
                 for t in tasks:
                     ch: ChunkRecord = t["chunk"]
-                    if extract_tmpl:
-                        raw_tmpl = extract_tmpl.get("prompt", "")
-                        vars_dict = dict(extract_tmpl.get("variables", {}))
-                        if variables:
-                            vars_dict.update(variables)
-                        raw_inst = extract_tmpl.get("instruction", "Extract all factual instances of {schema_name}.")
-                        vars_dict["instruction"] = raw_inst.replace("{schema_name}", meta.name)
-                        vars_dict["schema_name"] = meta.name
-                        vars_dict["schema_description"] = meta.description
-                        vars_dict["schema_block"] = schema_directive
+                    vars_dict = dict(variables or {})
+                    raw_inst = extract_tmpl.get("instruction", "Extract all factual instances of {schema_name}.")
+                    vars_dict["instruction"] = raw_inst.replace("{schema_name}", meta.name)
+                    vars_dict["schema_name"] = meta.name
+                    vars_dict["schema_description"] = meta.description
 
-                        prompt_str = raw_tmpl
-                        for vk, vv in vars_dict.items():
-                            prompt_str = prompt_str.replace(f"{{{vk}}}", str(vv))
-                        prompt_str = prompt_str.replace("{{ text }}", ch.text).replace("{{ text}}", ch.text)
-                    else:
-                        prompt_str = (
-                            f"Extract all factual instances of {meta.name} from the following text.\n"
-                            f"Scope: {meta.description}\n\n"
-                            f'Source Content:\n"""\n{ch.text}\n"""\n\n'
-                            f"{schema_directive}"
-                        )
+                    prompt_str = PromptTemplate.render(
+                        template=extract_tmpl,
+                        text=ch.text,
+                        schema_block=schema_directive,
+                        variables=vars_dict,
+                    )
 
                     payloads.append({
                         "record_id": ch.record_id,
@@ -295,10 +277,40 @@ class SchemaMappingPipeline:
             if tracker:
                 tracker.save()
 
-        # 8. Relational Normalization
+        # 8. Deduplicate cross-chunk items and Relational Normalization
         console.print("\n[bold green]Normalizing into Relational Tables...[/bold green]")
+        deduped_extractions: List[Dict[str, Any]] = []
+        grouped_by_src_schema: Dict[tuple, List[Dict[str, Any]]] = {}
+        for rec in extraction_records:
+            grouped_by_src_schema.setdefault((rec["source_id"], rec["schema_name"]), []).append(rec)
+
+        for (src_id, schema_name), recs in grouped_by_src_schema.items():
+            recs.sort(key=lambda r: r.get("chunk_index", 0))
+            all_data: List[Any] = []
+            seen: Set[str] = set()
+            for r in recs:
+                items = r.get("data", [])
+                if isinstance(items, list):
+                    for itm in items:
+                        key = json.dumps(itm, sort_keys=True, default=str).lower() if isinstance(itm, (dict, list)) else str(itm).lower()
+                        if key not in seen:
+                            seen.add(key)
+                            all_data.append(itm)
+                elif items is not None:
+                    key = json.dumps(items, sort_keys=True, default=str).lower() if isinstance(items, (dict, list)) else str(items).lower()
+                    if key not in seen:
+                        seen.add(key)
+                        all_data.append(items)
+
+            deduped_extractions.append({
+                "source_id": src_id,
+                "schema_name": schema_name,
+                "data": all_data,
+                "chunk_index": 0,
+            })
+
         relational_tables = RelationalNormalizer.normalize_dataset(
-            extraction_records,
+            deduped_extractions,
             id_column_name=id_column_name,
             child_separator=wide_list_separator,
         )
@@ -315,8 +327,7 @@ class SchemaMappingPipeline:
             csv_dir = out_dir / relational_csv_dir
             csv_dir.mkdir(parents=True, exist_ok=True)
             for t_name, rows in relational_tables.items():
-                df = pd.DataFrame(rows)
-                df.to_csv(csv_dir / f"{t_name}.csv", index=False)
+                export_results(rows, csv_dir / f"{t_name}.csv", output_format="csv")
             outputs_summary["relational_csv_dir"] = str(csv_dir)
 
         # Export SQLite DB

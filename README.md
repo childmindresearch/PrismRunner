@@ -1,85 +1,29 @@
 # PrismRunner
 
-A high-throughput, local-first LLM inference engine and batch execution runtime designed to process structured datasets (Parquet, CSV, JSON) and raw text into strongly-typed Pydantic schemas. Built with PyTorch and Hugging Face `transformers` for zero-overhead, completely offline execution across Apple Silicon MPS, NVIDIA CUDA, and CPU.
+> **High-throughput, local-first LLM batch execution runtime for structured datasets and Pydantic schemas.**  
+> Run completely offline across Apple Silicon (MPS), NVIDIA GPUs (CUDA), and CPU—zero API keys, zero cloud costs, and zero data leakage.
 
 ---
 
-## Architecture Overview
+## What is PrismRunner?
 
-```mermaid
-flowchart TD
-    IN[/"Input Data: Parquet · CSV · JSON · TXT"/] --> LOADER["Batch Loader & Deterministic ID Tracker"]
-    
-    subgraph Engine ["PrismRunner Engine (PyTorch MPS / CUDA / CPU)"]
-        LOADER --> CHUNK["Token-Aware Chunker (Sentence / Token Boundary)"]
-        CHUNK --> BUDGET["Context Budget & Safe Input Validator"]
-        BUDGET --> COMPILER["Dynamic Schema-to-Prompt Compiler"]
-        COMPILER --> CHATML["Native ChatML Left-Padded Batcher"]
-        CHATML --> INFER["Causal LM Forward Pass"]
-        INFER --> PARSE["Robust Universal Output Parser (Fence Stripping & Phantom Filter)"]
-        PARSE --> STITCH["Deterministic Stitcher"]
-    end
-    
-    STITCH -->|classify| VOTE["Majority Voting & Earliest Tie-Break"]
-    STITCH -->|extract| DEDUP["Case-Insensitive Entity Deduplication"]
-    STITCH -->|summarize| ASSEMBLE["Chronological Multi-Part Assembly"]
-    
-    VOTE --> OUT[/"Validated Structured Outputs: JSON · CSV · Parquet"/]
-    DEDUP --> OUT
-    ASSEMBLE --> OUT
-```
+PrismRunner bridges the gap between raw data files and typed Python data structures. It transforms unstructured text and tabular datasets (**Parquet**, **CSV**, **JSON**, **JSONL**, **TXT**, or **Pandas DataFrames**) into strongly-typed **Pydantic v2 schemas** using local open-weight language models (e.g., Qwen, Llama, Mistral).
+
+Instead of writing fragile custom glue code, prompt engineering hacks, and regex cleaners, PrismRunner provides a production-grade runtime that handles the entire lifecycle:
+
+* **Data Ingestion**: Loads tables, files, or DataFrames with deterministic ID tracking and metadata preservation.
+* **Token-Aware Chunking**: Intelligently segments long documents preserving sentence boundaries within your model's safe token budget.
+* **Schema-to-Prompt Compiler**: Automatically turns Pydantic models into clear bulleted rules and sample JSON—never leaking raw OpenAPI `$defs` or `$ref` blobs that confuse local models.
+* **Native ChatML Batching**: Automatically applies left-padded chat templates with generation prompt alignment for high-throughput GPU/MPS inference.
+* **Resilient Output Parsing**: Strips markdown fences, repairs trailing commas, validates models, and purges empty "phantom" hallucinations.
+* **Deterministic Stitching**: Recombines multi-chunk outputs into single record-level results via majority voting, entity deduplication, or chronological section assembly.
+* **Multi-Schema Database Mapping**: Pre-screens chunks against entire catalogs using lightweight triage and exports relational tables to SQLite, normalized CSVs, and consolidated wide tables.
 
 ---
 
-## 📚 User Documentation & Usage Guides
+## Quick Start (Under 60 Seconds)
 
-Comprehensive step-by-step guides, code recipes, and tutorials are available in the [**`docs/`**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/README.md) directory:
-
-- [**01. Prompt Customization Guide**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/01_prompt_customization.md) — In-memory string/dict overrides, YAML templates, guidelines, and system prompts.
-- [**02. Jupyter Notebook Guide**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/02_jupyter_notebooks.md) — Interactive workflows, in-cell Pydantic schemas, Pandas DataFrames, and dry-run previews.
-- [**03. Python Package API Reference**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/03_python_package_usage.md) — Complete Python SDK reference for `PrismPipeline`, `SchemaMappingPipeline`, chunkers, and parsers.
-- [**04. Standalone & CLI Reference**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/04_standalone_and_cli.md) — Standalone `python main.py` execution, CLI subcommands, flags, and shell recipes.
-- [**05. Custom Schemas & Catalogs**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/05_custom_schemas_and_catalogs.md) — Writing Pydantic v2 schemas, dynamic string schemas, catalogs, and SQLite/wide-table exports.
-- [**06. Configuration & Hardware Tuning**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/06_configuration_and_hardware.md) — Hardware acceleration (MPS, CUDA, CPU), VRAM batch sizing, and context budgeting.
-
----
-
-## Key Core Innovations & Architectural Guarantees
-
-### 1. Native ChatML Framing & Vectorized Batching
-- **Generation Prompt Alignment**: All instruct models are executed via `tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)`. This completely prevents model prompt echoing and guarantees that generation starts in assistant mode.
-- **Left-Padding Enforcement**: Batched generation strictly enforces `tokenizer.padding_side = "left"` with aligned attention masks.
-- **Accelerator Support**: Automatic device mapping for Apple Silicon MPS (`torch.device("mps")`), NVIDIA CUDA (`torch.device("cuda")`), and CPU with memory cleanup (`torch.mps.empty_cache()` / `torch.cuda.empty_cache()` and `gc.collect()`).
-
-### 2. Dynamic Schema-to-Prompt Compiler
-- **No OpenAPI Leaks**: Never dumps raw JSON schemas, `$defs`, `$ref`, or nested `anyOf` blocks that confuse local LLMs.
-- **Pydantic v2 Inspection**: Automatically parses Python `Enum` values, `Literal` definitions, field descriptions, and numeric bounds (`ge`, `le`, `gt`, `lt`).
-- **Human-Readable Prompt Specs**: Generates bulleted constraints:
-  ```text
-  - "category": one of ['Technology', 'Business', 'Health'] - The primary domain.
-  - "confidence": number (from 0.0 to 1.0) - Confidence metric.
-  ```
-- **Concrete Single-Item JSON Sample**: Automatically builds a valid sample JSON object directly in the prompt.
-
-### 3. Robust Universal Output Parser
-- **Resilient Decoding**: Strips markdown code fences (````json ... ````), extracts outer bracket boundaries (`[...]` and `{...}`), handles JSON Lines (JSONL), and repairs trailing commas.
-- **Phantom Object Discarding**: Automatically detects and discards empty objects where all fields are `None`, preventing fallback bugs when schemas use optional fields with `default=None`.
-- **Clean String Fallback**: When no schema is provided, cleanly returns stripped strings and bullet points.
-
-### 4. Deterministic Stitcher
-- **Classification**: Aggregates chunk-level labels via majority voting. In the event of an exact vote tie, deterministically selects the category from the earliest chronological chunk (`chunk_index` 0).
-- **Extraction**: Merges entities across chunks, performing case-insensitive deduplication while preserving distinct metadata.
-- **Summarization**: Chronologically orders chunks by `chunk_index`. Single-chunk records return clean text; multi-chunk records are formatted under distinct `--- [Part i/N] ---` section headers.
-
-### 5. Token-Budgeted Context Chunker & Advisor
-- **Sliding Window Chunking**: Token-aware chunker supporting sentence-boundary splitting (preserving semantic coherence) and strict token sliding windows with configurable overlap.
-- **Context Budgeting**: Computes maximum safe input capacity:
-  $$\text{Safe Input} = \text{Context Limit} - (\text{Max New Tokens} + \text{System Prompt} + \text{Template Tokens} + \text{Safety Buffer})$$
-- **Model Inspector**: The `inspect-model` CLI command reports context limits, hardware utilization, and safe chunking recommendations.
-
----
-
-## Installation
+### 1. Installation
 
 ```bash
 git clone https://github.com/childmindresearch/PrismRunner.git
@@ -87,46 +31,110 @@ cd PrismRunner
 pip install -e .
 ```
 
----
+### 2. Classify text in one command
 
-## CLI Usage
-
-### 1. Inspect Model Architecture & Context Budget
 ```bash
-prismrunner inspect-model --model Qwen/Qwen2.5-3B-Instruct --device auto
+prismrunner classify \
+  --input-text "Apple unveils new M4 chip with enhanced neural engine tensor cores." \
+  --json
 ```
 
-### 2. Document Classification
-Classify rows in a Parquet, CSV, or JSON dataset:
+### 3. Test prompts instantly (Dry Run - No Weights Loaded)
+
+Preview how your schema, variables, and text render into the model prompt without downloading or loading weights into memory:
+
 ```bash
-# Tabular batch classification
+prismrunner classify \
+  --input-text "Clinical trial demonstrates high efficacy for new hypertension drug." \
+  --dry-run
+```
+
+---
+
+## How It Works
+
+| Step | What PrismRunner Does | Why It Matters |
+| :--- | :--- | :--- |
+| **1. Data Ingestion** | Ingests Parquet, CSV, JSON, TXT, or Pandas DataFrames with automatic ID tracking. | No conversion scripts needed; connects directly to your existing data pipelines. |
+| **2. Context Chunking** | Sliding-window chunker respecting sentence boundaries and token budgets. | Prevents silent truncation and context window overflow on long documents. |
+| **3. Schema Compilation** | Inspects Pydantic v2 classes to generate clean human-readable bullets and sample JSON. | Local models follow clear bulleted constraints far better than complex raw JSON schemas. |
+| **4. Left-Padded Batching** | Left-pads tokens and aligns ChatML assistant generation prompts. | Maximizes batch throughput on GPUs/Apple Silicon while eliminating prompt echoing. |
+| **5. Robust Output Parser** | Strips markdown fences, fixes trailing commas, and filters phantom objects. | Guarantees valid Pydantic instances or actionable validation error diagnostics. |
+| **6. Deterministic Stitcher** | Reassembles multi-chunk outputs via majority voting, deduplication, or section headers. | You get exactly 1 clean, consolidated result per parent record. |
+
+---
+
+## Python API
+
+PrismRunner natively accepts Pandas DataFrames, lists of dictionaries, raw text strings, or file paths with zero boilerplate:
+
+```python
+import pandas as pd
+from pydantic import BaseModel, Field
+from typing import Literal
+from prismrunner import PrismPipeline
+
+# 1. Define any Pydantic schema
+class TechAssessment(BaseModel):
+    architecture: str = Field(description="Primary system architecture")
+    maturity_level: Literal["experimental", "beta", "production"] = Field(description="Deployment maturity")
+    score: float = Field(ge=0.0, le=10.0, description="Readiness score from 0 to 10")
+
+# 2. Ingest directly from Pandas DataFrame or in-memory data
+df = pd.DataFrame({
+    "service_id": ["SRV-01", "SRV-02"],
+    "system_report": [
+        "Migrated monolith to event-driven microservices using Kafka. Production ready.",
+        "Prototyping serverless edge functions for latency-critical routing.",
+    ]
+})
+
+# 3. Run pipeline (auto-detects Apple Silicon MPS, NVIDIA CUDA, or CPU)
+pipeline = PrismPipeline()
+results = pipeline.run(
+    task="extract",
+    input_data=df,
+    text_column="system_report",
+    id_column="service_id",
+    schema_cls=TechAssessment,
+    batch_size=4,
+)
+
+print(results)
+```
+
+---
+
+## Core Capabilities
+
+### 1. Document Classification (`prismrunner classify`)
+Classify tabular rows or text records into designated categories with confidence scoring and reasoning extraction. When records span multiple chunks, PrismRunner deterministically aggregates predictions via majority voting:
+
+```bash
 prismrunner classify \
   --input-path data/articles.parquet \
   --column text \
   --id-column article_id \
   --batch-size 8 \
   --output-path outputs/classified.json
-
-# Direct text string classification
-prismrunner classify \
-  --input-text "NVIDIA announces new Blackwell Ultra GPUs with enhanced FP4 tensor cores." \
-  --json
 ```
 
-### 3. Entity & Item Extraction
+### 2. Entity & Item Extraction (`prismrunner extract`)
+Extract entities, action items, or custom structured models with automatic cross-chunk deduplication:
+
 ```bash
-# Extract entities with token-aware chunking for long documents
 prismrunner extract \
   --input-path data/transcripts.csv \
   --column conversation \
+  --schema "schemas/clinical_records.py:Medication" \
   --chunk \
   --chunk-size 1024 \
-  --chunk-overlap 64 \
-  --batch-size 4 \
-  --output-path outputs/extracted_entities.json
+  --output-path outputs/medications.json
 ```
 
-### 4. Multi-Chunk Document Summarization
+### 3. Document Summarization (`prismrunner summarize`)
+Generate structured summaries and key takeaways across lengthy documents. Single-chunk documents return clean text; multi-chunk documents are chronologically ordered under section headers:
+
 ```bash
 prismrunner summarize \
   --input-path data/reports.json \
@@ -137,74 +145,46 @@ prismrunner summarize \
   --output-path outputs/summaries.csv
 ```
 
-### 5. Multi-Schema Extraction & Relational Mapping (SchemaMap Mode)
-Extract across an entire catalog of Pydantic models with fast relevance triage, checkpoint resume, and relational aggregation into SQLite, normalized CSVs, and a 1-row-per-document wide table:
+### 4. Multi-Schema Database Mapping (`prismrunner map`)
+Extract across an entire catalog of Pydantic models simultaneously. PrismRunner runs fast relevance triage to skip irrelevant schemas, tracks progress with fault-tolerant checkpointing, and exports relational outputs into:
+* A queryable **SQLite database** with foreign keys (`source_id`)
+* Normalized **relational CSVs**
+* A consolidated **1-row-per-document Wide Table** (Parquet & CSV)
+
 ```bash
 prismrunner map \
   --input-path data/clinical_notes.parquet \
-  --schemas-dir schemas/clinical/ \
+  --schemas-dir schemas/ \
   --output-dir outputs/clinical_run/ \
   --export sqlite,csv,wide \
   --batch-size 8
 ```
 
-### 6. Dry-Run Prompt Inspection
-Verify prompt rendering, variable substitution, and schema injection without loading the model weights:
+### 5. Hardware & Token Budget Advisor (`prismrunner inspect-model`)
+Inspect any Hugging Face model repository to see its context limit, available VRAM, and recommended safe chunk sizes:
+
 ```bash
-prismrunner classify \
-  --input-text "Quantum computing breakthrough achieved at room temperature." \
-  --var categories="Physics, Computing, Chemistry" \
-  --dry-run
+prismrunner inspect-model --model Qwen/Qwen2.5-3B-Instruct --device auto
 ```
 
 ---
 
-## Python API
+## 📚 User Documentation & Guides
 
-PrismRunner natively accepts Pandas DataFrames, lists of dictionaries, raw text strings, or file paths with zero conversion boilerplate:
+Comprehensive guides and interactive recipes are available in the [**`docs/`**](docs/README.md) directory:
 
-```python
-import pandas as pd
-from pydantic import BaseModel, Field
-from typing import Literal
-from prismrunner import PrismPipeline
-
-# Define any custom Pydantic schema
-class TechAssessment(BaseModel):
-    architecture: str = Field(description="Primary system architecture")
-    maturity_level: Literal["experimental", "beta", "production"] = Field(description="Deployment maturity")
-    score: float = Field(ge=0.0, le=10.0, description="Readiness score from 0 to 10")
-
-# Initialize pipeline (auto-detects Apple Silicon MPS, NVIDIA CUDA, or CPU)
-pipeline = PrismPipeline()
-
-# Ingest directly from Pandas DataFrame or in-memory data
-df = pd.DataFrame({
-    "service_id": ["SRV-01", "SRV-02"],
-    "system_report": [
-        "Migrated monolith to event-driven microservices using Kafka. Production ready.",
-        "Prototyping serverless edge functions for latency-critical routing.",
-    ]
-})
-
-results = pipeline.run(
-    task="extract",
-    input_data=df,
-    text_column="system_report",
-    id_column="service_id",
-    schema_cls=TechAssessment,
-    instruction="Extract system architecture details and readiness level.",
-    batch_size=4,
-    temperature=0.0,
-    top_p=0.95,
-)
-
-print(results)
-```
+* [**01. Prompt Customization Guide**](docs/01_prompt_customization.md) — Overriding templates, prompt variables, and system prompts.
+* [**02. Jupyter Notebook Guide**](docs/02_jupyter_notebooks.md) — Interactive workflows, in-cell Pydantic schemas, and DataFrame recipes.
+* [**03. Python Package API Reference**](docs/03_python_package_usage.md) — Complete SDK reference for `PrismPipeline` and `SchemaMappingPipeline`.
+* [**04. Standalone & CLI Reference**](docs/04_standalone_and_cli.md) — Command flags, recipes, and standalone `main.py` execution.
+* [**05. Custom Schemas & Catalogs**](docs/05_custom_schemas_and_catalogs.md) — Defining schemas, multi-schema catalogs, and SQLite/wide-table exports.
+* [**06. Configuration & Hardware Tuning**](docs/06_configuration_and_hardware.md) — Optimizing MPS, CUDA, CPU, VRAM batch sizing, and token budgets.
 
 ---
 
 ## Configuration (`config/pipeline_config.yaml`)
+
+Default pipeline settings can be customized in `config/pipeline_config.yaml`:
 
 ```yaml
 model:
@@ -218,7 +198,7 @@ inference:
   batch_size: 4
   max_new_tokens: 512
   temperature: 0.0
-  system_prompt: "You are PrismRunner, an accurate local inference engine. Output structured JSON strictly adhering to schema."
+  system_prompt: "You are PrismRunner, an accurate local inference engine. Follow structured format instructions strictly."
 
 chunking:
   enabled: false
@@ -230,4 +210,5 @@ chunking:
 ---
 
 ## License
+
 MIT

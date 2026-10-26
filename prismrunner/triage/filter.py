@@ -4,7 +4,6 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
-import yaml
 from pydantic import BaseModel, Field
 
 from prismrunner.catalog.registry import SchemaCatalog, SchemaMeta
@@ -12,6 +11,7 @@ from prismrunner.chunking.chunker import ChunkRecord
 from prismrunner.engine.inference import BatchInferenceEngine
 from prismrunner.schemas.compiler import compile_schema_to_prompt
 from prismrunner.schemas.parser import UniversalOutputParser
+from prismrunner.prompt import PromptTemplate
 
 logger = logging.getLogger(__name__)
 
@@ -38,51 +38,34 @@ class SchemaTriageFilter:
         self.catalog = catalog
         self.prompt_template = prompt_template
         self.system_prompt_override = system_prompt
-
-        t_path = Path(prompt_file) if prompt_file else Path("prompts/triage.yaml")
-        if not t_path.exists():
-            pkg_fallback = Path(__file__).resolve().parent.parent.parent / t_path
-            if pkg_fallback.exists():
-                t_path = pkg_fallback
-        self.prompt_file = t_path
+        self.prompt_file = Path(prompt_file) if prompt_file else Path("prompts/triage.yaml")
         self.compiled_schema = compile_schema_to_prompt(TriageResult)
+
+    def _get_template(self) -> Dict[str, Any]:
+        return PromptTemplate.load(
+            source=self.prompt_template or self.prompt_file,
+            default_task="triage",
+            fallback_prompt=(
+                "You are an expert data triage classifier. Your task is to analyze the text excerpt and "
+                "identify which of the candidate schemas have concrete, factual evidence present.\n\n"
+                "Candidate Schemas Catalog:\n{catalog_summary}\n\n"
+                "Source Content Excerpt:\n\"\"\"\n{{ text }}\n\"\"\"\n\n"
+                "{schema_block}\n"
+                "Rule: If no factual evidence exists for any schema in this excerpt, return an empty list."
+            ),
+        )
 
     def build_triage_prompt(self, text: str) -> str:
         """Construct a lightweight triage classification prompt."""
         catalog_summary = self.catalog.build_triage_summary()
         schema_block = self.compiled_schema.render_prompt_block(as_array=False)
+        tmpl = self._get_template()
 
-        tmpl: Dict[str, Any] = {}
-        if self.prompt_template is not None:
-            if isinstance(self.prompt_template, dict):
-                tmpl = dict(self.prompt_template)
-            elif isinstance(self.prompt_template, str):
-                tmpl = {"prompt": self.prompt_template, "variables": {}}
-        elif self.prompt_file.exists():
-            with open(self.prompt_file, "r", encoding="utf-8") as f:
-                tmpl = yaml.safe_load(f) or {}
-
-        if tmpl:
-            raw_prompt = tmpl.get("prompt", "")
-            variables = dict(tmpl.get("variables", {}))
-            variables["instruction"] = tmpl.get("instruction", "")
-            variables["catalog_summary"] = catalog_summary
-            variables["schema_block"] = schema_block
-
-            rendered = raw_prompt
-            for k, v in variables.items():
-                rendered = rendered.replace(f"{{{k}}}", str(v))
-            rendered = rendered.replace("{{ text }}", text).replace("{{ text}}", text)
-            return rendered
-
-        # Built-in fallback if no template configured
-        return (
-            "You are an expert data triage classifier. Your task is to analyze the text excerpt and "
-            "identify which of the candidate schemas have concrete, factual evidence present.\n\n"
-            f"Candidate Schemas Catalog:\n{catalog_summary}\n\n"
-            f'Source Content Excerpt:\n"""\n{text}\n"""\n\n'
-            f"{schema_block}\n"
-            "Rule: If no factual evidence exists for any schema in this excerpt, return an empty list."
+        return PromptTemplate.render(
+            template=tmpl,
+            text=text,
+            schema_block=schema_block,
+            variables={"catalog_summary": catalog_summary},
         )
 
     def triage_batch(
@@ -96,11 +79,8 @@ class SchemaTriageFilter:
             return {}
 
         # Build prompts
-        sys_prompt = self.system_prompt_override or "You are a fast, factual schema triage filter. Output valid JSON only."
-        if not self.system_prompt_override and self.prompt_file.exists():
-            with open(self.prompt_file, "r", encoding="utf-8") as f:
-                tmpl = yaml.safe_load(f) or {}
-            sys_prompt = tmpl.get("system_prompt") or sys_prompt
+        tmpl = self._get_template()
+        sys_prompt = self.system_prompt_override or tmpl.get("system_prompt") or "You are a fast, factual schema triage filter. Output valid JSON only."
 
         prompts: List[str] = []
         for ch in chunks:
