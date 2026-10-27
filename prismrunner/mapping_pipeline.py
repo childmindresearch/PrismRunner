@@ -40,7 +40,13 @@ class SchemaMappingPipeline:
         elif schemas_dir is not None:
             self.catalog = SchemaCatalog.from_directory(schemas_dir)
         else:
-            self.catalog = SchemaCatalog()
+            cfg_dir = self.base_pipeline.config.get("schemas_dir")
+            if not cfg_dir and isinstance(self.base_pipeline.config.get("schemas"), dict):
+                cfg_dir = self.base_pipeline.config["schemas"].get("dir")
+            if cfg_dir and Path(cfg_dir).exists():
+                self.catalog = SchemaCatalog.from_directory(cfg_dir)
+            else:
+                self.catalog = SchemaCatalog()
 
     def run(
         self,
