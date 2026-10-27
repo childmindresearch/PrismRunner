@@ -1,35 +1,137 @@
+# ==============================================================================
 # PrismRunner Pipeline Configuration
+# ==============================================================================
+# Guidelines:
+# - [REQUIRED]: Must be provided (either here in YAML or passed to pipeline.run())
+# - [OPTIONAL]: Has sensible defaults; customize as needed for your hardware
+# ==============================================================================
 
+# ------------------------------------------------------------------------------
+# 1. Dataset & Schema Inputs
+# ------------------------------------------------------------------------------
+# [REQUIRED for SchemaMap] Directory containing domain Pydantic schemas (.py files)
+schemas_dir: "schemas"
+
+io:
+  # [REQUIRED if running standalone without code arguments]
+  # Path to your source dataset (supports .parquet, .csv, .json, .jsonl, .txt)
+  input_path: null                       # e.g., "data/source_dataset.parquet"
+
+  # [OPTIONAL - Default: "id"]
+  # Primary key or unique identifier column in your dataset
+  default_id_column: "id"
+
+  # [OPTIONAL - Default: "text"]
+  # Unstructured text column to classify, extract, or summarize
+  default_text_column: "text"
+
+  # [OPTIONAL - Default: "outputs"]
+  # Output folder where databases, CSVs, and wide tables are written
+  output_dir: "outputs"
+
+  # [OPTIONAL - Default: "json"]
+  # Default output format for single-task runs (json, csv, parquet)
+  output_format: "json"
+
+
+# ------------------------------------------------------------------------------
+# 2. Model & Hardware Settings
+# ------------------------------------------------------------------------------
 model:
-  name: "Qwen/Qwen2.5-3B-Instruct"
-  device: "auto"             # auto, mps, cuda, cpu
-  torch_dtype: "auto"        # auto, float16, bfloat16, float32
+  # [OPTIONAL - Default: "Qwen/Qwen2.5-3B-Instruct"]
+  # Hugging Face model repository ID or local folder path
+  name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
+
+  # [OPTIONAL - Default: "auto"]
+  # Execution target: "auto", "cuda", "mps" (Apple Silicon), or "cpu"
+  device: "auto"
+
+  # [OPTIONAL - Default: "auto"]
+  # Floating point precision: "auto", "bfloat16", "float16", or "float32"
+  torch_dtype: "auto"
+
+  # [OPTIONAL - Default: false]
+  # Enable 4-bit NF4 quantization via bitsandbytes (saves VRAM, slower)
   load_in_4bit: false
+
+  # [OPTIONAL - Default: false]
+  # Enable 8-bit quantization via bitsandbytes
   load_in_8bit: false
+
+  # [OPTIONAL - Default: true]
+  # Trust custom model repository code from Hugging Face
   trust_remote_code: true
 
+  # [OPTIONAL - Default: null]
+  # Hugging Face auth token (only required for gated models like Llama-3)
+  token: null
+
+
+# ------------------------------------------------------------------------------
+# 3. Inference & Batch Generation
+# ------------------------------------------------------------------------------
 inference:
-  batch_size: 4
-  max_new_tokens: 512
+  # [OPTIONAL - Default: 4]
+  # Left-padded batch size for parallel inference (set 6-8 for 32B on 96GB GPU)
+  batch_size: 6
+
+  # [OPTIONAL - Default: 512]
+  # Maximum new tokens to generate (increase to 1536-2048 for reasoning models with <think>)
+  max_new_tokens: 1536
+
+  # [OPTIONAL - Default: 0.0]
+  # Sampling temperature: 0.0 for strict deterministic JSON extraction
   temperature: 0.0
+
+  # [OPTIONAL - Default: 0.95]
+  # Top-p nucleus sampling (used if temperature > 0.0)
   top_p: 0.95
+
+  # [OPTIONAL - Default: Built-in system prompt]
+  # Custom system instruction override
   system_prompt: "You are PrismRunner, an accurate local inference engine. Follow structured format instructions strictly."
 
-chunking:
-  enabled: false
-  chunk_size: 1024
-  chunk_overlap: 64
-  strategy: "sentence"       # sentence or token
 
+# ------------------------------------------------------------------------------
+# 4. Sliding-Window Chunking (For Documents Exceeding Token Budget)
+# ------------------------------------------------------------------------------
+chunking:
+  # [OPTIONAL - Default: true in SchemaMap, false in single-task]
+  # Automatically chunks documents exceeding chunk_size
+  enabled: true
+
+  # [OPTIONAL - Default: 1024]
+  # Token budget per sliding window chunk
+  chunk_size: 1024
+
+  # [OPTIONAL - Default: 64]
+  # Token overlap between consecutive chunks to avoid cutting entities
+  chunk_overlap: 64
+
+  # [OPTIONAL - Default: "sentence"]
+  # Chunking strategy: "sentence" (preserves boundary punctuation) or "token"
+  strategy: "sentence"
+
+
+# ------------------------------------------------------------------------------
+# 5. Relational Output Exports (SchemaMap Mode)
+# ------------------------------------------------------------------------------
+# [OPTIONAL - Default: ["sqlite", "csv", "wide"]]
+# Formats to generate: "sqlite" (DB), "csv" (relational tables), "wide" (1 row/doc table)
+export_formats:
+  - "sqlite"
+  - "csv"
+  - "wide"
+
+
+# ------------------------------------------------------------------------------
+# 6. Prompt Templates
+# ------------------------------------------------------------------------------
+# [OPTIONAL - Default: built-in package templates]
+# Relative paths to YAML prompt templates for each task
 prompts:
   classify: "prompts/classify.yaml"
   extract: "prompts/extract.yaml"
   summarize: "prompts/summarize.yaml"
   triage: "prompts/triage.yaml"
   schema_extract: "prompts/schema_extract.yaml"
-
-io:
-  default_id_column: "id"
-  default_text_column: "text"
-  output_format: "json"      # json, csv, parquet
-  output_dir: "outputs"

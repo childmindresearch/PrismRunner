@@ -50,7 +50,7 @@ class SchemaMappingPipeline:
 
     def run(
         self,
-        input_data: Union[str, Path, Any],
+        input_data: Optional[Union[str, Path, Any]] = None,
         output_dir: Union[str, Path] = "outputs",
         text_column: Optional[str] = None,
         id_column: Optional[str] = None,
@@ -86,14 +86,24 @@ class SchemaMappingPipeline:
         wide_list_separator: str = "; ",
     ) -> Dict[str, Any]:
         """Execute full multi-schema triage, extraction, and relational aggregation workflow."""
-        out_dir = Path(output_dir)
+        io_cfg = self.base_pipeline.config.get("io", {})
+        target_input = input_data if input_data is not None else (io_cfg.get("input_path") or io_cfg.get("default_input_path"))
+        if target_input is None:
+            raise ValueError(
+                "No input_data provided. Pass input_data to run() or define io.input_path in config/pipeline_config.yaml."
+            )
+
+        t_col = text_column or io_cfg.get("default_text_column") or io_cfg.get("text_column")
+        i_col = id_column or io_cfg.get("default_id_column") or io_cfg.get("id_column")
+        o_dir = output_dir if output_dir != "outputs" else io_cfg.get("output_dir", "outputs")
+        out_dir = Path(o_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Load Dataset dynamically
         records = DatasetLoader.load(
-            file_path_or_data=input_data,
-            text_column=text_column,
-            id_column=id_column,
+            file_path_or_data=target_input,
+            text_column=t_col,
+            id_column=i_col,
             metadata_columns=metadata_columns,
             exclude_columns=exclude_columns,
             limit=limit,
@@ -123,11 +133,16 @@ class SchemaMappingPipeline:
                 generation_kwargs=generation_kwargs,
             )
 
+        chunk_cfg = self.base_pipeline.config.get("chunking", {})
+        c_size = chunk_size if chunk_size != 1024 else chunk_cfg.get("chunk_size", 1024)
+        c_overlap = chunk_overlap if chunk_overlap != 64 else chunk_cfg.get("chunk_overlap", 64)
+        c_strat = chunk_strategy if chunk_strategy != "sentence" else chunk_cfg.get("strategy", "sentence")
+
         chunker = TokenAwareChunker(
             tokenizer=self.base_pipeline.tokenizer,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            strategy=chunk_strategy,
+            chunk_size=c_size,
+            chunk_overlap=c_overlap,
+            strategy=c_strat,
         )
         chunks: List[ChunkRecord] = chunker.chunk_dataset(records)
         console.print(f"Segmented into {len(chunks)} token-budgeted chunks.")
@@ -322,7 +337,7 @@ class SchemaMappingPipeline:
         )
 
         # 9. Output Exports
-        formats = export_formats or ["sqlite", "csv", "wide"]
+        formats = export_formats or self.base_pipeline.config.get("export_formats") or ["sqlite", "csv", "wide"]
         outputs_summary: Dict[str, Any] = {
             "tables_generated": list(relational_tables.keys()),
             "total_records": len(records),

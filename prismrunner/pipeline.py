@@ -154,6 +154,7 @@ class PrismPipeline:
             load_in_4bit=m_cfg.get("load_in_4bit", False),
             load_in_8bit=m_cfg.get("load_in_8bit", False),
             trust_remote_code=m_cfg.get("trust_remote_code", True),
+            token=m_cfg.get("token"),
         )
 
         self.engine = BatchInferenceEngine(
@@ -204,7 +205,7 @@ class PrismPipeline:
     def run(
         self,
         task: str,
-        input_data: Union[str, Path, Any],
+        input_data: Optional[Union[str, Path, Any]] = None,
         schema_cls: Optional[Type[BaseModel]] = None,
         text_column: Optional[str] = None,
         id_column: Optional[str] = None,
@@ -243,8 +244,12 @@ class PrismPipeline:
     ) -> List[Dict[str, Any]]:
         """Execute the end-to-end pipeline with fully dynamic and configurable parameters."""
         # 1. Load input dataset
+        target_input = input_data if input_data is not None else self.config.get("io", {}).get("input_path")
+        if target_input is None:
+            raise ValueError("No input_data provided. Pass input_data or define io.input_path in config.")
+
         records = DatasetLoader.load(
-            file_path_or_data=input_data,
+            file_path_or_data=target_input,
             text_column=text_column or self.config["io"].get("default_text_column"),
             id_column=id_column or self.config["io"].get("default_id_column"),
             metadata_columns=metadata_columns,
