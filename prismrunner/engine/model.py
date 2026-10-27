@@ -55,6 +55,18 @@ def load_model_and_tokenizer(
     - Apple Silicon MPS, CUDA, or CPU device placement
     - Optional 4-bit / 8-bit quantization (where supported by bitsandbytes)
     """
+    try:
+        from transformers.utils import is_torch_available
+        if not is_torch_available():
+            installed_torch_ver = getattr(torch, "__version__", "unknown")
+            raise RuntimeError(
+                f"PyTorch is disabled by the installed transformers library (found PyTorch {installed_torch_ver}). "
+                "This occurs when transformers enforces PyTorch >= 2.6. "
+                "To resolve, run: pip install 'transformers<4.48.0' or upgrade PyTorch: pip install --upgrade 'torch>=2.6.0'"
+            )
+    except ImportError:
+        pass
+
     if device is None:
         device = get_optimal_device()
 
