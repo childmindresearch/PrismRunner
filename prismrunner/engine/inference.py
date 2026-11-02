@@ -137,6 +137,8 @@ class BatchInferenceEngine:
                 gen_kwargs["top_k"] = curr_top_k
         else:
             gen_kwargs["do_sample"] = False
+            gen_kwargs["temperature"] = None
+            gen_kwargs["top_p"] = None
 
         if curr_rep_penalty is not None:
             gen_kwargs["repetition_penalty"] = curr_rep_penalty

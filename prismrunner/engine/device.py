@@ -9,6 +9,52 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def validate_cuda_device(device: torch.device, raise_on_error: bool = False) -> bool:
+    """Validate that CUDA kernels can execute on the target device.
+    
+    Catches CUDA compute capability mismatches ('CUDA error: no kernel image is available
+    for execution on the device') before model weights are loaded.
+    """
+    if device.type != "cuda":
+        return True
+
+    try:
+        # Test minimal kernel execution
+        t = torch.zeros(1, device=device)
+        _ = (t + 1).item()
+        return True
+    except RuntimeError as e:
+        err_msg = str(e)
+        if "no kernel image is available" in err_msg:
+            dev_idx = device.index if device.index is not None else 0
+            dev_name = torch.cuda.get_device_name(dev_idx)
+            cap = torch.cuda.get_device_capability(dev_idx)
+            archs = getattr(torch.cuda, "get_arch_list", lambda: [])()
+            arch_str = ", ".join(archs) if archs else "unknown"
+            diagnostic = (
+                f"CUDA error: no kernel image is available for execution on the device.\n"
+                f"CUDA kernel execution failed on '{dev_name}' (Compute Capability: {cap[0]}.{cap[1]} / sm_{cap[0]}{cap[1]}).\n"
+                f"The installed PyTorch binary ({torch.__version__}) was compiled for architectures: [{arch_str}], "
+                f"which does not include sm_{cap[0]}{cap[1]}.\n\n"
+                "To resolve this, reinstall PyTorch matching your CUDA version:\n"
+                "  pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu121\n"
+                "  # or for CUDA 12.4:\n"
+                "  pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu124\n"
+                "  # or for older CUDA 11.8:\n"
+                "  pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu118\n"
+                "Alternatively, run on CPU with: --device cpu"
+            )
+            logger.error(diagnostic)
+            if raise_on_error:
+                raise RuntimeError(diagnostic) from e
+            return False
+
+        if raise_on_error:
+            raise
+        logger.warning(f"CUDA device validation failed: {err_msg}")
+        return False
+
+
 def get_optimal_device(preferred: Optional[str] = None) -> torch.device:
     """Detect and return the optimal available PyTorch device.
     
@@ -21,7 +67,9 @@ def get_optimal_device(preferred: Optional[str] = None) -> torch.device:
     if preferred:
         pref = preferred.lower().strip()
         if pref.startswith("cuda") and torch.cuda.is_available():
-            return torch.device(pref)
+            dev = torch.device(pref)
+            validate_cuda_device(dev, raise_on_error=True)
+            return dev
         elif pref == "mps" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return torch.device("mps")
         elif pref == "cpu":
@@ -32,10 +80,14 @@ def get_optimal_device(preferred: Optional[str] = None) -> torch.device:
             )
 
     if torch.cuda.is_available():
-        device = torch.device("cuda")
-        logger.info(f"Using NVIDIA CUDA device: {torch.cuda.get_device_name(0)}")
-        return device
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        cuda_dev = torch.device("cuda")
+        if validate_cuda_device(cuda_dev, raise_on_error=False):
+            logger.info(f"Using NVIDIA CUDA device: {torch.cuda.get_device_name(0)}")
+            return cuda_dev
+        else:
+            logger.warning("CUDA device is available but cannot execute kernels; falling back to MPS or CPU.")
+
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = torch.device("mps")
         logger.info("Using Apple Silicon MPS device")
         return device

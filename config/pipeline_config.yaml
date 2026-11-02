@@ -66,6 +66,14 @@ model:
   # Hugging Face auth token (only required for gated models like Llama-3)
   token: null
 
+  # [OPTIONAL - Default: null]
+  # Custom directory to store downloaded model weights (defaults to ~/.cache/huggingface/hub)
+  cache_dir: null
+
+  # [OPTIONAL - Default: false]
+  # Force loading only from local cache; disables checking Hugging Face Hub online
+  local_files_only: false
+
 
 # ------------------------------------------------------------------------------
 # 3. Inference & Batch Generation

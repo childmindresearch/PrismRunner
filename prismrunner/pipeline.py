@@ -155,6 +155,8 @@ class PrismPipeline:
             load_in_8bit=m_cfg.get("load_in_8bit", False),
             trust_remote_code=m_cfg.get("trust_remote_code", True),
             token=m_cfg.get("token"),
+            cache_dir=m_cfg.get("cache_dir"),
+            local_files_only=m_cfg.get("local_files_only", False),
         )
 
         self.engine = BatchInferenceEngine(

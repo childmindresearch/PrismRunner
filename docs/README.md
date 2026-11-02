@@ -14,6 +14,7 @@ Welcome to the comprehensive PrismRunner reference manuals. This directory provi
 | [**04. Standalone & CLI Usage**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/04_standalone_and_cli.md) | CLI commands (`classify`, `extract`, `summarize`, `map`), arguments, and `main.py` execution. | Terminal users, automation scripts |
 | [**05. Custom Schemas & Catalogs**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/05_custom_schemas_and_catalogs.md) | Defining Pydantic v2 models, multi-schema catalogs, triage filters, and SQLite/wide-table exports. | Domain modelers, data architects |
 | [**06. Configuration & Hardware**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/06_configuration_and_hardware.md) | Tuning MPS, CUDA, CPU, context window budgeting, batch sizes, and `pipeline_config.yaml`. | DevOps, performance tuners |
+| [**07. Architecture & Internals**](file:///Users/david.lobue/Desktop/Agents/PrismRunner/docs/07_architecture_and_internals.md) | Deep dive into batch execution runtime, token chunking, schema compiling, and parsing internals. | Core contributors, engineers |
 
 ---
 

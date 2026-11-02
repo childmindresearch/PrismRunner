@@ -11,7 +11,12 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from prismrunner.engine.device import get_optimal_device, get_default_dtype, clear_device_memory
+from prismrunner.engine.device import (
+    get_optimal_device,
+    get_default_dtype,
+    clear_device_memory,
+    validate_cuda_device,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +51,8 @@ def load_model_and_tokenizer(
     load_in_8bit: bool = False,
     trust_remote_code: bool = True,
     token: Optional[str] = None,
+    cache_dir: Optional[Union[str, Path]] = None,
+    local_files_only: bool = False,
 ) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase, torch.device, int]:
     """Load Hugging Face model and tokenizer configured for batch ChatML generation.
     
@@ -54,6 +61,7 @@ def load_model_and_tokenizer(
     - tokenizer.pad_token configured to eos_token if not set
     - Apple Silicon MPS, CUDA, or CPU device placement
     - Optional 4-bit / 8-bit quantization (where supported by bitsandbytes)
+    - Explicit local cache directory verification and offline execution support
     """
     try:
         from transformers.utils import is_torch_available
@@ -69,14 +77,45 @@ def load_model_and_tokenizer(
 
     if device is None:
         device = get_optimal_device()
+    else:
+        validate_cuda_device(device, raise_on_error=True)
 
     selected_dtype = get_default_dtype(device, torch_dtype)
+
+    # Verify and log cache status
+    try:
+        from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
+        default_hub_cache = Path(HUGGINGFACE_HUB_CACHE)
+    except Exception:
+        default_hub_cache = Path.home() / ".cache" / "huggingface" / "hub"
+
+    effective_cache = Path(cache_dir).resolve() if cache_dir else default_hub_cache
+    model_path = Path(model_name_or_path)
+
+    if model_path.exists() and model_path.is_dir():
+        logger.info(f"Loading model weights from local path: {model_path.resolve()}")
+    else:
+        org_repo_slug = "models--" + model_name_or_path.replace("/", "--")
+        cached_repo_dir = effective_cache / org_repo_slug
+        if cached_repo_dir.exists():
+            logger.info(
+                f"Model verified in local cache: {cached_repo_dir} "
+                f"(loading from local storage; no download needed)."
+            )
+        else:
+            logger.info(
+                f"Model not found in local cache ({effective_cache}). "
+                f"Downloading weights from Hugging Face Hub (saved for all future runs)..."
+            )
+
     logger.info(f"Loading tokenizer: {model_name_or_path}")
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_name_or_path,
         trust_remote_code=trust_remote_code,
         token=token,
+        cache_dir=str(cache_dir) if cache_dir else None,
+        local_files_only=local_files_only,
     )
 
     # CRITICAL: Left-padding is mandatory for batched decoder-only generation
@@ -116,7 +155,10 @@ def load_model_and_tokenizer(
     model_kwargs: Dict[str, Any] = {
         "trust_remote_code": trust_remote_code,
         "token": token,
+        "local_files_only": local_files_only,
     }
+    if cache_dir:
+        model_kwargs["cache_dir"] = str(cache_dir)
 
     if quantization_config is not None:
         model_kwargs["quantization_config"] = quantization_config
