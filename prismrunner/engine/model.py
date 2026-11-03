@@ -54,7 +54,7 @@ def load_model_and_tokenizer(
     token: Optional[str] = None,
     cache_dir: Optional[Union[str, Path]] = None,
     local_files_only: bool = False,
-    attn_implementation: Optional[str] = None,
+    attn_implementation: Optional[str] = "sdpa",
 ) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase, torch.device, int]:
     """Load Hugging Face model and tokenizer configured for batch ChatML generation.
     
@@ -170,29 +170,11 @@ def load_model_and_tokenizer(
         if device.type == "cuda":
             model_kwargs["device_map"] = "auto"
 
-    # Configure attention implementation (FlashAttention-2, SDPA, or eager)
-    if attn_implementation == "flash_attention_2":
-        try:
-            import flash_attn  # noqa: F401
-            model_kwargs["attn_implementation"] = "flash_attention_2"
-            logger.info("FlashAttention-2 requested and package verified.")
-        except ImportError:
-            logger.warning(
-                "attn_implementation='flash_attention_2' was requested, but 'flash-attn' is not installed. "
-                "Falling back to PyTorch native SDPA attention to avoid device/kernel failure."
-            )
-            model_kwargs["attn_implementation"] = "sdpa"
-    elif attn_implementation:
-        model_kwargs["attn_implementation"] = attn_implementation
-        logger.info(f"Using requested attention implementation: {attn_implementation}")
-    elif device.type == "cuda":
-        try:
-            import flash_attn  # noqa: F401
-            model_kwargs["attn_implementation"] = "flash_attention_2"
-            logger.info("FlashAttention-2 detected and enabled.")
-        except ImportError:
-            model_kwargs["attn_implementation"] = "sdpa"
-            logger.info("Using PyTorch native SDPA attention.")
+    # Item 2: Standardized native PyTorch SDPA attention (zero external dependencies)
+    chosen_attn = attn_implementation if attn_implementation is not None else "sdpa"
+    if chosen_attn:
+        model_kwargs["attn_implementation"] = chosen_attn
+        logger.info(f"Using standardized attention implementation: {chosen_attn}")
 
     try:
         model = AutoModelForCausalLM.from_pretrained(
@@ -201,22 +183,14 @@ def load_model_and_tokenizer(
         )
     except Exception as e:
         logger.warning(f"Initial model load attempt failed: {e}")
-        # If attention implementation caused the failure, retry with SDPA or default while keeping device_map intact
+        # If attention implementation caused the failure, retry with default attention
         if "attn_implementation" in model_kwargs:
-            logger.info("Retrying model load with PyTorch native SDPA attention...")
-            model_kwargs["attn_implementation"] = "sdpa"
-            try:
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_name_or_path,
-                    **model_kwargs,
-                )
-            except Exception as e2:
-                logger.warning(f"Retry with SDPA also failed: {e2}. Falling back to default attention...")
-                model_kwargs.pop("attn_implementation", None)
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_name_or_path,
-                    **model_kwargs,
-                )
+            logger.info("Retrying model load without explicit attn_implementation...")
+            model_kwargs.pop("attn_implementation", None)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name_or_path,
+                **model_kwargs,
+            )
         else:
             raise e
 
@@ -243,3 +217,21 @@ def load_model_and_tokenizer(
             model_device = device
 
     return model, tokenizer, model_device, context_window
+
+
+def init_model_and_tokenizer(model_path: str) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase]:
+    """Universal direct initialization adhering to Item 2 specification.
+
+    Routes device dynamically to 'cuda', 'mps', or 'cpu', selects optimal precision,
+    and initializes with standardized native PyTorch SDPA attention.
+    """
+    from prismrunner.engine.device import resolve_device_and_dtype
+    device_name, dtype = resolve_device_and_dtype()
+    device = torch.device(device_name)
+    model, tokenizer, _, _ = load_model_and_tokenizer(
+        model_name_or_path=model_path,
+        device=device,
+        torch_dtype=str(dtype).replace("torch.", ""),
+        attn_implementation="sdpa",
+    )
+    return model, tokenizer

@@ -3,10 +3,27 @@
 from __future__ import annotations
 import gc
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_device_and_dtype() -> Tuple[str, torch.dtype]:
+    """Automated, dependency-free hardware and precision detector.
+
+    Returns:
+        (device_name, dtype):
+        - ("cuda", torch.bfloat16 or torch.float16)
+        - ("mps", torch.float16)
+        - ("cpu", torch.float32)
+    """
+    if torch.cuda.is_available():
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        return "cuda", dtype
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps", torch.float16
+    return "cpu", torch.float32
 
 
 def validate_cuda_device(device: torch.device, raise_on_error: bool = False) -> bool:

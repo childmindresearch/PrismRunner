@@ -1,0 +1,13 @@
+PrismRunner Technologies Inc. - Annual Operating & Strategic Report
+
+Executive Overview:
+During fiscal year 2026, PrismRunner Technologies achieved record operational performance, expanding local-first AI infrastructure deployment across healthcare, biomedical research, and privacy-sensitive enterprise environments. Total customer implementations grew by 142% year-over-year, driven by increasing regulatory scrutiny on third-party cloud LLM API security and data sovereignty mandates.
+
+Engineering & Architecture Advancements:
+The core engineering group completed a major modernization of the batch inference engine. By introducing standardized Scaled Dot-Product Attention (SDPA), PrismRunner eliminated external C++ compile dependencies while providing native kernel acceleration across Apple Silicon Metal Performance Shaders, NVIDIA CUDA, and server-grade CPU architectures. Length-bucketed batch collation reduced zero-padding compute waste by 65%, while asynchronous producer-consumer pipeline overlapping achieved near-100% GPU compute duty cycles.
+
+Financial Performance & Market Growth:
+Gross enterprise revenues reached $48.2 million, representing an 85% increase compared to the prior fiscal period. Operating margins expanded to 34%, reflecting the cost efficiency of local execution workflows compared to recurring cloud inference API fees. Strategic investments in automated multi-schema relational normalization and zero-dependency SQLite export capabilities expanded our addressable market to over 12,000 healthcare and research institutions.
+
+Strategic Outlook:
+Looking ahead to 2027, the company remains focused on accelerating local reasoning model throughput, extending zero-shot schema compilation, and delivering frictionless offline document processing pipelines for researchers worldwide.

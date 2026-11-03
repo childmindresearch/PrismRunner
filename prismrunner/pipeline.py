@@ -353,6 +353,24 @@ class PrismPipeline:
         )
 
         sys_prompt = system_prompt or tmpl.get("system_prompt") or self.config["inference"].get("system_prompt")
+
+        # Item 3: Asynchronous Pipeline Overlapping (Producer-Consumer I/O)
+        def _parse_batch_items(batch_completions: List[str], batch_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            batch_annotated = []
+            for item, comp in zip(batch_items, batch_completions):
+                res = dict(item)
+                res["raw_output"] = comp
+                parse_res = UniversalOutputParser.parse(
+                    text=comp,
+                    model_cls=target_schema,
+                )
+                res["parsed_items"] = parse_res.items
+                res["parse_success"] = parse_res.success
+                res["parsing_strategy"] = parse_res.parsing_strategy
+                res["parse_error"] = parse_res.error
+                batch_annotated.append(res)
+            return batch_annotated
+
         raw_results = engine.run_all(
             items=payloads,
             system_prompt=sys_prompt,
@@ -362,19 +380,21 @@ class PrismPipeline:
             top_p=top_p,
             top_k=top_k,
             repetition_penalty=repetition_penalty,
+            on_batch_complete=_parse_batch_items,
             **(generation_kwargs or {}),
         )
 
-        # 7. Parse outputs with UniversalOutputParser
+        # Fallback safeguard in case engine was mocked or parsed_items was omitted
         for res in raw_results:
-            parse_res = UniversalOutputParser.parse(
-                text=res.get("raw_output", ""),
-                model_cls=target_schema,
-            )
-            res["parsed_items"] = parse_res.items
-            res["parse_success"] = parse_res.success
-            res["parsing_strategy"] = parse_res.parsing_strategy
-            res["parse_error"] = parse_res.error
+            if "parsed_items" not in res:
+                parse_res = UniversalOutputParser.parse(
+                    text=res.get("raw_output", ""),
+                    model_cls=target_schema,
+                )
+                res["parsed_items"] = parse_res.items
+                res["parse_success"] = parse_res.success
+                res["parsing_strategy"] = parse_res.parsing_strategy
+                res["parse_error"] = parse_res.error
 
         # 8. Deterministic Stitching
         if task == "classify":

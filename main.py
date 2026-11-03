@@ -4,7 +4,7 @@
 Can be run directly via:
     python3 main.py --help
     python3 main.py classify --input-text "..." --dry-run
-    python3 main.py map -i data/notes.parquet -s schemas/ --dry-run
+    python3 main.py map -i data/clinical_notes.parquet -s schemas/ --dry-run
 """
 
 import sys

@@ -52,6 +52,7 @@ SHARED_ENGINE_OPTIONS = [
     click.option("--top-p", type=float, default=None, help="Top-p nucleus sampling probability threshold."),
     click.option("--top-k", type=int, default=None, help="Top-k sampling threshold."),
     click.option("--repetition-penalty", type=float, default=None, help="Repetition penalty parameter."),
+    click.option("--attn-implementation", type=str, default="sdpa", help="Attention implementation ('sdpa', 'eager')."),
     click.option("--cache-dir", type=click.Path(), help="Directory to store/load cached model weights."),
     click.option("--local-files-only", is_flag=True, help="Only load model from local cache; do not check Hugging Face online."),
     click.option("--config", "-c", type=click.Path(exists=True), help="Pipeline config YAML path."),
@@ -277,6 +278,8 @@ def _run_task_cli(task: str, kwargs: dict):
         overrides.setdefault("model", {})["cache_dir"] = kwargs["cache_dir"]
     if kwargs.get("local_files_only"):
         overrides.setdefault("model", {})["local_files_only"] = kwargs["local_files_only"]
+    if kwargs.get("attn_implementation"):
+        overrides.setdefault("model", {})["attn_implementation"] = kwargs["attn_implementation"]
 
     pipeline = PrismPipeline(
         config_path=kwargs.get("config"),

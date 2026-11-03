@@ -1,0 +1,27 @@
+COMPREHENSIVE PSYCHIATRIC AND EDUCATIONAL CONSULTATION
+Patient Identifier: HBN-002
+Age: 14 years, 1 month | Grade: 8th Grade | Referral Source: School Psychologist
+
+CHIEF COMPLAINT & PRESENTING PROBLEMS:
+Adolescent presents with social withdrawal, generalized anxiety symptoms, perfectionistic avoidance of school assignments, and sensory over-responsiveness.
+
+CLINICAL INTAKE INTERVIEW & MENTAL STATUS:
+Patient was cooperative, soft-spoken, and maintained intermittent eye contact. Affect was constricted and anxious. Speech was fluent with advanced vocabulary. Denies hallucinations, suicidal ideation, or thought disorder. Insight and judgment are age-appropriate.
+
+STANDARDIZED ASSESSMENT MEASURES:
+1. Multidimensional Anxiety Scale for Children (MASC-2):
+   - Generalized Anxiety Index: T-Score 74 (Very Elevated)
+   - Social Anxiety Scale: T-Score 78 (Very Elevated)
+2. Autism Diagnostic Observation Schedule, Second Edition (ADOS-2) Module 3:
+   - Communication & Social Interaction Total: 9 (Meets Autism Spectrum threshold)
+   - Stereotyped Behaviors & Restricted Interests: Notable insistence on sameness and intense interests in complex transit simulations.
+
+DIAGNOSTIC SUMMARY:
+1. Autism Spectrum Disorder, Level 1 (Requiring Support), without accompanying intellectual impairment (ICD-10 F84.0).
+2. Generalized Anxiety Disorder (ICD-10 F41.1).
+3. Social Anxiety Disorder (Social Phobia, ICD-10 F40.10).
+
+THERAPEUTIC MANAGEMENT PLAN:
+1. Outpatient Cognitive Behavioral Therapy (CBT) with exposure and response prevention for social anxiety.
+2. Social communication skills group tailored for neurodivergent adolescents.
+3. Classroom accommodations: Scheduled sensory breaks in a designated quiet zone; advance notice of changes in daily schedule.

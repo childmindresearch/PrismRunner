@@ -1,0 +1,23 @@
+PEDIATRIC DEVELOPMENTAL ASSESSMENT REPORT
+Patient Identifier: HBN-003
+Age: 7 years, 8 months | Grade: 2nd Grade
+
+BACKGROUND & DEVELOPMENTAL CONTEXT:
+Patient was evaluated following teacher concerns regarding reading acquisition, letter-sound correspondence, and phonetic decoding delays despite tiered reading intervention.
+
+EVALUATION FINDINGS:
+Woodcock-Johnson IV Tests of Achievement (WJ-IV ACH):
+- Letter-Word Identification: Standard Score 78 (7th percentile, Well Below Average)
+- Passage Comprehension: Standard Score 82 (12th percentile, Below Average)
+- Word Attack (Phonological Decoding): Standard Score 74 (4th percentile, Significantly Below Average)
+Comprehensive Test of Phonological Processing (CTOPP-2):
+- Phonological Awareness Composite: Standard Score 76 (5th percentile)
+- Rapid Symbolic Naming: Standard Score 80 (9th percentile)
+
+DIAGNOSTIC IMPRESSION:
+1. Specific Learning Disorder with Impairment in Reading (Developmental Dyslexia, ICD-10 F81.0).
+2. Secondary academic anxiety related to oral reading in front of peers.
+
+INTERVENTION PROTOCOL:
+1. Structured Literacy Intervention: Daily 45-minute individualized reading instruction using Orton-Gillingham methodology.
+2. Assistive Technology: Text-to-speech software for grade-level reading materials and audiobooks.

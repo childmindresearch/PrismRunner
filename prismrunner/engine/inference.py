@@ -2,13 +2,52 @@
 
 from __future__ import annotations
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from prismrunner.engine.device import clear_device_memory
 
 logger = logging.getLogger(__name__)
+
+# Item 5: Deterministic Greedy Decoding preset for objective structured extraction
+EXTRACTION_GEN_CONFIG: Dict[str, Any] = {
+    "do_sample": False,
+    "use_cache": True,
+}
+
+
+def create_length_buckets(
+    records: List[Dict[str, Any]],
+    batch_size: int,
+    text_key: str = "text",
+    index_key: str = "_orig_idx",
+) -> List[List[Dict[str, Any]]]:
+    """Group items by sequence length to eliminate padding waste in batched inference.
+
+    Args:
+        records: List of input dictionaries.
+        batch_size: Number of items per batch bucket.
+        text_key: Field in record to measure sequence length by.
+        index_key: Metadata key used to track original record position.
+
+    Returns:
+        List of batched sub-lists sorted by text sequence length.
+    """
+    indexed_records = [dict(item, **{index_key: i}) for i, item in enumerate(records)]
+    sorted_records = sorted(indexed_records, key=lambda x: len(str(x.get(text_key, ""))))
+    return [sorted_records[i : i + batch_size] for i in range(0, len(sorted_records), batch_size)]
+
+
+def restore_original_order(
+    processed_records: List[Dict[str, Any]],
+    index_key: str = "_orig_idx",
+) -> List[Dict[str, Any]]:
+    """Restore the original sequence order using the tracked index and clean metadata."""
+    sorted_records = sorted(processed_records, key=lambda x: x.get(index_key, 0))
+    for r in sorted_records:
+        r.pop(index_key, None)
+    return sorted_records
 
 
 class BatchInferenceEngine:
@@ -152,7 +191,8 @@ class BatchInferenceEngine:
         # Base generation kwargs configured on the engine instance
         gen_kwargs.update(self.generation_kwargs)
 
-        if temp > 0.0:
+        # Item 5: Enforced Deterministic Greedy Decoding when temperature <= 0 or do_sample is False
+        if temp is not None and temp > 0.0:
             gen_kwargs["do_sample"] = True
             gen_kwargs["temperature"] = temp
             if curr_top_p is not None:
@@ -160,9 +200,11 @@ class BatchInferenceEngine:
             if curr_top_k is not None:
                 gen_kwargs["top_k"] = curr_top_k
         else:
-            gen_kwargs["do_sample"] = False
+            gen_kwargs.update(EXTRACTION_GEN_CONFIG)
             gen_kwargs["temperature"] = None
             gen_kwargs["top_p"] = None
+            if curr_top_k is not None:
+                gen_kwargs["top_k"] = None
 
         if curr_rep_penalty is not None:
             gen_kwargs["repetition_penalty"] = curr_rep_penalty
@@ -198,35 +240,77 @@ class BatchInferenceEngine:
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
         repetition_penalty: Optional[float] = None,
+        bucket_by_length: bool = True,
+        on_batch_complete: Optional[Callable[[List[str], List[Dict[str, Any]]], List[Dict[str, Any]]]] = None,
+        max_workers: int = 2,
         **extra_gen_kwargs,
     ) -> List[Dict[str, Any]]:
         """Run batch inference over all items, returning results mapped to original records."""
-        results: List[Dict[str, Any]] = []
-        total_items = len(items)
+        if not items:
+            return []
 
-        for i in range(0, total_items, self.batch_size):
-            batch_items = items[i : i + self.batch_size]
-            formatted_batch: List[str] = []
+        # Item 1: Length-Bucketed Batch Collation to eliminate 50-70% zero-padding overhead
+        if bucket_by_length and len(items) > 1 and self.batch_size > 1:
+            buckets = create_length_buckets(items, self.batch_size, text_key=prompt_key)
+        else:
+            buckets = [
+                [dict(item, _orig_idx=idx) for idx, item in enumerate(items[i : i + self.batch_size], start=i)]
+                for i in range(0, len(items), self.batch_size)
+            ]
 
-            for item in batch_items:
-                user_content = item.get(prompt_key, "")
-                messages = self.format_chatml_messages(user_content, system_prompt)
-                formatted_prompt = self.render_chat_prompt(messages)
-                formatted_batch.append(formatted_prompt)
-
-            completions = self.generate_batch(
-                formatted_batch,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
-                **extra_gen_kwargs,
-            )
-
+        def _default_batch_mapper(completions: List[str], batch_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            mapped = []
             for item, comp in zip(batch_items, completions):
                 res = dict(item)
                 res["raw_output"] = comp
-                results.append(res)
+                mapped.append(res)
+            return mapped
 
-        return results
+        postprocess_fn = on_batch_complete or _default_batch_mapper
+        results: List[Dict[str, Any]] = []
+
+        # If only 1 bucket or single worker requested, execute sequentially without pool overhead
+        if len(buckets) <= 1 or max_workers <= 1:
+            for batch_items in buckets:
+                formatted_batch = [
+                    self.render_chat_prompt(self.format_chatml_messages(item.get(prompt_key, ""), system_prompt))
+                    for item in batch_items
+                ]
+                completions = self.generate_batch(
+                    formatted_batch,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    **extra_gen_kwargs,
+                )
+                results.extend(postprocess_fn(completions, batch_items))
+            return restore_original_order(results)
+
+        # Item 3: Asynchronous Pipeline Overlapping (Producer-Consumer I/O)
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=max_workers) as io_pool:
+            futures = []
+            for batch_items in buckets:
+                formatted_batch = [
+                    self.render_chat_prompt(self.format_chatml_messages(item.get(prompt_key, ""), system_prompt))
+                    for item in batch_items
+                ]
+                completions = self.generate_batch(
+                    formatted_batch,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    **extra_gen_kwargs,
+                )
+                # Offload CPU-bound decoding, Pydantic validation, and disk I/O to background thread
+                futures.append(io_pool.submit(postprocess_fn, completions, batch_items))
+
+            for future in futures:
+                results.extend(future.result())
+
+        return restore_original_order(results)

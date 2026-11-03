@@ -113,6 +113,22 @@ Hope this helps!"""
         self.assertEqual(result.items[0].condition, "Type 2 Diabetes")
         self.assertEqual(result.items[1].condition, "Essential Hypertension")
 
+    def test_sanitize_json_output_standalone(self):
+        from prismrunner.schemas.parser import sanitize_json_output
+        raw = """```json
+        {"name": "Standalone", "value": 42}
+        ```"""
+        parsed = sanitize_json_output(raw)
+        self.assertEqual(parsed, {"name": "Standalone", "value": 42})
+
+        raw_list = """Preamble chatter:
+```
+[{"name": "Alpha", "value": 1}, {"name": "Beta", "value": 2},]
+```
+Postamble chatter."""
+        parsed_list = sanitize_json_output(raw_list)
+        self.assertEqual(parsed_list, [{"name": "Alpha", "value": 1}, {"name": "Beta", "value": 2}])
+
 
 if __name__ == "__main__":
     unittest.main()

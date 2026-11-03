@@ -13,13 +13,15 @@ model:
   name: "Qwen/Qwen2.5-3B-Instruct"
   device: "auto"             # "auto", "mps", "cuda", or "cpu"
   torch_dtype: "auto"        # "auto", "float16", "bfloat16", "float32"
+  attn_implementation: "sdpa" # Native PyTorch SDPA attention (zero external build dependencies)
   load_in_4bit: false        # Enable 4-bit quantization (BitsAndBytes)
   load_in_8bit: false        # Enable 8-bit quantization (BitsAndBytes)
 
 inference:
   batch_size: 4
   max_new_tokens: 512
-  temperature: 0.0           # 0.0 for strict deterministic extraction
+  temperature: 0.0           # 0.0 for strict deterministic greedy argmax extraction
+  bucket_by_length: true     # Collate batches by sequence length to eliminate padding overhead
   top_p: 0.95
   system_prompt: "You are PrismRunner, an exact information extraction engine. Output valid JSON array only."
 

@@ -9,6 +9,7 @@ from prismrunner.schemas.parser import (
     ParseResult,
     is_phantom_object,
     parse_raw_text,
+    sanitize_json_output,
 )
 from prismrunner.schemas.base import (
     ClassificationItem,
@@ -23,6 +24,7 @@ __all__ = [
     "ParseResult",
     "is_phantom_object",
     "parse_raw_text",
+    "sanitize_json_output",
     "ClassificationItem",
     "EntityItem",
     "SummaryItem",

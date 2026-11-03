@@ -264,6 +264,18 @@ class SchemaMappingPipeline:
                     or extract_tmpl.get("system_prompt")
                     or "You are an exact, verbatim data extraction engine. Output valid JSON array only."
                 )
+
+                # Asynchronous Pipeline Overlapping: Parse outputs concurrently in worker pool
+                def _parse_extract_batch(batch_completions: List[str], batch_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                    annotated = []
+                    for item, comp in zip(batch_items, batch_completions):
+                        res = dict(item)
+                        res["raw_output"] = comp
+                        parsed = UniversalOutputParser.parse(comp, model_cls=meta.schema_cls)
+                        res["valid_data"] = [itm.model_dump() for itm in parsed.items] if parsed.success else []
+                        annotated.append(res)
+                    return annotated
+
                 raw_results = engine.run_all(
                     items=payloads,
                     system_prompt=sys_prompt,
@@ -273,12 +285,15 @@ class SchemaMappingPipeline:
                     top_k=top_k,
                     repetition_penalty=repetition_penalty,
                     prompt_key="prompt",
+                    on_batch_complete=_parse_extract_batch,
                     **(generation_kwargs or {}),
                 )
 
                 for res in raw_results:
-                    parsed = UniversalOutputParser.parse(res.get("raw_output", ""), model_cls=meta.schema_cls)
-                    valid_data = [item.model_dump() for item in parsed.items] if parsed.success else []
+                    valid_data = res.get("valid_data")
+                    if valid_data is None:
+                        parsed = UniversalOutputParser.parse(res.get("raw_output", ""), model_cls=meta.schema_cls)
+                        valid_data = [item.model_dump() for item in parsed.items] if parsed.success else []
 
                     if tracker:
                         tracker.mark_completed(

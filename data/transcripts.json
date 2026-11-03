@@ -1,0 +1,18 @@
+[
+  {
+    "id": "TR-101",
+    "title": "Quarterly Product Strategy & Customer Advisory Board",
+    "text": "Speaker A (Product Lead): Welcome everyone. Today we are discussing the roadmap for our offline batch LLM engine. Customer feedback highlights three priorities: deterministic JSON parsing without hallucinated envelopes, zero external C++ build requirements, and efficient length-bucketed batch collation to maximize GPU utilization. Speaker B (Engineering Manager): We have implemented native SDPA which eliminates flash-attn compiler dependencies across CUDA and Apple Silicon MPS. Next quarter we are introducing streaming pipeline overlapping to parse outputs while the GPU finishes subsequent batches. Speaker C (Enterprise Customer): This drastically reduces our compliance review time and cloud compute bills.",
+    "dialogue": "Speaker A (Product Lead): Welcome everyone. Today we are discussing the roadmap for our offline batch LLM engine. Customer feedback highlights three priorities: deterministic JSON parsing without hallucinated envelopes, zero external C++ build requirements, and efficient length-bucketed batch collation to maximize GPU utilization. Speaker B (Engineering Manager): We have implemented native SDPA which eliminates flash-attn compiler dependencies across CUDA and Apple Silicon MPS. Next quarter we are introducing streaming pipeline overlapping to parse outputs while the GPU finishes subsequent batches. Speaker C (Enterprise Customer): This drastically reduces our compliance review time and cloud compute bills.",
+    "speaker": "Mixed",
+    "duration_min": 45
+  },
+  {
+    "id": "TR-102",
+    "title": "Clinical Informatics Onboarding & Trial Review",
+    "text": "Dr. Evans: The retrospective cohort analysis of 500 patient notes identified multiple undocumented drug allergies and ACE-inhibitor interactions. Nurse Specialist Miller: When using PrismRunner with the clinical schema catalog, triage filtered out irrelevant schemas with 98% precision and extracted verified dosages directly into SQLite without manual data entry. Dr. Evans: Excellent. We will expand this protocol to oncology records next week.",
+    "dialogue": "Dr. Evans: The retrospective cohort analysis of 500 patient notes identified multiple undocumented drug allergies and ACE-inhibitor interactions. Nurse Specialist Miller: When using PrismRunner with the clinical schema catalog, triage filtered out irrelevant schemas with 98% precision and extracted verified dosages directly into SQLite without manual data entry. Dr. Evans: Excellent. We will expand this protocol to oncology records next week.",
+    "speaker": "Dr. Evans & Nurse Specialist Miller",
+    "duration_min": 30
+  }
+]

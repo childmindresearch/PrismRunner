@@ -69,13 +69,47 @@ def _extract_bracket_substring(text: str) -> Optional[str]:
     return None
 
 
+def sanitize_json_output(raw_text: str) -> Union[dict, list, Any]:
+    """Deterministic Pre-Validation JSON Sanitization (Item 4).
+
+    Strips markdown fence indicators, locates the outermost bounding brackets
+    ([ ... ] for lists, or { ... } for objects), repairs trailing comma syntax
+    glitches, and parses valid JSON structures.
+    """
+    text = raw_text.strip()
+    if not text:
+        return []
+
+    # 1. Strip markdown fence indicators
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE)
+    text = text.strip()
+
+    # 2. Extract content between first and last bounding brackets
+    match = re.search(r"(\[.*\]|\{.*\})", text, re.DOTALL)
+    if match:
+        text = match.group(1).strip()
+
+    # 3. Repair common glitches (like trailing commas before closing brackets)
+    text = _repair_common_json_glitches(text)
+
+    # 4. Standard JSON parse
+    return json.loads(text)
+
+
 def parse_raw_text(text: str) -> Any:
     """Attempt multi-stage extraction of structured JSON or fallback to lines."""
     clean_text = text.strip()
     if not clean_text:
         return []
 
-    # 1. Direct JSON parse
+    # 1. Deterministic pre-validation JSON sanitization
+    try:
+        return sanitize_json_output(clean_text)
+    except Exception:
+        pass
+
+    # 2. Direct JSON parse
     try:
         return json.loads(clean_text)
     except Exception:

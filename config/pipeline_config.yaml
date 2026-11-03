@@ -40,7 +40,7 @@ io:
 model:
   # [OPTIONAL - Default: "Qwen/Qwen2.5-3B-Instruct"]
   # Hugging Face model repository ID or local folder path
-  name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
+  name: "Qwen/Qwen2.5-3B-Instruct"
 
   # [OPTIONAL - Default: "auto"]
   # Execution target: "auto", "cuda", "mps" (Apple Silicon), or "cpu"
@@ -49,6 +49,10 @@ model:
   # [OPTIONAL - Default: "auto"]
   # Floating point precision: "auto", "bfloat16", "float16", or "float32"
   torch_dtype: "auto"
+
+  # [OPTIONAL - Default: "sdpa"]
+  # Attention implementation: "sdpa" (native PyTorch zero-dependency attention)
+  attn_implementation: "sdpa"
 
   # [OPTIONAL - Default: false]
   # Enable 4-bit NF4 quantization via bitsandbytes (saves VRAM, slower)
@@ -80,16 +84,20 @@ model:
 # ------------------------------------------------------------------------------
 inference:
   # [OPTIONAL - Default: 4]
-  # Left-padded batch size for parallel inference (set 6-8 for 32B on 96GB GPU)
-  batch_size: 6
+  # Batch size for parallel inference (set higher on high-VRAM accelerators)
+  batch_size: 4
 
   # [OPTIONAL - Default: 512]
-  # Maximum new tokens to generate (increase to 1536-2048 for reasoning models with <think>)
-  max_new_tokens: 1536
+  # Maximum new tokens to generate
+  max_new_tokens: 512
 
   # [OPTIONAL - Default: 0.0]
-  # Sampling temperature: 0.0 for strict deterministic JSON extraction
+  # Sampling temperature: 0.0 for strict deterministic greedy argmax extraction
   temperature: 0.0
+
+  # [OPTIONAL - Default: true]
+  # Collate batches by sequence length to eliminate zero-padding computation overhead
+  bucket_by_length: true
 
   # [OPTIONAL - Default: 0.95]
   # Top-p nucleus sampling (used if temperature > 0.0)

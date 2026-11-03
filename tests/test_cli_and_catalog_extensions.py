@@ -65,6 +65,8 @@ class TestCliAndCatalogExtensions(unittest.TestCase):
                 "0.2",
                 "--max-tokens",
                 "256",
+                "--attn-implementation",
+                "sdpa",
                 "--dry-run",
             ],
         )
