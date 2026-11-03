@@ -54,6 +54,7 @@ def load_model_and_tokenizer(
     token: Optional[str] = None,
     cache_dir: Optional[Union[str, Path]] = None,
     local_files_only: bool = False,
+    attn_implementation: Optional[str] = None,
 ) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase, torch.device, int]:
     """Load Hugging Face model and tokenizer configured for batch ChatML generation.
     
@@ -169,28 +170,76 @@ def load_model_and_tokenizer(
         if device.type == "cuda":
             model_kwargs["device_map"] = "auto"
 
+    # Configure attention implementation (FlashAttention-2, SDPA, or eager)
+    if attn_implementation == "flash_attention_2":
+        try:
+            import flash_attn  # noqa: F401
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+            logger.info("FlashAttention-2 requested and package verified.")
+        except ImportError:
+            logger.warning(
+                "attn_implementation='flash_attention_2' was requested, but 'flash-attn' is not installed. "
+                "Falling back to PyTorch native SDPA attention to avoid device/kernel failure."
+            )
+            model_kwargs["attn_implementation"] = "sdpa"
+    elif attn_implementation:
+        model_kwargs["attn_implementation"] = attn_implementation
+        logger.info(f"Using requested attention implementation: {attn_implementation}")
+    elif device.type == "cuda":
+        try:
+            import flash_attn  # noqa: F401
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+            logger.info("FlashAttention-2 detected and enabled.")
+        except ImportError:
+            model_kwargs["attn_implementation"] = "sdpa"
+            logger.info("Using PyTorch native SDPA attention.")
+
     try:
         model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
             **model_kwargs,
         )
     except Exception as e:
-        logger.warning(f"Initial model load attempt failed ({e}). Retrying with direct CPU placement...")
-        clear_device_memory()
-        model_kwargs.pop("device_map", None)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            **model_kwargs,
-        )
+        logger.warning(f"Initial model load attempt failed: {e}")
+        # If attention implementation caused the failure, retry with SDPA or default while keeping device_map intact
+        if "attn_implementation" in model_kwargs:
+            logger.info("Retrying model load with PyTorch native SDPA attention...")
+            model_kwargs["attn_implementation"] = "sdpa"
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name_or_path,
+                    **model_kwargs,
+                )
+            except Exception as e2:
+                logger.warning(f"Retry with SDPA also failed: {e2}. Falling back to default attention...")
+                model_kwargs.pop("attn_implementation", None)
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name_or_path,
+                    **model_kwargs,
+                )
+        else:
+            raise e
 
-    # For MPS or CPU without device_map, explicitly place on target device
-    if quantization_config is None and getattr(model, "device", None) != device:
-        if device.type in ("mps", "cpu"):
-            logger.info(f"Transferring model to {device}...")
-            model = model.to(device)
+    # Ensure model is on the target device if device_map was not used
+    if not hasattr(model, "hf_device_map") and quantization_config is None:
+        try:
+            curr_dev = next(model.parameters()).device
+            if curr_dev != device:
+                logger.info(f"Transferring model to {device}...")
+                model = model.to(device)
+        except Exception:
+            pass
 
     model.eval()
     context_window = get_context_window(model, tokenizer)
     logger.info(f"Model successfully loaded. Context window: {context_window} tokens.")
 
-    return model, tokenizer, device, context_window
+    # Determine primary model device (crucial for device_map="auto" multi-GPU or quantized placements)
+    model_device = getattr(model, "device", None)
+    if model_device is None:
+        try:
+            model_device = next(model.parameters()).device
+        except Exception:
+            model_device = device
+
+    return model, tokenizer, model_device, context_window

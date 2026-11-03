@@ -157,6 +157,7 @@ class PrismPipeline:
             token=m_cfg.get("token"),
             cache_dir=m_cfg.get("cache_dir"),
             local_files_only=m_cfg.get("local_files_only", False),
+            attn_implementation=m_cfg.get("attn_implementation"),
         )
 
         self.engine = BatchInferenceEngine(

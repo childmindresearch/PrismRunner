@@ -44,6 +44,29 @@ class BatchInferenceEngine:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
+    @property
+    def target_device(self) -> torch.device:
+        """Determines the device where model weights reside to avoid tensor mismatches."""
+        if hasattr(self.model, "get_input_embeddings"):
+            try:
+                emb = self.model.get_input_embeddings()
+                if emb is not None and hasattr(emb, "weight") and emb.weight is not None:
+                    dev = getattr(emb.weight, "device", None)
+                    if isinstance(dev, (torch.device, str)):
+                        return torch.device(dev)
+            except Exception:
+                pass
+        dev = getattr(self.model, "device", None)
+        if isinstance(dev, (torch.device, str)):
+            return torch.device(dev)
+        try:
+            p_dev = next(self.model.parameters()).device
+            if isinstance(p_dev, (torch.device, str)):
+                return torch.device(p_dev)
+        except Exception:
+            pass
+        return self.device
+
     def format_chatml_messages(
         self,
         user_prompt: str,
@@ -113,8 +136,9 @@ class BatchInferenceEngine:
             return_tensors="pt",
         )
 
-        input_ids = encoded["input_ids"].to(self.device)
-        attention_mask = encoded["attention_mask"].to(self.device)
+        target_dev = self.target_device
+        input_ids = encoded["input_ids"].to(target_dev)
+        attention_mask = encoded["attention_mask"].to(target_dev)
         prompt_length = input_ids.shape[1]
 
         gen_kwargs: Dict[str, Any] = {
@@ -160,7 +184,7 @@ class BatchInferenceEngine:
 
         # Clean device memory
         del input_ids, attention_mask, output_ids, generated_tokens
-        clear_device_memory(self.device)
+        clear_device_memory(target_dev)
 
         return [c.strip() for c in completions]
 
