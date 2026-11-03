@@ -30,3 +30,6 @@ outputs/
 *.sqlite
 .checkpoint_state*.json
 
+# User Private SemanticPrism workspace
+SP/
+
