@@ -85,10 +85,19 @@ def sanitize_json_output(raw_text: str) -> Union[dict, list, Any]:
     text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE)
     text = text.strip()
 
-    # 2. Extract content between first and last bounding brackets
-    match = re.search(r"(\[.*\]|\{.*\})", text, re.DOTALL)
-    if match:
-        text = match.group(1).strip()
+    # 2. Extract content between first and last bounding brackets (O(N) index search, immune to regex backtracking)
+    first_bracket = text.find("[")
+    last_bracket = text.rfind("]")
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+
+    if first_bracket != -1 and last_bracket != -1 and last_bracket > first_bracket:
+        if first_brace != -1 and first_brace < first_bracket and last_brace > last_bracket:
+            text = text[first_brace : last_brace + 1].strip()
+        else:
+            text = text[first_bracket : last_bracket + 1].strip()
+    elif first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        text = text[first_brace : last_brace + 1].strip()
 
     # 3. Repair common glitches (like trailing commas before closing brackets)
     text = _repair_common_json_glitches(text)

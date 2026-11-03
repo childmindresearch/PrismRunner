@@ -84,6 +84,15 @@ def load_model_and_tokenizer(
 
     selected_dtype = get_default_dtype(device, torch_dtype)
 
+    if device.type != "cuda" and "awq" in model_name_or_path.lower():
+        raise ValueError(
+            f"The requested model '{model_name_or_path}' is an AWQ-quantized checkpoint which requires an NVIDIA CUDA GPU.\n"
+            f"The current hardware device is '{device.type}'.\n"
+            f"To run on Apple Silicon (MPS) or CPU, please pass an unquantized model, e.g.:\n"
+            f"  python SP/run_stage_1.py --model Qwen/Qwen2.5-3B-Instruct --device auto\n"
+            f"Or run this pipeline directly on your remote NVIDIA GPU server."
+        )
+
     # Verify and log cache status
     try:
         from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
@@ -95,16 +104,19 @@ def load_model_and_tokenizer(
     model_path = Path(model_name_or_path)
 
     if model_path.exists() and model_path.is_dir():
+        print(f"-> Loading model weights from local path: {model_path.resolve()}", flush=True)
         logger.info(f"Loading model weights from local path: {model_path.resolve()}")
     else:
         org_repo_slug = "models--" + model_name_or_path.replace("/", "--")
         cached_repo_dir = effective_cache / org_repo_slug
         if cached_repo_dir.exists():
+            print(f"-> Model verified in local cache: {cached_repo_dir.name} (loading weights onto {device}...)", flush=True)
             logger.info(
                 f"Model verified in local cache: {cached_repo_dir} "
                 f"(loading from local storage; no download needed)."
             )
         else:
+            print(f"-> Model not found in cache ({effective_cache}). Downloading '{model_name_or_path}' from Hugging Face Hub...", flush=True)
             logger.info(
                 f"Model not found in local cache ({effective_cache}). "
                 f"Downloading weights from Hugging Face Hub (saved for all future runs)..."

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import logging
+import time
 from typing import List, Dict, Any, Optional, Callable
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
@@ -270,11 +271,12 @@ class BatchInferenceEngine:
 
         # If only 1 bucket or single worker requested, execute sequentially without pool overhead
         if len(buckets) <= 1 or max_workers <= 1:
-            for batch_items in buckets:
+            for b_idx, batch_items in enumerate(buckets, start=1):
                 formatted_batch = [
                     self.render_chat_prompt(self.format_chatml_messages(item.get(prompt_key, ""), system_prompt))
                     for item in batch_items
                 ]
+                t0 = time.perf_counter()
                 completions = self.generate_batch(
                     formatted_batch,
                     max_new_tokens=max_new_tokens,
@@ -284,6 +286,9 @@ class BatchInferenceEngine:
                     repetition_penalty=repetition_penalty,
                     **extra_gen_kwargs,
                 )
+                dt = time.perf_counter() - t0
+                if len(buckets) > 1:
+                    print(f"   [Batch {b_idx}/{len(buckets)}] Processed {len(batch_items)} items in {dt:.1f}s", flush=True)
                 results.extend(postprocess_fn(completions, batch_items))
             return restore_original_order(results)
 
@@ -292,11 +297,12 @@ class BatchInferenceEngine:
 
         with ThreadPoolExecutor(max_workers=max_workers) as io_pool:
             futures = []
-            for batch_items in buckets:
+            for b_idx, batch_items in enumerate(buckets, start=1):
                 formatted_batch = [
                     self.render_chat_prompt(self.format_chatml_messages(item.get(prompt_key, ""), system_prompt))
                     for item in batch_items
                 ]
+                t0 = time.perf_counter()
                 completions = self.generate_batch(
                     formatted_batch,
                     max_new_tokens=max_new_tokens,
@@ -306,6 +312,9 @@ class BatchInferenceEngine:
                     repetition_penalty=repetition_penalty,
                     **extra_gen_kwargs,
                 )
+                dt = time.perf_counter() - t0
+                if len(buckets) > 1:
+                    print(f"   [Batch {b_idx}/{len(buckets)}] Processed {len(batch_items)} items in {dt:.1f}s", flush=True)
                 # Offload CPU-bound decoding, Pydantic validation, and disk I/O to background thread
                 futures.append(io_pool.submit(postprocess_fn, completions, batch_items))
 
