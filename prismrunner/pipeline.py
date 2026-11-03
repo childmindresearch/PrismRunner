@@ -244,6 +244,7 @@ class PrismPipeline:
         output_path: Optional[Union[str, Path]] = None,
         output_format: Optional[str] = None,
         dry_run: bool = False,
+        on_chunk_processed: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> List[Dict[str, Any]]:
         """Execute the end-to-end pipeline with fully dynamic and configurable parameters."""
         # 1. Load input dataset
@@ -368,6 +369,11 @@ class PrismPipeline:
                 res["parse_success"] = parse_res.success
                 res["parsing_strategy"] = parse_res.parsing_strategy
                 res["parse_error"] = parse_res.error
+                if on_chunk_processed:
+                    try:
+                        on_chunk_processed(res)
+                    except Exception as e:
+                        logger.warning(f"Error in on_chunk_processed callback: {e}")
                 batch_annotated.append(res)
             return batch_annotated
 
