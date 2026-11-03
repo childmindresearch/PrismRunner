@@ -224,9 +224,8 @@ class BatchInferenceEngine:
             clean_up_tokenization_spaces=True,
         )
 
-        # Clean device memory
+        # Clean tensor references from device
         del input_ids, attention_mask, output_ids, generated_tokens
-        clear_device_memory(target_dev)
 
         return [c.strip() for c in completions]
 
@@ -313,4 +312,6 @@ class BatchInferenceEngine:
             for future in futures:
                 results.extend(future.result())
 
+        # Clean device memory cache once after all batches finish
+        clear_device_memory(self.target_device)
         return restore_original_order(results)
