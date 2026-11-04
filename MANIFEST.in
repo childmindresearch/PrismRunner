@@ -1,8 +1,0 @@
-include README.md
-include requirements.txt
-include pyproject.toml
-recursive-include config *.yaml *.yml
-recursive-include prompts *.yaml *.yml
-recursive-include schemas *.py
-recursive-include docs *.md
-recursive-include data *.csv *.parquet *.txt *.json

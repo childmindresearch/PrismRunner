@@ -1,34 +1,61 @@
-"""PrismRunner: Lightweight, local-first LLM inference engine."""
+"""PrismRunner: Lightweight, local-first LLM batch inference engine for Pydantic schemas."""
 
+from prismrunner.data import (
+    ChunkRecord,
+    DatasetLoader,
+    DeterministicStitcher,
+    Record,
+    TokenAwareChunker,
+    export_results,
+)
+from prismrunner.engine import (
+    DEFAULT_MODEL_NAME,
+    EXTRACTION_GEN_CONFIG,
+    BatchInferenceEngine,
+    ContextBudget,
+    JsonBracketStoppingCriteria,
+    clear_device_memory,
+    configure_hardware_backends,
+    create_length_buckets,
+    generate_hardware_advisory,
+    get_context_window,
+    get_default_dtype,
+    get_memory_info,
+    get_optimal_device,
+    init_model_and_tokenizer,
+    is_json_bracket_balanced,
+    load_model_and_tokenizer,
+    resolve_device_and_dtype,
+    resolve_optimal_attention,
+    restore_original_order,
+    validate_cuda_device,
+)
 from prismrunner.pipeline import PrismPipeline
-from prismrunner.mapping_pipeline import SchemaMappingPipeline, SchemaMapPipeline
-from prismrunner.loaders.dataset import DatasetLoader, Record
-from prismrunner.chunking.chunker import TokenAwareChunker, ChunkRecord
-from prismrunner.schemas.compiler import compile_schema_to_prompt, CompiledPromptSchema, load_schema_from_string
-from prismrunner.schemas.parser import UniversalOutputParser, ParseResult, is_phantom_object, sanitize_json_output
-from prismrunner.schemas.base import ClassificationItem, EntityItem, SummaryItem
-from prismrunner.stitcher.stitcher import DeterministicStitcher
-from prismrunner.catalog.registry import SchemaCatalog, SchemaMeta
-from prismrunner.triage.filter import SchemaTriageFilter, TriageResult
-from prismrunner.tracker.checkpoint import CheckpointTracker
-from prismrunner.aggregator.relational import RelationalNormalizer, has_extracted_content
-from prismrunner.aggregator.sqlite_export import SQLiteExporter
-from prismrunner.aggregator.wide_table import WideTableBuilder
-from prismrunner.prompt import PromptTemplate
-from prismrunner.engine.device import resolve_device_and_dtype
-from prismrunner.engine.model import init_model_and_tokenizer
-from prismrunner.engine.inference import create_length_buckets, restore_original_order, EXTRACTION_GEN_CONFIG
+from prismrunner.prompt import DEFAULT_PROMPTS, PromptTemplate
+from prismrunner.schema import (
+    ClassificationItem,
+    CompiledPromptSchema,
+    EntityItem,
+    ParseResult,
+    SummaryItem,
+    UniversalOutputParser,
+    compile_schema_to_prompt,
+    is_phantom_object,
+    load_schema_from_string,
+    sanitize_json_output,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
     "PrismPipeline",
-    "SchemaMappingPipeline",
-    "SchemaMapPipeline",
+    "BatchInferenceEngine",
     "DatasetLoader",
     "Record",
+    "export_results",
     "TokenAwareChunker",
     "ChunkRecord",
+    "DeterministicStitcher",
     "compile_schema_to_prompt",
     "CompiledPromptSchema",
     "load_schema_from_string",
@@ -39,21 +66,22 @@ __all__ = [
     "ClassificationItem",
     "EntityItem",
     "SummaryItem",
-    "DeterministicStitcher",
-    "SchemaCatalog",
-    "SchemaMeta",
-    "SchemaTriageFilter",
-    "TriageResult",
-    "CheckpointTracker",
-    "RelationalNormalizer",
-    "has_extracted_content",
-    "SQLiteExporter",
-    "WideTableBuilder",
     "PromptTemplate",
+    "DEFAULT_PROMPTS",
+    "ContextBudget",
+    "generate_hardware_advisory",
     "resolve_device_and_dtype",
+    "get_optimal_device",
+    "get_default_dtype",
+    "validate_cuda_device",
+    "clear_device_memory",
+    "get_memory_info",
+    "load_model_and_tokenizer",
     "init_model_and_tokenizer",
+    "get_context_window",
     "create_length_buckets",
     "restore_original_order",
     "EXTRACTION_GEN_CONFIG",
+    "JsonBracketStoppingCriteria",
+    "is_json_bracket_balanced",
 ]
-
