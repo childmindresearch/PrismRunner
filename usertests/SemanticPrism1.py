@@ -44,9 +44,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from prismrunner import (
+    ContextBudget,
     PrismPipeline,
     UniversalOutputParser,
     clear_device_memory,
+    get_optimal_device,
+    resolve_dynamic_batch_size,
 )
 
 # =============================================================================
@@ -501,22 +504,40 @@ class ThemeClusteringEngine:
     def _compute_embeddings(self, texts: List[str]) -> np.ndarray:
         """Compute L2-normalized embeddings via SentenceTransformer or TF-IDF fallback, freeing VRAM immediately."""
         try:
+            import torch
             from sentence_transformers import SentenceTransformer
             models_dir = Path("models/embeddings")
             models_dir.mkdir(parents=True, exist_ok=True)
+            model = None
+            emb = None
             try:
-                model = SentenceTransformer(self.embedding_model_name, cache_folder=str(models_dir), local_files_only=True)
-            except Exception:
-                model = SentenceTransformer(self.embedding_model_name, cache_folder=str(models_dir), local_files_only=False)
-            emb = model.encode(texts, normalize_embeddings=True, batch_size=64)
-            arr = np.asarray(emb, dtype=np.float32)
-            try:
-                model.to("cpu")
-            except Exception:
-                pass
-            del model, emb
-            clear_device_memory()
-            return arr
+                try:
+                    model = SentenceTransformer(self.embedding_model_name, cache_folder=str(models_dir), local_files_only=True)
+                except Exception:
+                    model = SentenceTransformer(self.embedding_model_name, cache_folder=str(models_dir), local_files_only=False)
+                emb_batch_size = resolve_dynamic_batch_size(
+                    device=get_optimal_device(DEVICE),
+                    requested_batch_size=BATCH_SIZE,
+                    items=[{"prompt": t} for t in texts],
+                )
+                with torch.inference_mode():
+                    emb = model.encode(
+                        texts,
+                        normalize_embeddings=True,
+                        batch_size=emb_batch_size,
+                        convert_to_numpy=True,
+                        show_progress_bar=False,
+                    )
+                arr = np.asarray(emb, dtype=np.float32)
+                return arr
+            finally:
+                if model is not None:
+                    try:
+                        model.to("cpu")
+                    except Exception:
+                        pass
+                del model, emb
+                clear_device_memory()
         except Exception:
             vocab: Dict[str, int] = {}
             tokenized: List[List[str]] = []
@@ -700,6 +721,7 @@ class ThemeClusteringEngine:
             }
             for c_id, c_data in sorted(active_part["clusters"].items())
         ]
+        self.embeddings = None
 
         return {
             "partitions": self.partitions,
@@ -1009,14 +1031,30 @@ class SemanticPrismStage1Pipeline:
             self.prism.engine.context_window = effective_ctx
         return effective_ctx
 
-    def _resolve_stage_max_words(self, requested_max_words: int, max_new_tokens: int) -> int:
+    def _resolve_stage_max_words(
+        self,
+        requested_max_words: int,
+        max_new_tokens: int,
+        system_prompt: Optional[str] = None,
+        template_text: Optional[str] = None,
+    ) -> int:
         """
-        Dynamically bound word chunk length so it always fits within the model's context budget
-        (accounting for system prompt, schema instructions, and max_new_tokens).
+        Dynamically bound word chunk length using ContextBudget.from_tokenizer so it always fits
+        within the model's context budget (accounting for actual system prompt, schema, and max_new_tokens).
         """
         effective_ctx = self._apply_context_window_cap()
-        available_input_tokens = max(256, effective_ctx - max_new_tokens - 512)
-        safe_max_words = max(150, int(available_input_tokens * 0.7))
+        try:
+            budget = ContextBudget.from_tokenizer(
+                tokenizer=self.prism.tokenizer,
+                context_limit=effective_ctx,
+                system_prompt=system_prompt,
+                template_text=template_text,
+                max_new_tokens=max_new_tokens,
+            )
+            available_input_tokens = budget.max_input_tokens
+        except ValueError:
+            available_input_tokens = max(1, effective_ctx // 2)
+        safe_max_words = max(1, int(available_input_tokens * 0.7))
         return min(requested_max_words, safe_max_words)
 
     def discover_themes_across_documents(
@@ -1070,7 +1108,12 @@ class SemanticPrismStage1Pipeline:
                 f"Model ready on device '{self.prism.device}' (effective context window: {eff_ctx} tokens)",
             )
 
-        effective_theme_words = self._resolve_stage_max_words(THEME_CHUNK_MAX_WORDS, THEME_MAX_NEW_TOKENS)
+        effective_theme_words = self._resolve_stage_max_words(
+            THEME_CHUNK_MAX_WORDS,
+            THEME_MAX_NEW_TOKENS,
+            system_prompt=THEME_DISCOVERY_SYSTEM_PROMPT,
+            template_text=THEME_DISCOVERY_USER_PROMPT,
+        )
         chunk_rows: List[Dict[str, Any]] = []
         chunk_meta_by_uid: Dict[str, Dict[str, Any]] = {}
         doc_expected_chunks: Dict[str, int] = {}
@@ -1317,6 +1360,15 @@ class SemanticPrismStage1Pipeline:
             f"Formed {len(exemplar_groups)} empirical theme cluster(s)",
         )
 
+        if not dry_run and self.prism.engine is None:
+            self._log_checkpoint("Phase 2: Master Synthesis", f"Loading model '{MODEL_NAME}' onto device...")
+            self.prism.init_engine(
+                batch_size=BATCH_SIZE,
+                max_new_tokens=MASTER_SYNTHESIS_MAX_NEW_TOKENS,
+                temperature=TEMPERATURE,
+            )
+            self._apply_context_window_cap()
+
         if SYNTHESIS_STRATEGY == "map_reduce":
             map_payloads = cluster_engine.get_map_payload(
                 max_themes_per_cluster=MAP_MAX_THEMES_PER_CLUSTER,
@@ -1407,6 +1459,9 @@ class SemanticPrismStage1Pipeline:
                 "Phase 2A: Cluster Map",
                 f"Saved '{cand_path.name}' ({len(map_candidates)} cluster candidate syntheses)",
             )
+            del map_results
+            if MANAGE_VRAM:
+                clear_device_memory()
 
             reduce_anchors = cluster_engine.get_reduce_anchors(top_n=REDUCE_ANCHOR_THEME_COUNT)
             cluster_blocks = []
@@ -1518,6 +1573,9 @@ class SemanticPrismStage1Pipeline:
         )
         self._log_checkpoint("Phase 2.5: Clustering Summary", f"Saved '{summary_path.name}'")
         self._export_cluster_theme_mapping(active_partition, master_res.master_themes)
+        del cluster_engine, cluster_results, partitions, exemplar_groups, active_partition, reduce_results
+        if MANAGE_VRAM:
+            clear_device_memory()
         return master_res
 
     # =========================================================================
@@ -1594,7 +1652,12 @@ class SemanticPrismStage1Pipeline:
             )
             self._apply_context_window_cap()
 
-        effective_triple_words = self._resolve_stage_max_words(TRIPLE_CHUNK_MAX_WORDS, TRIPLE_MAX_NEW_TOKENS)
+        effective_triple_words = self._resolve_stage_max_words(
+            TRIPLE_CHUNK_MAX_WORDS,
+            TRIPLE_MAX_NEW_TOKENS,
+            system_prompt=full_sys_prompt,
+            template_text=TRIPLE_EXTRACTION_USER_PROMPT,
+        )
         chunk_rows: List[Dict[str, Any]] = []
         chunk_meta_by_uid: Dict[str, Dict[str, Any]] = {}
         doc_expected_chunks: Dict[str, int] = {}

@@ -448,14 +448,6 @@ class PrismPipeline:
         response_prefix = ("[" if target_as_array else "{") if (use_constrain and target_schema is not None) else None
 
         req_batch = batch_size if batch_size is not None else self.config["inference"].get("batch_size", "auto")
-        effective_batch_size = resolve_dynamic_batch_size(
-            device=self.device,
-            requested_batch_size=req_batch,
-            items=payloads,
-            text_key="prompt",
-            max_new_tokens=m_tokens,
-            tokenizer=self.tokenizer,
-        )
 
         raw_results = engine.run_all(
             items=payloads,
@@ -466,7 +458,7 @@ class PrismPipeline:
             top_p=top_p,
             top_k=top_k,
             repetition_penalty=repetition_penalty,
-            batch_size=effective_batch_size,
+            batch_size=req_batch,
             bucket_by_length=self.config["inference"].get("bucket_by_length", True),
             bucket_window_size=bucket_window_size,
             on_batch_start=on_batch_start,

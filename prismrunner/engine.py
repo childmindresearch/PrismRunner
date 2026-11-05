@@ -178,8 +178,24 @@ def resolve_optimal_attention(
 
 
 def clear_device_memory(device: Optional[torch.device] = None) -> None:
-    """Flush garbage collector and empty accelerator device cache."""
+    """Synchronize accelerator streams, flush cyclic garbage, and empty device allocator caches."""
+    if device is None or device.type == "cuda":
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize(device)
+            except Exception:
+                pass
+    if device is None or device.type == "mps":
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            try:
+                if hasattr(torch.mps, "synchronize"):
+                    torch.mps.synchronize()
+            except Exception:
+                pass
+
     gc.collect()
+    gc.collect()
+
     if device is None or device.type == "cuda":
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -276,33 +292,29 @@ def generate_hardware_advisory(
     """Provide continuous, device-relative recommendations for batch sizes, precision, and chunking."""
     budget = ContextBudget(model_context_limit=context_limit, max_new_tokens=max_new_tokens)
     safe_input = budget.max_input_tokens
+    rec_batch = resolve_dynamic_batch_size(device=device, requested_batch_size="auto", max_new_tokens=max_new_tokens)
 
     if device.type == "cuda" and torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(device)
+        total_bytes = max(1, props.total_memory)
         try:
             free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-            avail_gb = free_bytes / (1024 ** 3)
-            total_gb = total_bytes / (1024 ** 3)
         except Exception:
-            props = torch.cuda.get_device_properties(device)
-            total_gb = props.total_memory / (1024 ** 3)
-            avail_gb = total_gb * 0.80
+            free_bytes = max(1, total_bytes - torch.cuda.memory_allocated(device))
+        headroom_ratio = min(1.0, max(0.25, free_bytes / float(total_bytes)))
         rec_dtype = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
-        rec_batch = max(1, min(32, int(round(avail_gb / 2.0))))
-        mem_scale = min(1.0, max(0.25, total_gb / 24.0))
-        rec_chunk = min(safe_input, max(512, int(context_limit * 0.5 * mem_scale)))
+        rec_chunk = min(safe_input, max(512, int(context_limit * 0.5 * headroom_ratio)))
     elif device.type == "mps":
+        total_bytes = max(1, os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
         try:
-            total_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)
+            alloc_bytes = torch.mps.current_allocated_memory()
         except Exception:
-            total_gb = 16.0
+            alloc_bytes = 0
+        headroom_ratio = min(1.0, max(0.25, (total_bytes - alloc_bytes) / float(total_bytes)))
         rec_dtype = "float16"
-        rec_batch = max(1, min(16, int(round(total_gb / 6.0))))
-        mem_scale = min(1.0, max(0.25, total_gb / 32.0))
-        rec_chunk = min(safe_input, max(512, int(context_limit * 0.5 * mem_scale)))
+        rec_chunk = min(safe_input, max(512, int(context_limit * 0.5 * headroom_ratio)))
     else:
-        cores = os.cpu_count() or 2
         rec_dtype = "float32"
-        rec_batch = max(1, min(4, cores // 4))
         rec_chunk = min(safe_input, max(512, context_limit // 8))
 
     return {
@@ -338,9 +350,10 @@ def resolve_dynamic_batch_size(
             return val
 
     # Estimate 90th-percentile prompt token length across queued items
-    est_prompt_tokens = 512
+    est_prompt_tokens = max(1, max_new_tokens)
     if items:
-        sample = items if len(items) <= 128 else items[:: max(1, len(items) // 128)]
+        sample_limit = min(len(items), max(16, max_batch_size * 4))
+        sample = items if len(items) <= sample_limit else items[:: max(1, len(items) // sample_limit)]
         lengths: List[int] = []
         for item in sample:
             txt = str(item.get(text_key) or item.get("text") or "")
@@ -358,47 +371,45 @@ def resolve_dynamic_batch_size(
             p90_idx = min(len(lengths) - 1, int(len(lengths) * 0.9))
             est_prompt_tokens = lengths[p90_idx]
 
-    est_seq_tokens = est_prompt_tokens + max(64, max_new_tokens) + 128
+    est_seq_tokens = est_prompt_tokens + max(1, max_new_tokens)
+    seq_expansion_ratio = est_seq_tokens / float(max(1, max_new_tokens))
     dev_type = device.type if device is not None else "cpu"
 
     if dev_type == "cuda" and torch.cuda.is_available():
-        allocated_gb = 4.0
+        props = torch.cuda.get_device_properties(device)
+        total_bytes = props.total_memory
+        allocated_bytes = torch.cuda.memory_allocated(device)
+        reserved_bytes = torch.cuda.memory_reserved(device)
         try:
-            allocated_gb = max(1.0, torch.cuda.memory_allocated(device) / (1024 ** 3))
-            free_bytes, _ = torch.cuda.mem_get_info(device)
-            usable_gb = (free_bytes / (1024 ** 3)) * 0.70
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            avail_bytes = free_bytes + max(0, reserved_bytes - allocated_bytes)
         except Exception:
-            try:
-                total_bytes = torch.cuda.get_device_properties(device).total_memory
-                allocated_bytes = torch.cuda.memory_allocated(device)
-                allocated_gb = max(1.0, allocated_bytes / (1024 ** 3))
-                usable_gb = max(0.5, ((total_bytes - allocated_bytes) / (1024 ** 3)) * 0.70)
-            except Exception:
-                usable_gb = 4.0
+            avail_bytes = max(1, total_bytes - allocated_bytes)
 
-        # Continuous per-token KV-cache + prefill activation footprint relative to loaded model weight size
-        prefill_expansion = 1.0 + (est_seq_tokens / 2048.0) * (allocated_gb / 32.0)
-        gb_per_token = (0.00015 + allocated_gb * 0.000025) * prefill_expansion
-        per_seq_gb = max(0.15, est_seq_tokens * gb_per_token)
-        return max(1, min(max_batch_size, int(usable_gb // per_seq_gb)))
+        model_bytes = allocated_bytes if allocated_bytes > 0 else int(total_bytes * 0.25)
+        usable_bytes = avail_bytes * 0.70
+        model_load_ratio = model_bytes / max(1.0, float(total_bytes))
+        prefill_expansion = 1.0 + (seq_expansion_ratio * 0.25) * model_load_ratio
+        bytes_per_token = (model_bytes * 0.00003) * prefill_expansion
+        per_seq_bytes = max(1.0, est_seq_tokens * bytes_per_token)
+        return max(1, min(max_batch_size, int(usable_bytes // per_seq_bytes)))
 
     if dev_type == "mps":
+        total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
         try:
-            total_ram_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)
+            allocated_bytes = torch.mps.current_allocated_memory()
         except Exception:
-            total_ram_gb = 16.0
-        try:
-            allocated_gb = max(1.0, torch.mps.current_allocated_memory() / (1024 ** 3))
-        except Exception:
-            allocated_gb = max(1.0, total_ram_gb * 0.25)
-        usable_gb = max(0.5, (total_ram_gb * 0.65 - allocated_gb) * 0.70)
-        prefill_expansion = 1.0 + (est_seq_tokens / 2048.0) * (allocated_gb / 32.0)
-        gb_per_token = (0.00015 + allocated_gb * 0.000025) * prefill_expansion
-        per_seq_gb = max(0.15, est_seq_tokens * gb_per_token)
-        return max(1, min(max_batch_size, int(usable_gb // per_seq_gb)))
+            allocated_bytes = 0
+        model_bytes = allocated_bytes if allocated_bytes > 0 else int(total_bytes * 0.25)
+        usable_bytes = max(1.0, (total_bytes * 0.65 - model_bytes) * 0.70)
+        model_load_ratio = model_bytes / max(1.0, float(total_bytes))
+        prefill_expansion = 1.0 + (seq_expansion_ratio * 0.25) * model_load_ratio
+        bytes_per_token = (model_bytes * 0.00003) * prefill_expansion
+        per_seq_bytes = max(1.0, est_seq_tokens * bytes_per_token)
+        return max(1, min(max_batch_size, int(usable_bytes // per_seq_bytes)))
 
     cores = os.cpu_count() or 2
-    return max(1, min(max_batch_size, int((cores // 2) / max(1.0, est_seq_tokens / 512.0))))
+    return max(1, min(max_batch_size, int(max(1, cores // 2) / max(1.0, seq_expansion_ratio * 0.5))))
 
 
 # ==============================================================================
@@ -1004,6 +1015,8 @@ class BatchInferenceEngine:
         if not items:
             return []
 
+        clear_device_memory(self.target_device)
+
         tokens_to_gen = max_new_tokens if max_new_tokens is not None else self.max_new_tokens
         if batch_size == "auto":
             eff_batch_size = resolve_dynamic_batch_size(
@@ -1014,8 +1027,10 @@ class BatchInferenceEngine:
                 max_new_tokens=tokens_to_gen,
                 tokenizer=self.tokenizer,
             )
+            self.batch_size = eff_batch_size
         elif isinstance(batch_size, int) and batch_size > 0:
             eff_batch_size = batch_size
+            self.batch_size = eff_batch_size
         else:
             eff_batch_size = self.batch_size
 
@@ -1048,13 +1063,9 @@ class BatchInferenceEngine:
         results: List[Dict[str, Any]] = []
         workers = max_workers if max_workers is not None else min(4, max(1, (os.cpu_count() or 2) // 2))
 
-        if total_batches <= 1 or workers <= 1:
-            for batch_idx, batch_items in enumerate(buckets, start=1):
-                if on_batch_start is not None:
-                    try:
-                        on_batch_start(batch_idx, total_batches, batch_items)
-                    except Exception as e:
-                        logger.debug(f"on_batch_start callback notice: {e}")
+        def _run_bucket(batch_items: List[Dict[str, Any]]) -> List[str]:
+            step = max(1, self.batch_size)
+            if len(batch_items) <= step:
                 formatted_batch = [
                     self.render_chat_prompt(
                         self.format_chatml_messages(item.get(prompt_key, ""), system_prompt),
@@ -1062,7 +1073,7 @@ class BatchInferenceEngine:
                     )
                     for item in batch_items
                 ]
-                completions = self.generate_batch(
+                return self.generate_batch(
                     formatted_batch,
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
@@ -1073,7 +1084,44 @@ class BatchInferenceEngine:
                     stop_on_json_close=stop_on_json_close,
                     **extra_gen_kwargs,
                 )
+            sub_completions: List[str] = []
+            idx = 0
+            while idx < len(batch_items):
+                cur_step = max(1, self.batch_size)
+                sub_slice = batch_items[idx : idx + cur_step]
+                formatted_sub = [
+                    self.render_chat_prompt(
+                        self.format_chatml_messages(item.get(prompt_key, ""), system_prompt),
+                        response_prefix=response_prefix,
+                    )
+                    for item in sub_slice
+                ]
+                sub_completions.extend(
+                    self.generate_batch(
+                        formatted_sub,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        repetition_penalty=repetition_penalty,
+                        response_prefix=response_prefix,
+                        stop_on_json_close=stop_on_json_close,
+                        **extra_gen_kwargs,
+                    )
+                )
+                idx += len(sub_slice)
+            return sub_completions
+
+        if total_batches <= 1 or workers <= 1:
+            for batch_idx, batch_items in enumerate(buckets, start=1):
+                if on_batch_start is not None:
+                    try:
+                        on_batch_start(batch_idx, total_batches, batch_items)
+                    except Exception as e:
+                        logger.debug(f"on_batch_start callback notice: {e}")
+                completions = _run_bucket(batch_items)
                 results.extend(postprocess_fn(completions, batch_items))
+            clear_device_memory(self.target_device)
             return restore_original_order(results)
 
         with ThreadPoolExecutor(max_workers=workers) as io_pool:
@@ -1084,24 +1132,7 @@ class BatchInferenceEngine:
                         on_batch_start(batch_idx, total_batches, batch_items)
                     except Exception as e:
                         logger.debug(f"on_batch_start callback notice: {e}")
-                formatted_batch = [
-                    self.render_chat_prompt(
-                        self.format_chatml_messages(item.get(prompt_key, ""), system_prompt),
-                        response_prefix=response_prefix,
-                    )
-                    for item in batch_items
-                ]
-                completions = self.generate_batch(
-                    formatted_batch,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    repetition_penalty=repetition_penalty,
-                    response_prefix=response_prefix,
-                    stop_on_json_close=stop_on_json_close,
-                    **extra_gen_kwargs,
-                )
+                completions = _run_bucket(batch_items)
                 futures.append(io_pool.submit(postprocess_fn, completions, batch_items))
 
             for future in futures:

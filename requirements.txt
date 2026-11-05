@@ -17,12 +17,11 @@ scikit-learn>=1.4.0
 networkx>=3.2.0
 sentence-transformers>=3.0.0
 
-# Optional NVIDIA CUDA kernel & quantization accelerators
-# (Uncomment on Linux + NVIDIA GPUs for FlashAttention-2, Qwen3.5/3.6 Gated DeltaNet kernels, or 4/8-bit quantization)
-# flash-attn>=2.6.0
-# causal-conv1d>=1.4.0
-# flash-linear-attention
-# bitsandbytes>=0.44.0
+# Optimized NVIDIA CUDA kernels for Qwen3.5/3.6 Gated DeltaNet & FlashAttention
+causal-conv1d>=1.4.0; sys_platform == "linux"
+flash-linear-attention; sys_platform == "linux"
+flash-attn>=2.6.0; sys_platform == "linux"
+bitsandbytes>=0.44.0; sys_platform == "linux"
 
 # Testing & development
 pytest>=8.0.0

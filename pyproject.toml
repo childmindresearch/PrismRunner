@@ -24,15 +24,13 @@ dependencies = [
     "scikit-learn>=1.4.0",
     "networkx>=3.2.0",
     "sentence-transformers>=3.0.0",
+    "causal-conv1d>=1.4.0; sys_platform == 'linux'",
+    "flash-linear-attention; sys_platform == 'linux'",
+    "flash-attn>=2.6.0; sys_platform == 'linux'",
+    "bitsandbytes>=0.44.0; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
-cuda = [
-    "flash-attn>=2.6.0",
-    "causal-conv1d>=1.4.0",
-    "flash-linear-attention",
-    "bitsandbytes>=0.44.0",
-]
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=4.1.0",

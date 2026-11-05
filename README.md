@@ -32,7 +32,7 @@ Every hardware, memory, context, and batching optimization in PrismRunner is com
 
 ## Installation
 
-Install core dependencies via `requirements.txt` or editable install:
+Install all dependencies via `requirements.txt` or editable install (on Linux, this automatically installs `causal-conv1d`, `flash-linear-attention`, `flash-attn`, and `bitsandbytes` for optimized `Qwen3.5`/`Qwen3.6` Gated DeltaNet and FlashAttention-2 kernels):
 
 ```bash
 pip install -r requirements.txt
@@ -40,15 +40,10 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-### Optional NVIDIA CUDA Kernel Accelerators
-
-On Linux with NVIDIA Ampere, Hopper, or Blackwell GPUs, install the optional `cuda` extras (or uncomment them in `requirements.txt`) for FlashAttention-2, fast Triton kernels for `Qwen3.5` / `Qwen3.6` Gated DeltaNet linear attention, and 4/8-bit quantization:
-
-```bash
-pip install -e ".[cuda]"
-# or manually:
-pip install flash-attn causal-conv1d flash-linear-attention bitsandbytes --no-build-isolation
-```
+> **Note for compiling `causal-conv1d` / `flash-attn` from source on Linux**: If prebuilt wheels are not available for your exact PyTorch/CUDA combination, pass `--no-build-isolation` after `torch` is installed:
+> ```bash
+> pip install causal-conv1d flash-linear-attention flash-attn --no-build-isolation
+> ```
 
 ---
 
