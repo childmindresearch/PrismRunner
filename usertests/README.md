@@ -17,6 +17,10 @@ python usertests/02_custom_schemas_and_dataframes.py --live
 
 # Run the SemanticPrism Stage 1 Extraction pipeline (Theme Discovery, Master Synthesis, and SVO Triples)
 python usertests/SemanticPrism1.py
+
+# Run the SemanticPrism Stage 2 Refinement pipeline (Two-Tier SVO Clustering, Taxonomic Hypernym Lifting, and Contextual Fidelity)
+python usertests/SemanticPrism2.py
+python usertests/SemanticPrism2.py --fidelity-only
 ```
 
 ### `SemanticPrism1.py` Highlights

@@ -187,5 +187,6 @@ Run the interactive user tests in `usertests/`:
 python usertests/01_quickstart_and_hardware.py
 python usertests/02_custom_schemas_and_dataframes.py
 python usertests/SemanticPrism1.py
+python usertests/SemanticPrism2.py
 # Or open usertests/03_interactive_walkthrough.ipynb in Jupyter / VS Code
 ```
