@@ -404,7 +404,7 @@ def load_model_and_tokenizer(
         model_kwargs["quantization_config"] = quantization_config
         model_kwargs["device_map"] = "auto"
     else:
-        model_kwargs["torch_dtype"] = selected_dtype
+        model_kwargs["dtype"] = selected_dtype
         if device.type == "cuda":
             model_kwargs["device_map"] = "auto"
 
@@ -412,13 +412,23 @@ def load_model_and_tokenizer(
     if chosen_attn:
         model_kwargs["attn_implementation"] = chosen_attn
 
+    def _from_pretrained_compat(kwargs: Dict[str, Any]) -> PreTrainedModel:
+        try:
+            return AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
+        except TypeError as exc:
+            if "dtype" in str(exc) and "dtype" in kwargs:
+                compat_kwargs = dict(kwargs)
+                compat_kwargs["torch_dtype"] = compat_kwargs.pop("dtype")
+                return AutoModelForCausalLM.from_pretrained(model_name_or_path, **compat_kwargs)
+            raise
+
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **model_kwargs)
+        model = _from_pretrained_compat(model_kwargs)
     except Exception as e:
         if "attn_implementation" in model_kwargs:
             logger.info(f"Retrying model load with fallback attention ({e})...")
             model_kwargs.pop("attn_implementation", None)
-            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **model_kwargs)
+            model = _from_pretrained_compat(model_kwargs)
         else:
             raise
 
@@ -540,26 +550,70 @@ class JsonBracketStoppingCriteria(StoppingCriteria):
         self.open_char = "{" if self.response_prefix.startswith("{") else "["
         self.close_char = "}" if self.open_char == "{" else "]"
         self.eos_token_id = eos_token_id
+        self._token_has_close: Dict[int, bool] = {}
+        self._finished: Optional[List[bool]] = None
+
+    def _has_closing_char(self, token_id: int) -> bool:
+        cached = self._token_has_close.get(token_id)
+        if cached is not None:
+            return cached
+        piece = getattr(self.tokenizer, "decode", lambda *a, **kw: None)(
+            [token_id],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        has_close = (self.close_char in piece) if isinstance(piece, str) else True
+        self._token_has_close[token_id] = has_close
+        return has_close
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
         try:
-            if input_ids.shape[1] <= self.prompt_length:
+            batch_size, seq_len = input_ids.shape
+            if seq_len <= self.prompt_length:
+                return False
+
+            if self._finished is None or len(self._finished) != batch_size:
+                self._finished = [False] * batch_size
+
+            last_tokens = input_ids[:, -1].tolist()
+            needs_decode = False
+            for idx in range(batch_size):
+                if self._finished[idx]:
+                    continue
+                last_tid = int(last_tokens[idx])
+                if self.eos_token_id is not None and last_tid == self.eos_token_id:
+                    self._finished[idx] = True
+                    continue
+                if self._has_closing_char(last_tid):
+                    needs_decode = True
+
+            if all(self._finished):
+                return True
+            if not needs_decode:
                 return False
 
             gen_slice = input_ids[:, self.prompt_length :]
-            decoded_batch = self.tokenizer.batch_decode(gen_slice, skip_special_tokens=True)
-            if not isinstance(decoded_batch, list) or len(decoded_batch) != input_ids.shape[0]:
+            decoded_batch = self.tokenizer.batch_decode(
+                gen_slice,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            if not isinstance(decoded_batch, list) or len(decoded_batch) != batch_size:
                 return False
 
             for idx, text in enumerate(decoded_batch):
+                if self._finished[idx]:
+                    continue
                 if self.eos_token_id is not None and (gen_slice[idx] == self.eos_token_id).any():
+                    self._finished[idx] = True
                     continue
                 candidate = text.lstrip()
                 if self.response_prefix and not candidate.startswith((self.open_char, "```")):
                     candidate = self.response_prefix + candidate
-                if not is_json_bracket_balanced(candidate, self.open_char, self.close_char):
-                    return False
-            return True
+                if is_json_bracket_balanced(candidate, self.open_char, self.close_char):
+                    self._finished[idx] = True
+
+            return all(self._finished)
         except Exception:
             return False
 
@@ -740,7 +794,7 @@ class BatchInferenceEngine:
         completions = self.tokenizer.batch_decode(
             generated_tokens,
             skip_special_tokens=True,
-            clean_up_tokenization_spaces=True,
+            clean_up_tokenization_spaces=False,
         )
         del input_ids, attention_mask, output_ids, generated_tokens
 

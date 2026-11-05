@@ -26,6 +26,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -74,12 +75,13 @@ OUTPUT_DIR: str = "outputs/01_extraction"      # Stage 1 extraction artifacts di
 LOG_DIR: str = "outputs/logs"                  # Error logs directory
 PAYLOAD_DIR: str = "outputs/payload_text"      # Exported initial LLM prompt inspection directory
 RESUME_MODE: str = "skip"                      # "skip" (reuse existing per-doc outputs) or "overwrite" (re-run all)
+PRINT_CHECKPOINTS: bool = True                 # Print real-time chunk, document, and stage checkpoint progress to console
 
 # 4. Stage 1 Extraction Token & Chunking Parameters
 DOMAIN: str = "General Subjects"               # Context domain injected into extraction prompts
 THEME_CHUNK_MAX_WORDS: int = 2000              # Max words per chunk during Phase 1 Theme Discovery
 TRIPLE_CHUNK_MAX_WORDS: int = 400              # Max words per chunk during Phase 3 SVO Triple Extraction
-CONTEXT_WINDOW_CAP: int = 6000                 # Max prompt token cap per chunk
+CONTEXT_WINDOW_CAP: Union[int, str] = "auto"   # "auto" (detect from model config via PrismRunner) or integer token cap
 THEME_MAX_NEW_TOKENS: int = 512                # Max generated tokens per theme discovery chunk
 MASTER_SYNTHESIS_MAX_NEW_TOKENS: int = 512     # Max generated tokens for cluster map/reduce synthesis
 TRIPLE_MAX_NEW_TOKENS: int = 768               # Max generated tokens per triple extraction chunk
@@ -802,6 +804,13 @@ class SemanticPrismStage1Pipeline:
         """Sanitize document identifiers to be filesystem-safe."""
         return re.sub(r'[\\/:*?"<>|]', "_", str(name))
 
+    @staticmethod
+    def _log_checkpoint(phase: str, message: str) -> None:
+        """Print timestamped checkpoint progress to the console when PRINT_CHECKPOINTS is enabled."""
+        if PRINT_CHECKPOINTS:
+            ts = time.strftime("%H:%M:%S")
+            print(f"[{ts} | Checkpoint | {phase}] {message}", flush=True)
+
     def clear_stage_logs(self, phase: Optional[str] = None) -> None:
         log_map = {
             "themes": ["stage_01_theme_discovery_errors.json"],
@@ -826,17 +835,24 @@ class SemanticPrismStage1Pipeline:
     @staticmethod
     def chunk_text(text: str, max_words: int) -> List[Tuple[str, int, int]]:
         """
-        SemanticPrism's exact word-based sentence-boundary lookahead chunker.
+        SemanticPrism's word-based sentence-boundary lookahead chunker with a bounded
+        lookahead cap so unpunctuated sections/tables cannot merge into giant chunks.
         Returns a list of tuples: (chunk_text, start_word_index, end_word_index).
         """
         words = text.split()
         chunks: List[Tuple[str, int, int]] = []
         start = 0
+        sentence_endings = (".", "!", "?", '."', '!"', '?"', ".'", "!'", "?'", ".)", "!)")
+        max_lookahead = max(100, max_words // 5)
         while start < len(words):
-            end = min(start + max_words, len(words))
+            base_end = min(start + max_words, len(words))
+            end = base_end
             if end < len(words):
-                while end < len(words) and not words[end - 1].endswith((".", "!", "?", '."', '!"', '?"')):
+                lookahead_limit = min(len(words), base_end + max_lookahead)
+                while end < lookahead_limit and not words[end - 1].endswith(sentence_endings):
                     end += 1
+                if end == lookahead_limit and not words[end - 1].endswith(sentence_endings):
+                    end = base_end
             chunk = " ".join(words[start:end])
             chunks.append((chunk, start, end))
             if end >= len(words):
@@ -940,51 +956,57 @@ class SemanticPrismStage1Pipeline:
     # PHASE 1: GLOBAL THEME DISCOVERY & AGGREGATION
     # =========================================================================
 
+    def _apply_context_window_cap(self) -> int:
+        """
+        Dynamically resolve the effective context window from the loaded model's config
+        (or apply CONTEXT_WINDOW_CAP if an explicit integer cap is set).
+        """
+        native_ctx = getattr(self.prism, "context_window", 4096) or 4096
+        if isinstance(CONTEXT_WINDOW_CAP, int) and CONTEXT_WINDOW_CAP > 0:
+            effective_ctx = min(native_ctx, CONTEXT_WINDOW_CAP)
+        else:
+            effective_ctx = native_ctx
+        self.prism.context_window = effective_ctx
+        if self.prism.engine is not None:
+            self.prism.engine.context_window = effective_ctx
+        return effective_ctx
+
+    def _resolve_stage_max_words(self, requested_max_words: int, max_new_tokens: int) -> int:
+        """
+        Dynamically bound word chunk length so it always fits within the model's context budget
+        (accounting for system prompt, schema instructions, and max_new_tokens).
+        """
+        effective_ctx = self._apply_context_window_cap()
+        available_input_tokens = max(256, effective_ctx - max_new_tokens - 512)
+        safe_max_words = max(150, int(available_input_tokens * 0.7))
+        return min(requested_max_words, safe_max_words)
+
+    def _resolve_stage_batch_size(self, max_words_per_chunk: int) -> int:
+        """
+        Resolve safe batch size for a given chunk word length.
+        2,000-word theme chunks (~3,000 tokens each) use smaller batch sizes to prevent
+        MPS unified-memory swap / CUDA KV-cache stalls and provide responsive checkpoints.
+        """
+        if isinstance(BATCH_SIZE, int) and BATCH_SIZE > 0:
+            return BATCH_SIZE
+        dev_type = self.prism.device.type if self.prism.device is not None else "cpu"
+        if max_words_per_chunk >= 1200:
+            return 2 if dev_type == "cuda" else 1
+        return 8 if dev_type == "cuda" else (2 if dev_type == "mps" else 1)
+
     def discover_themes_across_documents(
         self,
         documents: List[Dict[str, str]],
         dry_run: bool = DRY_RUN,
     ) -> List[Theme]:
         """
-        Phase 1: Discover abstract overarching themes across all documents using
-        SemanticPrism's exact word-chunking + prompts, batched through PrismPipeline.
+        Phase 1: Discover abstract overarching themes document-by-document using
+        SemanticPrism's word-chunking + prompts, batched through PrismPipeline.
+        Saves each document's {doc}_themes.json immediately upon completing that document.
         """
         print(f"=== Phase 1: Global Theme Discovery (Model: {MODEL_NAME}) ===")
-        chunk_rows: List[Dict[str, Any]] = []
-        doc_expected_chunks: Dict[str, int] = {}
-
-        for doc in documents:
-            doc_id = doc["id"]
-            safe_name = self.sanitize_filename(doc_id)
-            theme_file_path = self.themes_dir / f"{safe_name}_themes.json"
-
-            if RESUME_MODE == "skip" and theme_file_path.exists():
-                print(f"-> Skipping theme discovery for: {doc_id} (already exists on disk)")
-                try:
-                    cached = json.loads(theme_file_path.read_text(encoding="utf-8"))
-                    for t in cached:
-                        self.context.all_discovered_themes.append(Theme.model_validate(t))
-                except Exception:
-                    pass
-                continue
-
-            print(f"-> Discovering themes in: {doc_id}")
-            doc_chunks = self.chunk_text(doc["text"], THEME_CHUNK_MAX_WORDS)
-            doc_expected_chunks[doc_id] = len(doc_chunks)
-
-            for chunk_idx, (chunk_str, start_w, end_w) in enumerate(doc_chunks):
-                user_prompt = THEME_DISCOVERY_USER_PROMPT.format(text_content=chunk_str)
-                full_prompt = f"=== SYSTEM PROMPT ===\n{THEME_DISCOVERY_SYSTEM_PROMPT}\n\n=== USER PROMPT ===\n{user_prompt}"
-                self._save_payload_text("stage_01_theme_discovery.txt", full_prompt)
-                chunk_rows.append({
-                    "chunk_uid": f"{doc_id}__chunk_{chunk_idx}",
-                    "doc_id": doc_id,
-                    "start_word": start_w,
-                    "end_word": end_w,
-                    "text": chunk_str,
-                })
-
-        if not chunk_rows:
+        total_docs = len(documents)
+        if total_docs == 0:
             return self.aggregate_themes()
 
         theme_template = {
@@ -994,59 +1016,153 @@ class SemanticPrismStage1Pipeline:
             "prompt": f"{THEME_DISCOVERY_USER_PROMPT.replace('{text_content}', '{{ text }}')}\n\n{{schema_block}}",
         }
 
-        results = self.prism.run(
-            task="extract",
-            input_data=chunk_rows,
-            text_column="text",
-            id_column="chunk_uid",
-            schema_cls=ThemeDiscoveryResult,
-            prompt_template=theme_template,
-            system_prompt=THEME_DISCOVERY_SYSTEM_PROMPT,
-            chunk=False,
-            as_array=False,
-            max_new_tokens=THEME_MAX_NEW_TOKENS,
-            temperature=TEMPERATURE,
-            constrain_json=CONSTRAIN_JSON,
-            dry_run=dry_run,
-        )
-
-        if dry_run:
-            return self.context.all_discovered_themes
-
-        themes_by_doc: Dict[str, List[Theme]] = {doc_id: [] for doc_id in doc_expected_chunks}
-        for row_meta, res in zip(chunk_rows, results):
-            doc_id = row_meta["doc_id"]
-            items = res.get("extracted_items") or res.get("parsed_items") or []
-            if not items and not res.get("parse_success", True):
-                err_rec = {
-                    "source_document": doc_id,
-                    "start_word": row_meta["start_word"],
-                    "end_word": row_meta["end_word"],
-                    "error": res.get("parse_error", "Validation error"),
-                    "chunk_text": row_meta["text"],
-                }
-                with open(self.log_dir / "stage_01_theme_discovery_errors.json", "a", encoding="utf-8") as ef:
-                    ef.write(json.dumps(err_rec) + "\n")
-                continue
-
+        def _extract_theme_objects(items: List[Any]) -> List[Theme]:
+            extracted: List[Theme] = []
             for item in items:
                 if isinstance(item, ThemeDiscoveryResult):
-                    themes_by_doc[doc_id].extend(item.themes)
+                    extracted.extend(item.themes)
                 elif isinstance(item, Theme):
-                    themes_by_doc[doc_id].append(item)
+                    extracted.append(item)
                 elif isinstance(item, dict):
                     try:
                         parsed_res = ThemeDiscoveryResult.model_validate(item)
-                        themes_by_doc[doc_id].extend(parsed_res.themes)
+                        extracted.extend(parsed_res.themes)
                     except Exception:
                         pass
+            return extracted
 
-        for doc_id, doc_themes in themes_by_doc.items():
+        # Initialize LLM engine once upfront before iterating through documents
+        if not dry_run and self.prism.engine is None:
+            self._log_checkpoint("Phase 1: Themes", f"Loading model '{MODEL_NAME}' onto device...")
+            self.prism.init_engine(
+                batch_size=BATCH_SIZE,
+                max_new_tokens=THEME_MAX_NEW_TOKENS,
+                temperature=TEMPERATURE,
+            )
+            eff_ctx = self._apply_context_window_cap()
+            self._log_checkpoint(
+                "Phase 1: Themes",
+                f"Model ready on device '{self.prism.device}' (effective context window: {eff_ctx} tokens)",
+            )
+
+        effective_theme_words = self._resolve_stage_max_words(THEME_CHUNK_MAX_WORDS, THEME_MAX_NEW_TOKENS)
+        theme_batch_size = self._resolve_stage_batch_size(effective_theme_words)
+        save_lock = threading.Lock()
+
+        for doc_idx, doc in enumerate(documents, start=1):
+            doc_id = doc["id"]
             safe_name = self.sanitize_filename(doc_id)
-            out_file = self.themes_dir / f"{safe_name}_themes.json"
-            with open(out_file, "w", encoding="utf-8") as f:
+            theme_file_path = self.themes_dir / f"{safe_name}_themes.json"
+
+            if RESUME_MODE == "skip" and theme_file_path.exists():
+                print(f"-> [{doc_idx}/{total_docs}] Skipping theme discovery for: {doc_id} (already exists on disk)")
+                try:
+                    cached = json.loads(theme_file_path.read_text(encoding="utf-8"))
+                    for t in cached:
+                        self.context.all_discovered_themes.append(Theme.model_validate(t))
+                except Exception:
+                    pass
+                continue
+
+            doc_chunks = self.chunk_text(doc["text"], effective_theme_words)
+            num_chunks = len(doc_chunks)
+            total_words = len(doc["text"].split())
+            self._log_checkpoint(
+                "Phase 1: Themes",
+                f"Starting Doc {doc_idx}/{total_docs}: '{doc_id}' ({num_chunks} chunk(s), {total_words} words, batch_size={theme_batch_size})...",
+            )
+
+            doc_chunk_rows: List[Dict[str, Any]] = []
+            chunk_meta_by_uid: Dict[str, Dict[str, Any]] = {}
+            for chunk_idx, (chunk_str, start_w, end_w) in enumerate(doc_chunks):
+                user_prompt = THEME_DISCOVERY_USER_PROMPT.format(text_content=chunk_str)
+                full_prompt = f"=== SYSTEM PROMPT ===\n{THEME_DISCOVERY_SYSTEM_PROMPT}\n\n=== USER PROMPT ===\n{user_prompt}"
+                self._save_payload_text("stage_01_theme_discovery.txt", full_prompt)
+                chunk_uid = f"{doc_id}__chunk_{chunk_idx}"
+                row_meta = {
+                    "chunk_uid": chunk_uid,
+                    "doc_id": doc_id,
+                    "chunk_idx": chunk_idx,
+                    "start_word": start_w,
+                    "end_word": end_w,
+                    "text": chunk_str,
+                }
+                doc_chunk_rows.append(row_meta)
+                chunk_meta_by_uid[chunk_uid] = row_meta
+
+            doc_themes: List[Theme] = []
+            completed_chunks = 0
+            callback_fired = False
+
+            def _on_theme_chunk(chunk_res: Dict[str, Any]) -> None:
+                nonlocal completed_chunks, callback_fired
+                chunk_uid = str(chunk_res.get("record_id") or chunk_res.get("id") or "")
+                row_meta = chunk_meta_by_uid.get(chunk_uid)
+                if not row_meta:
+                    return
+                items = chunk_res.get("parsed_items") or chunk_res.get("extracted_items") or []
+
+                with save_lock:
+                    callback_fired = True
+                    if not items and not chunk_res.get("parse_success", True):
+                        err_rec = {
+                            "source_document": doc_id,
+                            "start_word": row_meta["start_word"],
+                            "end_word": row_meta["end_word"],
+                            "error": chunk_res.get("parse_error", "Validation error"),
+                            "chunk_text": row_meta["text"],
+                        }
+                        with open(self.log_dir / "stage_01_theme_discovery_errors.json", "a", encoding="utf-8") as ef:
+                            ef.write(json.dumps(err_rec) + "\n")
+                        new_themes: List[Theme] = []
+                    else:
+                        new_themes = _extract_theme_objects(items)
+                        doc_themes.extend(new_themes)
+
+                    completed_chunks += 1
+                    self._log_checkpoint(
+                        "Phase 1: Themes",
+                        f"Doc {doc_idx}/{total_docs} '{doc_id}' — chunk {completed_chunks}/{num_chunks} "
+                        f"processed (+{len(new_themes)} themes)",
+                    )
+
+            results = self.prism.run(
+                task="extract",
+                input_data=doc_chunk_rows,
+                text_column="text",
+                id_column="chunk_uid",
+                schema_cls=ThemeDiscoveryResult,
+                prompt_template=theme_template,
+                system_prompt=THEME_DISCOVERY_SYSTEM_PROMPT,
+                chunk=False,
+                as_array=False,
+                batch_size=theme_batch_size,
+                max_new_tokens=THEME_MAX_NEW_TOKENS,
+                temperature=TEMPERATURE,
+                constrain_json=CONSTRAIN_JSON,
+                dry_run=dry_run,
+                on_chunk_processed=_on_theme_chunk,
+            )
+
+            if dry_run:
+                continue
+
+            if not callback_fired:
+                for res in results:
+                    items = res.get("extracted_items") or res.get("parsed_items") or []
+                    doc_themes.extend(_extract_theme_objects(items))
+
+            with open(theme_file_path, "w", encoding="utf-8") as f:
                 json.dump([t.model_dump() for t in doc_themes], f, indent=2)
             self.context.all_discovered_themes.extend(doc_themes)
+            self._log_checkpoint(
+                "Phase 1: Themes",
+                f"Saved '{theme_file_path.name}' ({len(doc_themes)} themes) — "
+                f"Document {doc_idx}/{total_docs} complete",
+            )
+
+        if dry_run:
+            return self.context.all_discovered_themes
 
         return self.aggregate_themes()
 
@@ -1066,8 +1182,13 @@ class SemanticPrismStage1Pipeline:
 
         self.context.all_discovered_themes = [Theme.model_validate(t) for t in all_themes]
         if all_themes:
-            with open(self.out_dir / "all_themes.json", "w", encoding="utf-8") as f:
+            out_all = self.out_dir / "all_themes.json"
+            with open(out_all, "w", encoding="utf-8") as f:
                 json.dump([t.model_dump() for t in self.context.all_discovered_themes], f, indent=2)
+            self._log_checkpoint(
+                "Phase 1.5: Aggregation",
+                f"Saved '{out_all.name}' ({len(self.context.all_discovered_themes)} total themes)",
+            )
         return self.context.all_discovered_themes
 
     # =========================================================================
@@ -1127,6 +1248,10 @@ class SemanticPrismStage1Pipeline:
             print("-> Skipping master theme synthesis (already exists on disk). Loading existing master themes...")
             return self.load_master_themes()
 
+        self._log_checkpoint(
+            "Phase 2: Clustering",
+            f"Embedding and clustering {len(self.context.all_discovered_themes)} discovered themes ({CLUSTERING_MODE} mode)...",
+        )
         cluster_engine = ThemeClusteringEngine(
             themes_path=self.out_dir / "all_themes.json",
             output_dir=self.out_dir,
@@ -1135,6 +1260,10 @@ class SemanticPrismStage1Pipeline:
         partitions = cluster_results["partitions"]
         exemplar_groups = cluster_results["active_exemplars"]
         active_partition = cluster_engine.get_active_partition(partitions)
+        self._log_checkpoint(
+            "Phase 2: Clustering",
+            f"Formed {len(exemplar_groups)} empirical theme cluster(s)",
+        )
 
         if SYNTHESIS_STRATEGY == "map_reduce":
             map_payloads = cluster_engine.get_map_payload(
@@ -1162,6 +1291,11 @@ class SemanticPrismStage1Pipeline:
                 "system_prompt": CLUSTER_MAP_SYSTEM_PROMPT,
                 "prompt": "{{ text }}\n\n{schema_block}",
             }
+            map_batch_size = self._resolve_stage_batch_size(1200)
+            self._log_checkpoint(
+                "Phase 2A: Cluster Map",
+                f"Synthesizing candidate definitions for {len(map_inputs)} cluster(s) (batch_size={map_batch_size})...",
+            )
             map_results = self.prism.run(
                 task="extract",
                 input_data=map_inputs,
@@ -1172,6 +1306,7 @@ class SemanticPrismStage1Pipeline:
                 system_prompt=CLUSTER_MAP_SYSTEM_PROMPT,
                 chunk=False,
                 as_array=False,
+                batch_size=map_batch_size,
                 max_new_tokens=MASTER_SYNTHESIS_MAX_NEW_TOKENS,
                 temperature=TEMPERATURE,
                 constrain_json=CONSTRAIN_JSON,
@@ -1210,8 +1345,13 @@ class SemanticPrismStage1Pipeline:
                 map_candidates.append(cand)
 
             self.context.cluster_candidates = map_candidates
-            with open(self.out_dir / "cluster_candidates.json", "w", encoding="utf-8") as f:
+            cand_path = self.out_dir / "cluster_candidates.json"
+            with open(cand_path, "w", encoding="utf-8") as f:
                 json.dump([c.model_dump() for c in map_candidates], f, indent=2)
+            self._log_checkpoint(
+                "Phase 2A: Cluster Map",
+                f"Saved '{cand_path.name}' ({len(map_candidates)} cluster candidate syntheses)",
+            )
 
             reduce_anchors = cluster_engine.get_reduce_anchors(top_n=REDUCE_ANCHOR_THEME_COUNT)
             cluster_blocks = []
@@ -1260,6 +1400,7 @@ class SemanticPrismStage1Pipeline:
             "system_prompt": reduce_sys_prompt,
             "prompt": "{{ text }}\n\n{schema_block}",
         }
+        self._log_checkpoint("Phase 2B: Master Ontology", "Running Reduce synthesis for unified Master Ontology...")
         reduce_results = self.prism.run(
             task="extract",
             input_data=reduce_user_prompt,
@@ -1311,11 +1452,16 @@ class SemanticPrismStage1Pipeline:
 
         with open(master_path, "w", encoding="utf-8") as f:
             f.write(master_res.model_dump_json(indent=2))
+        self._log_checkpoint(
+            "Phase 2B: Master Ontology",
+            f"Saved '{master_path.name}' ({len(master_res.master_themes)} master themes in domain '{master_res.master_domain}')",
+        )
 
-        cluster_engine.export_clustering_summary(
+        summary_path = cluster_engine.export_clustering_summary(
             master_themes=master_res.master_themes,
             master_domain=master_res.master_domain,
         )
+        self._log_checkpoint("Phase 2.5: Clustering Summary", f"Saved '{summary_path.name}'")
         self._export_cluster_theme_mapping(active_partition, master_res.master_themes)
         return master_res
 
@@ -1329,10 +1475,15 @@ class SemanticPrismStage1Pipeline:
         dry_run: bool = DRY_RUN,
     ) -> List[Dict[str, Any]]:
         """
-        Phase 3: Extract atomic (Subject, Predicate, Object) triples across all documents
+        Phase 3: Extract atomic (Subject, Predicate, Object) triples document-by-document
         using Master Themes context and verbatim source_quote grounding.
+        Saves each document's {doc}_triplets.json immediately upon completing that document.
         """
         print(f"\n=== Phase 3: Global Triple Extraction (Model: {MODEL_NAME}) ===")
+        total_docs = len(documents)
+        if total_docs == 0:
+            return self.aggregate_triplets()
+
         if not self.context.master_themes:
             self.load_master_themes()
 
@@ -1343,40 +1494,6 @@ class SemanticPrismStage1Pipeline:
             sys_context = '\nAllowed theme_association values: ["Other"]'
 
         full_sys_prompt = f"{TRIPLE_EXTRACTION_SYSTEM_PROMPT}\n{sys_context}"
-
-        chunk_rows: List[Dict[str, Any]] = []
-        pending_doc_ids: List[str] = []
-
-        for doc in documents:
-            doc_id = doc["id"]
-            self.context.processed_documents.add(doc_id)
-            safe_name = self.sanitize_filename(doc_id)
-            triple_file_path = self.triples_dir / f"{safe_name}_triplets.json"
-
-            if RESUME_MODE == "skip" and triple_file_path.exists():
-                print(f"-> Skipping triple extraction for: {doc_id} (already exists on disk)")
-                continue
-
-            print(f"-> Extracting triples from: {doc_id}")
-            pending_doc_ids.append(doc_id)
-            triple_chunks = self.chunk_text(doc["text"], TRIPLE_CHUNK_MAX_WORDS)
-            for chunk_idx, (chunk_str, start_w, end_w) in enumerate(triple_chunks):
-                user_prompt = TRIPLE_EXTRACTION_USER_PROMPT.format(text_content=chunk_str)
-                self._save_payload_text(
-                    "stage_01_triple_extraction.txt",
-                    f"=== SYSTEM PROMPT ===\n{full_sys_prompt}\n\n=== USER PROMPT ===\n{user_prompt}",
-                )
-                chunk_rows.append({
-                    "chunk_uid": f"{doc_id}__tchunk_{chunk_idx}",
-                    "doc_id": doc_id,
-                    "start_word": start_w,
-                    "end_word": end_w,
-                    "text": chunk_str,
-                })
-
-        if not chunk_rows:
-            return self.aggregate_triplets()
-
         triple_template = {
             "version": "1.0",
             "task": "triple_extraction",
@@ -1384,33 +1501,14 @@ class SemanticPrismStage1Pipeline:
             "prompt": f"{TRIPLE_EXTRACTION_USER_PROMPT.replace('{text_content}', '{{ text }}')}\n\n{{schema_block}}",
         }
 
-        results = self.prism.run(
-            task="extract",
-            input_data=chunk_rows,
-            text_column="text",
-            id_column="chunk_uid",
-            schema_cls=TripleExtractionResult,
-            prompt_template=triple_template,
-            system_prompt=full_sys_prompt,
-            chunk=False,
-            as_array=False,
-            max_new_tokens=TRIPLE_MAX_NEW_TOKENS,
-            temperature=TEMPERATURE,
-            constrain_json=CONSTRAIN_JSON,
-            dry_run=dry_run,
+        allowed_themes = (
+            set(self.context.master_themes.master_themes)
+            if (self.context.master_themes and self.context.master_themes.master_themes)
+            else set()
         )
 
-        if dry_run:
-            return self.context.raw_triples
-
-        triples_by_doc: Dict[str, List[Dict[str, Any]]] = {doc_id: [] for doc_id in pending_doc_ids}
-        allowed_themes = set(self.context.master_themes.master_themes) if (self.context.master_themes and self.context.master_themes.master_themes) else set()
-
-        for row_meta, res in zip(chunk_rows, results):
-            doc_id = row_meta["doc_id"]
-            items = res.get("extracted_items") or res.get("parsed_items") or []
+        def _extract_triple_dicts(items: List[Any], doc_id: str) -> List[Dict[str, Any]]:
             extracted_triples: List[RawTriple] = []
-
             for item in items:
                 if isinstance(item, TripleExtractionResult):
                     extracted_triples.extend(item.triples)
@@ -1423,17 +1521,140 @@ class SemanticPrismStage1Pipeline:
                     except Exception:
                         pass
 
+            dicts: List[Dict[str, Any]] = []
             for t in extracted_triples:
                 t_dict = t.model_dump()
                 if allowed_themes and t_dict.get("theme_association") not in allowed_themes:
                     t_dict["theme_association"] = "Other"
                 t_dict["source_document"] = doc_id
-                triples_by_doc[doc_id].append(t_dict)
+                dicts.append(t_dict)
+            return dicts
 
-        for doc_id, doc_triples in triples_by_doc.items():
+        if not dry_run and self.prism.engine is None:
+            self._log_checkpoint("Phase 3: Triples", f"Loading model '{MODEL_NAME}' onto device...")
+            self.prism.init_engine(
+                batch_size=BATCH_SIZE,
+                max_new_tokens=TRIPLE_MAX_NEW_TOKENS,
+                temperature=TEMPERATURE,
+            )
+            self._apply_context_window_cap()
+
+        effective_triple_words = self._resolve_stage_max_words(TRIPLE_CHUNK_MAX_WORDS, TRIPLE_MAX_NEW_TOKENS)
+        triple_batch_size = self._resolve_stage_batch_size(effective_triple_words)
+        save_lock = threading.Lock()
+
+        for doc_idx, doc in enumerate(documents, start=1):
+            doc_id = doc["id"]
+            self.context.processed_documents.add(doc_id)
             safe_name = self.sanitize_filename(doc_id)
-            with open(self.triples_dir / f"{safe_name}_triplets.json", "w", encoding="utf-8") as f:
+            triple_file_path = self.triples_dir / f"{safe_name}_triplets.json"
+
+            if RESUME_MODE == "skip" and triple_file_path.exists():
+                print(f"-> [{doc_idx}/{total_docs}] Skipping triple extraction for: {doc_id} (already exists on disk)")
+                continue
+
+            triple_chunks = self.chunk_text(doc["text"], effective_triple_words)
+            num_chunks = len(triple_chunks)
+            total_words = len(doc["text"].split())
+            self._log_checkpoint(
+                "Phase 3: Triples",
+                f"Starting Doc {doc_idx}/{total_docs}: '{doc_id}' ({num_chunks} chunk(s), {total_words} words, batch_size={triple_batch_size})...",
+            )
+
+            doc_chunk_rows: List[Dict[str, Any]] = []
+            chunk_meta_by_uid: Dict[str, Dict[str, Any]] = {}
+            for chunk_idx, (chunk_str, start_w, end_w) in enumerate(triple_chunks):
+                user_prompt = TRIPLE_EXTRACTION_USER_PROMPT.format(text_content=chunk_str)
+                self._save_payload_text(
+                    "stage_01_triple_extraction.txt",
+                    f"=== SYSTEM PROMPT ===\n{full_sys_prompt}\n\n=== USER PROMPT ===\n{user_prompt}",
+                )
+                chunk_uid = f"{doc_id}__tchunk_{chunk_idx}"
+                row_meta = {
+                    "chunk_uid": chunk_uid,
+                    "doc_id": doc_id,
+                    "chunk_idx": chunk_idx,
+                    "start_word": start_w,
+                    "end_word": end_w,
+                    "text": chunk_str,
+                }
+                doc_chunk_rows.append(row_meta)
+                chunk_meta_by_uid[chunk_uid] = row_meta
+
+            doc_triples: List[Dict[str, Any]] = []
+            completed_chunks = 0
+            callback_fired = False
+
+            def _on_triple_chunk(chunk_res: Dict[str, Any]) -> None:
+                nonlocal completed_chunks, callback_fired
+                chunk_uid = str(chunk_res.get("record_id") or chunk_res.get("id") or "")
+                row_meta = chunk_meta_by_uid.get(chunk_uid)
+                if not row_meta:
+                    return
+                items = chunk_res.get("parsed_items") or chunk_res.get("extracted_items") or []
+
+                with save_lock:
+                    callback_fired = True
+                    if not items and not chunk_res.get("parse_success", True):
+                        err_rec = {
+                            "phase": "initial_triple_extraction_failed",
+                            "source_document": doc_id,
+                            "start_word": row_meta["start_word"],
+                            "end_word": row_meta["end_word"],
+                            "error_message": chunk_res.get("parse_error", "Validation error"),
+                            "malformed_output": chunk_res.get("raw_output", ""),
+                            "chunk_text": row_meta["text"],
+                        }
+                        with open(self.log_dir / "stage_01_triple_extraction_errors.json", "a", encoding="utf-8") as ef:
+                            ef.write(json.dumps(err_rec) + "\n")
+                        new_triples: List[Dict[str, Any]] = []
+                    else:
+                        new_triples = _extract_triple_dicts(items, doc_id)
+                        doc_triples.extend(new_triples)
+
+                    completed_chunks += 1
+                    self._log_checkpoint(
+                        "Phase 3: Triples",
+                        f"Doc {doc_idx}/{total_docs} '{doc_id}' — chunk {completed_chunks}/{num_chunks} "
+                        f"processed (+{len(new_triples)} triples)",
+                    )
+
+            results = self.prism.run(
+                task="extract",
+                input_data=doc_chunk_rows,
+                text_column="text",
+                id_column="chunk_uid",
+                schema_cls=TripleExtractionResult,
+                prompt_template=triple_template,
+                system_prompt=full_sys_prompt,
+                chunk=False,
+                as_array=False,
+                batch_size=triple_batch_size,
+                max_new_tokens=TRIPLE_MAX_NEW_TOKENS,
+                temperature=TEMPERATURE,
+                constrain_json=CONSTRAIN_JSON,
+                dry_run=dry_run,
+                on_chunk_processed=_on_triple_chunk,
+            )
+
+            if dry_run:
+                continue
+
+            if not callback_fired:
+                for res in results:
+                    items = res.get("extracted_items") or res.get("parsed_items") or []
+                    doc_triples.extend(_extract_triple_dicts(items, doc_id))
+
+            with open(triple_file_path, "w", encoding="utf-8") as f:
                 json.dump(doc_triples, f, indent=2)
+            self._log_checkpoint(
+                "Phase 3: Triples",
+                f"Saved '{triple_file_path.name}' ({len(doc_triples)} triples) — "
+                f"Document {doc_idx}/{total_docs} complete",
+            )
+
+        if dry_run:
+            return self.context.raw_triples
 
         return self.aggregate_triplets()
 
@@ -1471,6 +1692,10 @@ class SemanticPrismStage1Pipeline:
             for doc, count in sorted(counts.items()):
                 f.write(f"{doc},{count}\n")
 
+        self._log_checkpoint(
+            "Phase 3.5: Aggregation",
+            f"Saved 'original_triplets.json' ({len(all_triples)} total triples) and '{csv_path.name}' ({len(counts)} docs)",
+        )
         return all_triples
 
     # =========================================================================
