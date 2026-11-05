@@ -310,6 +310,78 @@ def generate_hardware_advisory(
     }
 
 
+def resolve_dynamic_batch_size(
+    device: Optional[torch.device] = None,
+    requested_batch_size: Optional[Union[int, str]] = "auto",
+    items: Optional[List[Dict[str, Any]]] = None,
+    text_key: str = "prompt",
+    max_new_tokens: int = 512,
+    tokenizer: Optional[PreTrainedTokenizerBase] = None,
+    max_batch_size: int = 32,
+) -> int:
+    """Dynamically compute the optimal concurrent batch size from live hardware memory and payload token length."""
+    if isinstance(requested_batch_size, int) and requested_batch_size > 0:
+        return requested_batch_size
+    if isinstance(requested_batch_size, str) and requested_batch_size.strip().isdigit():
+        val = int(requested_batch_size.strip())
+        if val > 0:
+            return val
+
+    # Estimate 90th-percentile prompt token length across queued items
+    est_prompt_tokens = 512
+    if items:
+        sample = items if len(items) <= 128 else items[:: max(1, len(items) // 128)]
+        lengths: List[int] = []
+        for item in sample:
+            txt = str(item.get(text_key) or item.get("text") or "")
+            if tokenizer is not None:
+                try:
+                    ids = tokenizer.encode(txt, add_special_tokens=False)
+                    if isinstance(ids, list) and ids:
+                        lengths.append(len(ids))
+                        continue
+                except Exception:
+                    pass
+            lengths.append(max(1, int(len(txt.split()) * 1.35)))
+        if lengths:
+            lengths.sort()
+            p90_idx = min(len(lengths) - 1, int(len(lengths) * 0.9))
+            est_prompt_tokens = lengths[p90_idx]
+
+    est_seq_tokens = est_prompt_tokens + max(64, max_new_tokens) + 128
+    dev_type = device.type if device is not None else "cpu"
+
+    if dev_type == "cuda" and torch.cuda.is_available():
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+            usable_gb = (free_bytes / (1024 ** 3)) * 0.75
+        except Exception:
+            try:
+                total_bytes = torch.cuda.get_device_properties(device).total_memory
+                allocated_bytes = torch.cuda.memory_allocated(device)
+                usable_gb = max(1.0, ((total_bytes - allocated_bytes) / (1024 ** 3)) * 0.75)
+            except Exception:
+                usable_gb = 6.0
+
+        per_seq_gb = max(0.12, est_seq_tokens * 0.00018)
+        return max(1, min(max_batch_size, int(usable_gb // per_seq_gb)))
+
+    if dev_type == "mps":
+        try:
+            total_ram_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)
+        except Exception:
+            total_ram_gb = 16.0
+        if est_seq_tokens >= 2400:
+            return 4 if total_ram_gb >= 32 else 2
+        elif est_seq_tokens >= 1200:
+            return 6 if total_ram_gb >= 32 else 4
+        return 8 if total_ram_gb >= 32 else 4
+
+    if est_seq_tokens >= 1600:
+        return 1
+    return max(1, min(4, (os.cpu_count() or 2) // 2))
+
+
 # ==============================================================================
 # 3. Model & Tokenizer Loading (Zero-Copy / Low-CPU-Mem / Safetensors / SDPA)
 # ==============================================================================
@@ -473,8 +545,14 @@ def create_length_buckets(
     text_key: str = "text",
     index_key: str = "_orig_idx",
     tokenizer: Optional[PreTrainedTokenizerBase] = None,
+    window_size: Optional[int] = None,
 ) -> List[List[Dict[str, Any]]]:
-    """Group items by sequence length to minimize padding waste in batched inference."""
+    """
+    Group items by sequence length to minimize padding waste in batched inference.
+    When window_size > 0, length sorting is applied within local sliding windows of
+    window_size items so multi-chunk documents stay contiguous for streaming saves.
+    """
+    b_size = max(1, batch_size)
     indexed = [dict(item, **{index_key: i}) for i, item in enumerate(records)]
     if tokenizer is not None:
         def _seq_len(x: Dict[str, Any]) -> int:
@@ -488,8 +566,17 @@ def create_length_buckets(
         def _seq_len(x: Dict[str, Any]) -> int:
             return len(str(x.get(text_key, "")))
 
+    if window_size is not None and window_size > b_size and len(indexed) > window_size:
+        buckets: List[List[Dict[str, Any]]] = []
+        for w_start in range(0, len(indexed), window_size):
+            window = indexed[w_start : w_start + window_size]
+            sorted_window = sorted(window, key=_seq_len)
+            for i in range(0, len(sorted_window), b_size):
+                buckets.append(sorted_window[i : i + b_size])
+        return buckets
+
     sorted_recs = sorted(indexed, key=_seq_len)
-    return [sorted_recs[i : i + batch_size] for i in range(0, len(sorted_recs), batch_size)]
+    return [sorted_recs[i : i + b_size] for i in range(0, len(sorted_recs), b_size)]
 
 
 def restore_original_order(
@@ -817,9 +904,12 @@ class BatchInferenceEngine:
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
         repetition_penalty: Optional[float] = None,
+        batch_size: Optional[Union[int, str]] = None,
         bucket_by_length: bool = True,
+        bucket_window_size: Optional[int] = None,
         response_prefix: Optional[str] = None,
         stop_on_json_close: bool = True,
+        on_batch_start: Optional[Callable[[int, int, List[Dict[str, Any]]], None]] = None,
         on_batch_complete: Optional[Callable[[List[str], List[Dict[str, Any]]], List[Dict[str, Any]]]] = None,
         max_workers: Optional[int] = None,
         **extra_gen_kwargs,
@@ -828,18 +918,42 @@ class BatchInferenceEngine:
         if not items:
             return []
 
-        if bucket_by_length and len(items) > 1 and self.batch_size > 1:
+        tokens_to_gen = max_new_tokens if max_new_tokens is not None else self.max_new_tokens
+        if batch_size == "auto":
+            eff_batch_size = resolve_dynamic_batch_size(
+                device=self.target_device,
+                requested_batch_size="auto",
+                items=items,
+                text_key=prompt_key,
+                max_new_tokens=tokens_to_gen,
+                tokenizer=self.tokenizer,
+            )
+        elif isinstance(batch_size, int) and batch_size > 0:
+            eff_batch_size = batch_size
+        else:
+            eff_batch_size = self.batch_size
+
+        eff_window_size = (
+            bucket_window_size
+            if bucket_window_size is not None
+            else eff_batch_size * 8
+        )
+
+        if bucket_by_length and len(items) > 1 and eff_batch_size > 1:
             buckets = create_length_buckets(
                 items,
-                self.batch_size,
+                eff_batch_size,
                 text_key=prompt_key,
                 tokenizer=self.tokenizer,
+                window_size=eff_window_size,
             )
         else:
             buckets = [
-                [dict(item, _orig_idx=idx) for idx, item in enumerate(items[i : i + self.batch_size], start=i)]
-                for i in range(0, len(items), self.batch_size)
+                [dict(item, _orig_idx=idx) for idx, item in enumerate(items[i : i + eff_batch_size], start=i)]
+                for i in range(0, len(items), eff_batch_size)
             ]
+
+        total_batches = len(buckets)
 
         def _default_batch_mapper(completions: List[str], batch_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             return [dict(item, raw_output=comp) for item, comp in zip(batch_items, completions)]
@@ -848,8 +962,13 @@ class BatchInferenceEngine:
         results: List[Dict[str, Any]] = []
         workers = max_workers if max_workers is not None else min(4, max(1, (os.cpu_count() or 2) // 2))
 
-        if len(buckets) <= 1 or workers <= 1:
-            for batch_items in buckets:
+        if total_batches <= 1 or workers <= 1:
+            for batch_idx, batch_items in enumerate(buckets, start=1):
+                if on_batch_start is not None:
+                    try:
+                        on_batch_start(batch_idx, total_batches, batch_items)
+                    except Exception as e:
+                        logger.debug(f"on_batch_start callback notice: {e}")
                 formatted_batch = [
                     self.render_chat_prompt(
                         self.format_chatml_messages(item.get(prompt_key, ""), system_prompt),
@@ -873,7 +992,12 @@ class BatchInferenceEngine:
 
         with ThreadPoolExecutor(max_workers=workers) as io_pool:
             futures = []
-            for batch_items in buckets:
+            for batch_idx, batch_items in enumerate(buckets, start=1):
+                if on_batch_start is not None:
+                    try:
+                        on_batch_start(batch_idx, total_batches, batch_items)
+                    except Exception as e:
+                        logger.debug(f"on_batch_start callback notice: {e}")
                 formatted_batch = [
                     self.render_chat_prompt(
                         self.format_chatml_messages(item.get(prompt_key, ""), system_prompt),

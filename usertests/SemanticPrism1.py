@@ -981,28 +981,16 @@ class SemanticPrismStage1Pipeline:
         safe_max_words = max(150, int(available_input_tokens * 0.7))
         return min(requested_max_words, safe_max_words)
 
-    def _resolve_stage_batch_size(self, max_words_per_chunk: int) -> int:
-        """
-        Resolve safe batch size for a given chunk word length.
-        2,000-word theme chunks (~3,000 tokens each) use smaller batch sizes to prevent
-        MPS unified-memory swap / CUDA KV-cache stalls and provide responsive checkpoints.
-        """
-        if isinstance(BATCH_SIZE, int) and BATCH_SIZE > 0:
-            return BATCH_SIZE
-        dev_type = self.prism.device.type if self.prism.device is not None else "cpu"
-        if max_words_per_chunk >= 1200:
-            return 2 if dev_type == "cuda" else 1
-        return 8 if dev_type == "cuda" else (2 if dev_type == "mps" else 1)
-
     def discover_themes_across_documents(
         self,
         documents: List[Dict[str, str]],
         dry_run: bool = DRY_RUN,
     ) -> List[Theme]:
         """
-        Phase 1: Discover abstract overarching themes document-by-document using
-        SemanticPrism's word-chunking + prompts, batched through PrismPipeline.
-        Saves each document's {doc}_themes.json immediately upon completing that document.
+        Phase 1: Discover abstract overarching themes across all documents concurrently.
+        Delegates dynamic payload-aware batch sizing and windowed length-bucketing to
+        PrismPipeline.run(), flushing each document's {doc}_themes.json to disk as soon
+        as its chunks finish.
         """
         print(f"=== Phase 1: Global Theme Discovery (Model: {MODEL_NAME}) ===")
         total_docs = len(documents)
@@ -1031,7 +1019,6 @@ class SemanticPrismStage1Pipeline:
                         pass
             return extracted
 
-        # Initialize LLM engine once upfront before iterating through documents
         if not dry_run and self.prism.engine is None:
             self._log_checkpoint("Phase 1: Themes", f"Loading model '{MODEL_NAME}' onto device...")
             self.prism.init_engine(
@@ -1046,8 +1033,9 @@ class SemanticPrismStage1Pipeline:
             )
 
         effective_theme_words = self._resolve_stage_max_words(THEME_CHUNK_MAX_WORDS, THEME_MAX_NEW_TOKENS)
-        theme_batch_size = self._resolve_stage_batch_size(effective_theme_words)
-        save_lock = threading.Lock()
+        chunk_rows: List[Dict[str, Any]] = []
+        chunk_meta_by_uid: Dict[str, Dict[str, Any]] = {}
+        doc_expected_chunks: Dict[str, int] = {}
 
         for doc_idx, doc in enumerate(documents, start=1):
             doc_id = doc["id"]
@@ -1065,15 +1053,8 @@ class SemanticPrismStage1Pipeline:
                 continue
 
             doc_chunks = self.chunk_text(doc["text"], effective_theme_words)
-            num_chunks = len(doc_chunks)
-            total_words = len(doc["text"].split())
-            self._log_checkpoint(
-                "Phase 1: Themes",
-                f"Starting Doc {doc_idx}/{total_docs}: '{doc_id}' ({num_chunks} chunk(s), {total_words} words, batch_size={theme_batch_size})...",
-            )
+            doc_expected_chunks[doc_id] = len(doc_chunks)
 
-            doc_chunk_rows: List[Dict[str, Any]] = []
-            chunk_meta_by_uid: Dict[str, Dict[str, Any]] = {}
             for chunk_idx, (chunk_str, start_w, end_w) in enumerate(doc_chunks):
                 user_prompt = THEME_DISCOVERY_USER_PROMPT.format(text_content=chunk_str)
                 full_prompt = f"=== SYSTEM PROMPT ===\n{THEME_DISCOVERY_SYSTEM_PROMPT}\n\n=== USER PROMPT ===\n{user_prompt}"
@@ -1087,82 +1068,110 @@ class SemanticPrismStage1Pipeline:
                     "end_word": end_w,
                     "text": chunk_str,
                 }
-                doc_chunk_rows.append(row_meta)
+                chunk_rows.append(row_meta)
                 chunk_meta_by_uid[chunk_uid] = row_meta
 
-            doc_themes: List[Theme] = []
-            completed_chunks = 0
-            callback_fired = False
+        if not chunk_rows:
+            return self.aggregate_themes()
 
-            def _on_theme_chunk(chunk_res: Dict[str, Any]) -> None:
-                nonlocal completed_chunks, callback_fired
-                chunk_uid = str(chunk_res.get("record_id") or chunk_res.get("id") or "")
-                row_meta = chunk_meta_by_uid.get(chunk_uid)
-                if not row_meta:
-                    return
-                items = chunk_res.get("parsed_items") or chunk_res.get("extracted_items") or []
+        total_pending_docs = len(doc_expected_chunks)
+        save_lock = threading.Lock()
+        themes_by_doc: Dict[str, List[Theme]] = {doc_id: [] for doc_id in doc_expected_chunks}
+        completed_chunks_by_doc: Dict[str, int] = {doc_id: 0 for doc_id in doc_expected_chunks}
+        saved_doc_ids: Set[str] = set()
 
-                with save_lock:
-                    callback_fired = True
-                    if not items and not chunk_res.get("parse_success", True):
-                        err_rec = {
-                            "source_document": doc_id,
-                            "start_word": row_meta["start_word"],
-                            "end_word": row_meta["end_word"],
-                            "error": chunk_res.get("parse_error", "Validation error"),
-                            "chunk_text": row_meta["text"],
-                        }
-                        with open(self.log_dir / "stage_01_theme_discovery_errors.json", "a", encoding="utf-8") as ef:
-                            ef.write(json.dumps(err_rec) + "\n")
-                        new_themes: List[Theme] = []
-                    else:
-                        new_themes = _extract_theme_objects(items)
-                        doc_themes.extend(new_themes)
-
-                    completed_chunks += 1
-                    self._log_checkpoint(
-                        "Phase 1: Themes",
-                        f"Doc {doc_idx}/{total_docs} '{doc_id}' — chunk {completed_chunks}/{num_chunks} "
-                        f"processed (+{len(new_themes)} themes)",
-                    )
-
-            results = self.prism.run(
-                task="extract",
-                input_data=doc_chunk_rows,
-                text_column="text",
-                id_column="chunk_uid",
-                schema_cls=ThemeDiscoveryResult,
-                prompt_template=theme_template,
-                system_prompt=THEME_DISCOVERY_SYSTEM_PROMPT,
-                chunk=False,
-                as_array=False,
-                batch_size=theme_batch_size,
-                max_new_tokens=THEME_MAX_NEW_TOKENS,
-                temperature=TEMPERATURE,
-                constrain_json=CONSTRAIN_JSON,
-                dry_run=dry_run,
-                on_chunk_processed=_on_theme_chunk,
-            )
-
-            if dry_run:
-                continue
-
-            if not callback_fired:
-                for res in results:
-                    items = res.get("extracted_items") or res.get("parsed_items") or []
-                    doc_themes.extend(_extract_theme_objects(items))
-
-            with open(theme_file_path, "w", encoding="utf-8") as f:
+        def _flush_doc_themes(doc_id: str) -> None:
+            if doc_id in saved_doc_ids:
+                return
+            saved_doc_ids.add(doc_id)
+            doc_themes = themes_by_doc.get(doc_id, [])
+            safe_name = self.sanitize_filename(doc_id)
+            out_file = self.themes_dir / f"{safe_name}_themes.json"
+            with open(out_file, "w", encoding="utf-8") as f:
                 json.dump([t.model_dump() for t in doc_themes], f, indent=2)
             self.context.all_discovered_themes.extend(doc_themes)
             self._log_checkpoint(
                 "Phase 1: Themes",
-                f"Saved '{theme_file_path.name}' ({len(doc_themes)} themes) — "
-                f"Document {doc_idx}/{total_docs} complete",
+                f"Saved '{out_file.name}' ({len(doc_themes)} themes) — "
+                f"Document {len(saved_doc_ids)}/{total_pending_docs} complete",
             )
+
+        def _on_theme_batch_start(batch_idx: int, total_batches: int, batch_items: List[Dict[str, Any]]) -> None:
+            batch_docs = list(dict.fromkeys(
+                chunk_meta_by_uid[str(it.get("record_id") or "")]["doc_id"]
+                for it in batch_items
+                if str(it.get("record_id") or "") in chunk_meta_by_uid
+            ))
+            self._log_checkpoint(
+                "Phase 1: Themes",
+                f"Running concurrent batch {batch_idx}/{total_batches}: {len(batch_items)} chunk(s) "
+                f"across {len(batch_docs)} doc(s) {batch_docs[:4]}{'...' if len(batch_docs) > 4 else ''}",
+            )
+
+        def _on_theme_chunk(chunk_res: Dict[str, Any]) -> None:
+            chunk_uid = str(chunk_res.get("record_id") or chunk_res.get("id") or "")
+            row_meta = chunk_meta_by_uid.get(chunk_uid)
+            if not row_meta:
+                return
+            doc_id = row_meta["doc_id"]
+            items = chunk_res.get("parsed_items") or chunk_res.get("extracted_items") or []
+
+            with save_lock:
+                if not items and not chunk_res.get("parse_success", True):
+                    err_rec = {
+                        "source_document": doc_id,
+                        "start_word": row_meta["start_word"],
+                        "end_word": row_meta["end_word"],
+                        "error": chunk_res.get("parse_error", "Validation error"),
+                        "chunk_text": row_meta["text"],
+                    }
+                    with open(self.log_dir / "stage_01_theme_discovery_errors.json", "a", encoding="utf-8") as ef:
+                        ef.write(json.dumps(err_rec) + "\n")
+                    new_themes: List[Theme] = []
+                else:
+                    new_themes = _extract_theme_objects(items)
+                    themes_by_doc[doc_id].extend(new_themes)
+
+                completed_chunks_by_doc[doc_id] += 1
+                self._log_checkpoint(
+                    "Phase 1: Themes",
+                    f"Doc '{doc_id}' — chunk {completed_chunks_by_doc[doc_id]}/{doc_expected_chunks[doc_id]} "
+                    f"processed (+{len(new_themes)} themes)",
+                )
+                if completed_chunks_by_doc[doc_id] >= doc_expected_chunks[doc_id]:
+                    _flush_doc_themes(doc_id)
+
+        results = self.prism.run(
+            task="extract",
+            input_data=chunk_rows,
+            text_column="text",
+            id_column="chunk_uid",
+            schema_cls=ThemeDiscoveryResult,
+            prompt_template=theme_template,
+            system_prompt=THEME_DISCOVERY_SYSTEM_PROMPT,
+            chunk=False,
+            as_array=False,
+            batch_size=BATCH_SIZE,
+            max_new_tokens=THEME_MAX_NEW_TOKENS,
+            temperature=TEMPERATURE,
+            constrain_json=CONSTRAIN_JSON,
+            dry_run=dry_run,
+            on_batch_start=_on_theme_batch_start,
+            on_chunk_processed=_on_theme_chunk,
+        )
 
         if dry_run:
             return self.context.all_discovered_themes
+
+        for row_meta, res in zip(chunk_rows, results):
+            doc_id = row_meta["doc_id"]
+            if doc_id not in saved_doc_ids:
+                items = res.get("extracted_items") or res.get("parsed_items") or []
+                themes_by_doc[doc_id].extend(_extract_theme_objects(items))
+
+        for doc_id in doc_expected_chunks:
+            if doc_id not in saved_doc_ids:
+                _flush_doc_themes(doc_id)
 
         return self.aggregate_themes()
 
@@ -1291,10 +1300,9 @@ class SemanticPrismStage1Pipeline:
                 "system_prompt": CLUSTER_MAP_SYSTEM_PROMPT,
                 "prompt": "{{ text }}\n\n{schema_block}",
             }
-            map_batch_size = self._resolve_stage_batch_size(1200)
             self._log_checkpoint(
                 "Phase 2A: Cluster Map",
-                f"Synthesizing candidate definitions for {len(map_inputs)} cluster(s) (batch_size={map_batch_size})...",
+                f"Synthesizing candidate definitions for {len(map_inputs)} cluster(s)...",
             )
             map_results = self.prism.run(
                 task="extract",
@@ -1306,7 +1314,7 @@ class SemanticPrismStage1Pipeline:
                 system_prompt=CLUSTER_MAP_SYSTEM_PROMPT,
                 chunk=False,
                 as_array=False,
-                batch_size=map_batch_size,
+                batch_size=BATCH_SIZE,
                 max_new_tokens=MASTER_SYNTHESIS_MAX_NEW_TOKENS,
                 temperature=TEMPERATURE,
                 constrain_json=CONSTRAIN_JSON,
@@ -1540,8 +1548,9 @@ class SemanticPrismStage1Pipeline:
             self._apply_context_window_cap()
 
         effective_triple_words = self._resolve_stage_max_words(TRIPLE_CHUNK_MAX_WORDS, TRIPLE_MAX_NEW_TOKENS)
-        triple_batch_size = self._resolve_stage_batch_size(effective_triple_words)
-        save_lock = threading.Lock()
+        chunk_rows: List[Dict[str, Any]] = []
+        chunk_meta_by_uid: Dict[str, Dict[str, Any]] = {}
+        doc_expected_chunks: Dict[str, int] = {}
 
         for doc_idx, doc in enumerate(documents, start=1):
             doc_id = doc["id"]
@@ -1554,15 +1563,8 @@ class SemanticPrismStage1Pipeline:
                 continue
 
             triple_chunks = self.chunk_text(doc["text"], effective_triple_words)
-            num_chunks = len(triple_chunks)
-            total_words = len(doc["text"].split())
-            self._log_checkpoint(
-                "Phase 3: Triples",
-                f"Starting Doc {doc_idx}/{total_docs}: '{doc_id}' ({num_chunks} chunk(s), {total_words} words, batch_size={triple_batch_size})...",
-            )
+            doc_expected_chunks[doc_id] = len(triple_chunks)
 
-            doc_chunk_rows: List[Dict[str, Any]] = []
-            chunk_meta_by_uid: Dict[str, Dict[str, Any]] = {}
             for chunk_idx, (chunk_str, start_w, end_w) in enumerate(triple_chunks):
                 user_prompt = TRIPLE_EXTRACTION_USER_PROMPT.format(text_content=chunk_str)
                 self._save_payload_text(
@@ -1578,83 +1580,111 @@ class SemanticPrismStage1Pipeline:
                     "end_word": end_w,
                     "text": chunk_str,
                 }
-                doc_chunk_rows.append(row_meta)
+                chunk_rows.append(row_meta)
                 chunk_meta_by_uid[chunk_uid] = row_meta
 
-            doc_triples: List[Dict[str, Any]] = []
-            completed_chunks = 0
-            callback_fired = False
+        if not chunk_rows:
+            return self.aggregate_triplets()
 
-            def _on_triple_chunk(chunk_res: Dict[str, Any]) -> None:
-                nonlocal completed_chunks, callback_fired
-                chunk_uid = str(chunk_res.get("record_id") or chunk_res.get("id") or "")
-                row_meta = chunk_meta_by_uid.get(chunk_uid)
-                if not row_meta:
-                    return
-                items = chunk_res.get("parsed_items") or chunk_res.get("extracted_items") or []
+        total_pending_docs = len(doc_expected_chunks)
+        save_lock = threading.Lock()
+        triples_by_doc: Dict[str, List[Dict[str, Any]]] = {doc_id: [] for doc_id in doc_expected_chunks}
+        completed_chunks_by_doc: Dict[str, int] = {doc_id: 0 for doc_id in doc_expected_chunks}
+        saved_doc_ids: Set[str] = set()
 
-                with save_lock:
-                    callback_fired = True
-                    if not items and not chunk_res.get("parse_success", True):
-                        err_rec = {
-                            "phase": "initial_triple_extraction_failed",
-                            "source_document": doc_id,
-                            "start_word": row_meta["start_word"],
-                            "end_word": row_meta["end_word"],
-                            "error_message": chunk_res.get("parse_error", "Validation error"),
-                            "malformed_output": chunk_res.get("raw_output", ""),
-                            "chunk_text": row_meta["text"],
-                        }
-                        with open(self.log_dir / "stage_01_triple_extraction_errors.json", "a", encoding="utf-8") as ef:
-                            ef.write(json.dumps(err_rec) + "\n")
-                        new_triples: List[Dict[str, Any]] = []
-                    else:
-                        new_triples = _extract_triple_dicts(items, doc_id)
-                        doc_triples.extend(new_triples)
-
-                    completed_chunks += 1
-                    self._log_checkpoint(
-                        "Phase 3: Triples",
-                        f"Doc {doc_idx}/{total_docs} '{doc_id}' — chunk {completed_chunks}/{num_chunks} "
-                        f"processed (+{len(new_triples)} triples)",
-                    )
-
-            results = self.prism.run(
-                task="extract",
-                input_data=doc_chunk_rows,
-                text_column="text",
-                id_column="chunk_uid",
-                schema_cls=TripleExtractionResult,
-                prompt_template=triple_template,
-                system_prompt=full_sys_prompt,
-                chunk=False,
-                as_array=False,
-                batch_size=triple_batch_size,
-                max_new_tokens=TRIPLE_MAX_NEW_TOKENS,
-                temperature=TEMPERATURE,
-                constrain_json=CONSTRAIN_JSON,
-                dry_run=dry_run,
-                on_chunk_processed=_on_triple_chunk,
-            )
-
-            if dry_run:
-                continue
-
-            if not callback_fired:
-                for res in results:
-                    items = res.get("extracted_items") or res.get("parsed_items") or []
-                    doc_triples.extend(_extract_triple_dicts(items, doc_id))
-
-            with open(triple_file_path, "w", encoding="utf-8") as f:
+        def _flush_doc_triples(doc_id: str) -> None:
+            if doc_id in saved_doc_ids:
+                return
+            saved_doc_ids.add(doc_id)
+            doc_triples = triples_by_doc.get(doc_id, [])
+            safe_name = self.sanitize_filename(doc_id)
+            out_file = self.triples_dir / f"{safe_name}_triplets.json"
+            with open(out_file, "w", encoding="utf-8") as f:
                 json.dump(doc_triples, f, indent=2)
             self._log_checkpoint(
                 "Phase 3: Triples",
-                f"Saved '{triple_file_path.name}' ({len(doc_triples)} triples) — "
-                f"Document {doc_idx}/{total_docs} complete",
+                f"Saved '{out_file.name}' ({len(doc_triples)} triples) — "
+                f"Document {len(saved_doc_ids)}/{total_pending_docs} complete",
             )
+
+        def _on_triple_batch_start(batch_idx: int, total_batches: int, batch_items: List[Dict[str, Any]]) -> None:
+            batch_docs = list(dict.fromkeys(
+                chunk_meta_by_uid[str(it.get("record_id") or "")]["doc_id"]
+                for it in batch_items
+                if str(it.get("record_id") or "") in chunk_meta_by_uid
+            ))
+            self._log_checkpoint(
+                "Phase 3: Triples",
+                f"Running concurrent batch {batch_idx}/{total_batches}: {len(batch_items)} chunk(s) "
+                f"across {len(batch_docs)} doc(s) {batch_docs[:4]}{'...' if len(batch_docs) > 4 else ''}",
+            )
+
+        def _on_triple_chunk(chunk_res: Dict[str, Any]) -> None:
+            chunk_uid = str(chunk_res.get("record_id") or chunk_res.get("id") or "")
+            row_meta = chunk_meta_by_uid.get(chunk_uid)
+            if not row_meta:
+                return
+            doc_id = row_meta["doc_id"]
+            items = chunk_res.get("parsed_items") or chunk_res.get("extracted_items") or []
+
+            with save_lock:
+                if not items and not chunk_res.get("parse_success", True):
+                    err_rec = {
+                        "phase": "initial_triple_extraction_failed",
+                        "source_document": doc_id,
+                        "start_word": row_meta["start_word"],
+                        "end_word": row_meta["end_word"],
+                        "error_message": chunk_res.get("parse_error", "Validation error"),
+                        "malformed_output": chunk_res.get("raw_output", ""),
+                        "chunk_text": row_meta["text"],
+                    }
+                    with open(self.log_dir / "stage_01_triple_extraction_errors.json", "a", encoding="utf-8") as ef:
+                        ef.write(json.dumps(err_rec) + "\n")
+                    new_triples: List[Dict[str, Any]] = []
+                else:
+                    new_triples = _extract_triple_dicts(items, doc_id)
+                    triples_by_doc[doc_id].extend(new_triples)
+
+                completed_chunks_by_doc[doc_id] += 1
+                self._log_checkpoint(
+                    "Phase 3: Triples",
+                    f"Doc '{doc_id}' — chunk {completed_chunks_by_doc[doc_id]}/{doc_expected_chunks[doc_id]} "
+                    f"processed (+{len(new_triples)} triples)",
+                )
+                if completed_chunks_by_doc[doc_id] >= doc_expected_chunks[doc_id]:
+                    _flush_doc_triples(doc_id)
+
+        results = self.prism.run(
+            task="extract",
+            input_data=chunk_rows,
+            text_column="text",
+            id_column="chunk_uid",
+            schema_cls=TripleExtractionResult,
+            prompt_template=triple_template,
+            system_prompt=full_sys_prompt,
+            chunk=False,
+            as_array=False,
+            batch_size=BATCH_SIZE,
+            max_new_tokens=TRIPLE_MAX_NEW_TOKENS,
+            temperature=TEMPERATURE,
+            constrain_json=CONSTRAIN_JSON,
+            dry_run=dry_run,
+            on_batch_start=_on_triple_batch_start,
+            on_chunk_processed=_on_triple_chunk,
+        )
 
         if dry_run:
             return self.context.raw_triples
+
+        for row_meta, res in zip(chunk_rows, results):
+            doc_id = row_meta["doc_id"]
+            if doc_id not in saved_doc_ids:
+                items = res.get("extracted_items") or res.get("parsed_items") or []
+                triples_by_doc[doc_id].extend(_extract_triple_dicts(items, doc_id))
+
+        for doc_id in doc_expected_chunks:
+            if doc_id not in saved_doc_ids:
+                _flush_doc_triples(doc_id)
 
         return self.aggregate_triplets()
 

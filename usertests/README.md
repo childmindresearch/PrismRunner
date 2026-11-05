@@ -16,6 +16,8 @@ python usertests/02_custom_schemas_and_dataframes.py
 python usertests/02_custom_schemas_and_dataframes.py --live
 
 # Run the SemanticPrism Stage 1 Extraction pipeline (Theme Discovery, Master Synthesis, and SVO Triples)
+# Configured via global variables at the top of usertests/SemanticPrism1.py with incremental per-document
+# checkpoint saves and real-time console progress logging (PRINT_CHECKPOINTS = True)
 python usertests/SemanticPrism1.py
 ```
 

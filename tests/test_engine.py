@@ -14,6 +14,7 @@ from prismrunner.engine import (
     get_optimal_device,
     is_json_bracket_balanced,
     resolve_device_and_dtype,
+    resolve_dynamic_batch_size,
     restore_original_order,
     validate_cuda_device,
 )
@@ -72,6 +73,23 @@ class TestEngine(unittest.TestCase):
         restored = restore_original_order(processed)
         self.assertEqual([x["id"] for x in restored], ["doc1", "doc2", "doc3", "doc4"])
         self.assertNotIn("_orig_idx", restored[0])
+
+        # Windowed length bucketing keeps items within local windows while sorting inside each window
+        windowed_items = [
+            {"id": "w1_long", "prompt": "a very long sequence in window one"},
+            {"id": "w1_short", "prompt": "short"},
+            {"id": "w2_short", "prompt": "tiny"},
+            {"id": "w2_long", "prompt": "another very long sequence in window two"},
+        ]
+        win_buckets = create_length_buckets(windowed_items, batch_size=1, text_key="prompt", window_size=2)
+        self.assertEqual([b[0]["id"] for b in win_buckets], ["w1_short", "w1_long", "w2_short", "w2_long"])
+
+        # Dynamic batch size resolution scales down for long sequences and respects explicit int overrides
+        self.assertEqual(resolve_dynamic_batch_size(torch.device("cpu"), requested_batch_size=6), 6)
+        short_b = resolve_dynamic_batch_size(torch.device("mps"), requested_batch_size="auto", items=items, text_key="prompt")
+        long_items = [{"prompt": " ".join(["word"] * 2200)}]
+        long_b = resolve_dynamic_batch_size(torch.device("mps"), requested_batch_size="auto", items=long_items, text_key="prompt")
+        self.assertGreaterEqual(short_b, long_b)
 
     def test_greedy_generation_and_async_batches(self):
         mock_model = MagicMock()

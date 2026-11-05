@@ -6,10 +6,11 @@ Lightweight, local-first LLM batch inference library for turning unstructured te
 
 ## Key Capabilities & Local Optimizations
 
-- **Dynamic Hardware & Precision Detection**: Automatically detects `cuda` (Ampere+ `bfloat16` or `float16` + TF32 kernels), Apple Silicon `mps` (`float16` + unified memory watermark configuration), or `cpu` (`float32`), and selects `flash_attention_2` (when installed on Ampere+ CUDA) or PyTorch's native `sdpa` (Scaled Dot-Product Attention).
-- **Dynamic Context & Batch Sizing**: Inspects the model's `config.json` (`max_position_embeddings`, `sliding_window`) and available free VRAM / system memory to automatically calculate safe `batch_size` and `chunk_size` budgets (`"auto"`).
-- **Length-Bucketed Batch Inference**: Sorts prompts by token length before batching to minimize left-padding waste, runs under `torch.inference_mode()` with KV cache enabled (`use_cache=True`), and restores the original input order afterward.
-- **Native Constrained JSON Decoding**: Pre-fills the assistant header with `[` or `{` to eliminate conversational preamble, and uses [`JsonBracketStoppingCriteria`](prismrunner/engine.py) to halt `model.generate()` as soon as all sequences in the batch close their outer JSON bracket.
+- **Dynamic Hardware & Precision Detection**: Automatically detects `cuda` (Ampere+ `bfloat16` or `float16` + TF32 kernels), Apple Silicon `mps` (`float16` + unified memory configuration), or `cpu` (`float32`), and selects `flash_attention_2` (when installed on Ampere+ CUDA) or PyTorch's native `sdpa` (Scaled Dot-Product Attention).
+- **Payload-Aware Dynamic Batch & Context Sizing**: Inspects the model's `config.json` (`max_position_embeddings`, `sliding_window`), live free hardware memory (`torch.cuda.mem_get_info` on CUDA, physical unified RAM on MPS), and the **actual 90th-percentile token length** of queued prompts via [`resolve_dynamic_batch_size`](prismrunner/engine.py) to automatically scale `batch_size` (`1`–`32`) and `chunk_size` (`"auto"`) per `.run()` invocation.
+- **Windowed Length-Bucketed Batch Inference**: Sorts prompts by token length within local sliding windows (`window_size = batch_size * 8`) via [`create_length_buckets`](prismrunner/engine.py) to minimize left-padding waste while keeping multi-chunk documents contiguous, runs under `torch.inference_mode()` with KV cache enabled (`use_cache=True`), and restores the original input order afterward.
+- **Streaming Progress & Crash-Safe Checkpoint Callbacks**: Supports `on_batch_start` and `on_chunk_processed` hooks on [`PrismPipeline.run`](prismrunner/pipeline.py) so long-running jobs can log real-time progress and flush completed documents to disk incrementally as batches finish.
+- **Native Constrained JSON Decoding**: Pre-fills the assistant header with `[` or `{` to eliminate conversational preamble, and uses token-filtered [`JsonBracketStoppingCriteria`](prismrunner/engine.py) to halt `model.generate()` as soon as all sequences in the batch close their outer JSON bracket without re-decoding on non-bracket tokens.
 - **Fault-Tolerant Schema Compiler & Parser**:
   - Compiles Pydantic v2 schemas into compact, human-readable prompt specifications (no bloated OpenAPI `$defs`/`$ref` trees) and orders `reasoning` before `category` in [`ClassificationItem`](prismrunner/schema.py) to avoid the token-1 reasoning penalty.
   - Automatically strips `<think>...</think>` reasoning blocks, markdown code fences, and trailing commas, unwraps container dicts, filters all-null phantom objects, and salvages completed items from truncated JSON arrays cut off by `max_new_tokens`.
@@ -92,7 +93,23 @@ summaries = pipeline.run(
 )
 ```
 
-### 3. Direct Access to Engine, Compiler & Parser Primitives
+### 3. Streaming Progress & Incremental Checkpoint Callbacks
+
+Use `on_batch_start` and `on_chunk_processed` to monitor concurrent batches in real time and save results incrementally as chunks complete:
+
+```python
+results = pipeline.run(
+    task="extract",
+    input_data=df,
+    text_column="message",
+    id_column="ticket_id",
+    schema_cls=FeedbackItem,
+    on_batch_start=lambda idx, total, items: print(f"Batch {idx}/{total} ({len(items)} items)"),
+    on_chunk_processed=lambda res: print(f"Completed {res['record_id']}: {len(res['parsed_items'])} items"),
+)
+```
+
+### 4. Direct Access to Engine, Compiler & Parser Primitives
 
 ```python
 from prismrunner import (
@@ -100,6 +117,7 @@ from prismrunner import (
     UniversalOutputParser,
     compile_schema_to_prompt,
     init_model_and_tokenizer,
+    resolve_dynamic_batch_size,
 )
 
 # Compile any Pydantic v2 model into a flat, readable prompt specification
@@ -146,5 +164,6 @@ Run the interactive user tests in `usertests/`:
 ```bash
 python usertests/01_quickstart_and_hardware.py
 python usertests/02_custom_schemas_and_dataframes.py
+python usertests/SemanticPrism1.py
 # Or open usertests/03_interactive_walkthrough.ipynb in Jupyter / VS Code
 ```

@@ -22,6 +22,7 @@ from prismrunner.engine import (
     generate_hardware_advisory,
     get_optimal_device,
     load_model_and_tokenizer,
+    resolve_dynamic_batch_size,
 )
 from prismrunner.prompt import PromptTemplate
 from prismrunner.schema import (
@@ -311,6 +312,8 @@ class PrismPipeline:
         output_path: Optional[Union[str, Path]] = None,
         output_format: Optional[str] = None,
         dry_run: bool = False,
+        bucket_window_size: Optional[int] = None,
+        on_batch_start: Optional[Callable[[int, int, List[Dict[str, Any]]], None]] = None,
         on_chunk_processed: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> List[Dict[str, Any]]:
         """Execute the end-to-end pipeline on strings, lists, DataFrames, or dataset files."""
@@ -444,6 +447,16 @@ class PrismPipeline:
         target_as_array = as_array if as_array is not None else True
         response_prefix = ("[" if target_as_array else "{") if (use_constrain and target_schema is not None) else None
 
+        req_batch = batch_size if batch_size is not None else self.config["inference"].get("batch_size", "auto")
+        effective_batch_size = resolve_dynamic_batch_size(
+            device=self.device,
+            requested_batch_size=req_batch,
+            items=payloads,
+            text_key="prompt",
+            max_new_tokens=m_tokens,
+            tokenizer=self.tokenizer,
+        )
+
         raw_results = engine.run_all(
             items=payloads,
             system_prompt=sys_prompt,
@@ -453,7 +466,10 @@ class PrismPipeline:
             top_p=top_p,
             top_k=top_k,
             repetition_penalty=repetition_penalty,
+            batch_size=effective_batch_size,
             bucket_by_length=self.config["inference"].get("bucket_by_length", True),
+            bucket_window_size=bucket_window_size,
+            on_batch_start=on_batch_start,
             on_batch_complete=_parse_batch_items,
             response_prefix=response_prefix,
             stop_on_json_close=bool(use_constrain),
