@@ -31,6 +31,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
+# Prevent PyTorch CUDA allocator fragmentation when switching between LLM and embedding stages
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -496,7 +499,7 @@ class ThemeClusteringEngine:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def _compute_embeddings(self, texts: List[str]) -> np.ndarray:
-        """Compute L2-normalized embeddings via SentenceTransformer or TF-IDF fallback."""
+        """Compute L2-normalized embeddings via SentenceTransformer or TF-IDF fallback, freeing VRAM immediately."""
         try:
             from sentence_transformers import SentenceTransformer
             models_dir = Path("models/embeddings")
@@ -505,8 +508,15 @@ class ThemeClusteringEngine:
                 model = SentenceTransformer(self.embedding_model_name, cache_folder=str(models_dir), local_files_only=True)
             except Exception:
                 model = SentenceTransformer(self.embedding_model_name, cache_folder=str(models_dir), local_files_only=False)
-            emb = model.encode(texts, normalize_embeddings=True)
-            return np.asarray(emb, dtype=np.float32)
+            emb = model.encode(texts, normalize_embeddings=True, batch_size=64)
+            arr = np.asarray(emb, dtype=np.float32)
+            try:
+                model.to("cpu")
+            except Exception:
+                pass
+            del model, emb
+            clear_device_memory()
+            return arr
         except Exception:
             vocab: Dict[str, int] = {}
             tokenized: List[List[str]] = []
@@ -628,6 +638,34 @@ class ThemeClusteringEngine:
                 for c_idx, comm in enumerate(communities):
                     for node_idx in comm:
                         dyn_labels[int(node_idx)] = c_idx
+
+                # Absorb micro-clusters (< MICRO_CLUSTER_RATIO of corpus) into nearest dominant centroid
+                if n >= 20 and len(communities) > 2:
+                    min_cluster_size = max(2, int(round(n * MICRO_CLUSTER_RATIO)))
+                    unique_c, counts_c = np.unique(dyn_labels, return_counts=True)
+                    dom_ids = [int(cid) for cid, cnt in zip(unique_c, counts_c) if cnt >= min_cluster_size]
+                    if not dom_ids:
+                        top_order = np.argsort(counts_c)[::-1][: max(2, min(self.fixed_k, len(unique_c)))]
+                        dom_ids = [int(unique_c[idx]) for idx in top_order]
+
+                    if 0 < len(dom_ids) < len(unique_c):
+                        dom_centroids = []
+                        for cid in dom_ids:
+                            c_embs = self.embeddings[dyn_labels == cid]
+                            cent = c_embs.mean(axis=0)
+                            norm = np.linalg.norm(cent)
+                            dom_centroids.append(cent / norm if norm > 0 else cent)
+                        dom_mat = np.vstack(dom_centroids)
+
+                        dom_set = set(dom_ids)
+                        for idx in range(n):
+                            if int(dyn_labels[idx]) not in dom_set:
+                                sims = dom_mat @ self.embeddings[idx]
+                                best_dom = dom_ids[int(np.argmax(sims))]
+                                dyn_labels[idx] = best_dom
+
+                        remap = {old_id: new_id for new_id, old_id in enumerate(sorted(set(int(x) for x in dyn_labels)))}
+                        dyn_labels = np.array([remap[int(x)] for x in dyn_labels], dtype=int)
             except Exception:
                 dyn_labels = np.array([i % dynamic_k for i in range(n)], dtype=int)
 
@@ -1257,6 +1295,9 @@ class SemanticPrismStage1Pipeline:
             print("-> Skipping master theme synthesis (already exists on disk). Loading existing master themes...")
             return self.load_master_themes()
 
+        if MANAGE_VRAM:
+            clear_device_memory()
+
         self._log_checkpoint(
             "Phase 2: Clustering",
             f"Embedding and clustering {len(self.context.all_discovered_themes)} discovered themes ({CLUSTERING_MODE} mode)...",
@@ -1266,6 +1307,8 @@ class SemanticPrismStage1Pipeline:
             output_dir=self.out_dir,
         )
         cluster_results = cluster_engine.cluster_themes()
+        if MANAGE_VRAM:
+            clear_device_memory()
         partitions = cluster_results["partitions"]
         exemplar_groups = cluster_results["active_exemplars"]
         active_partition = cluster_engine.get_active_partition(partitions)
@@ -1319,6 +1362,10 @@ class SemanticPrismStage1Pipeline:
                 temperature=TEMPERATURE,
                 constrain_json=CONSTRAIN_JSON,
                 dry_run=dry_run,
+                on_batch_start=lambda b_idx, b_tot, b_items: self._log_checkpoint(
+                    "Phase 2A: Cluster Map",
+                    f"Running concurrent Map batch {b_idx}/{b_tot} ({len(b_items)} cluster(s))",
+                ),
             )
             if dry_run:
                 return None

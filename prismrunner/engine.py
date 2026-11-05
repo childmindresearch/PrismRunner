@@ -9,6 +9,9 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+# Mitigate CUDA caching allocator fragmentation on large 27B-70B models
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 from transformers import (
     AutoModelForCausalLM,
@@ -270,33 +273,37 @@ def generate_hardware_advisory(
     device: torch.device,
     max_new_tokens: int = 512,
 ) -> Dict[str, Any]:
-    """Provide hardware-specific recommendations for batch sizes, precision, and chunking."""
+    """Provide continuous, device-relative recommendations for batch sizes, precision, and chunking."""
     budget = ContextBudget(model_context_limit=context_limit, max_new_tokens=max_new_tokens)
     safe_input = budget.max_input_tokens
 
     if device.type == "cuda" and torch.cuda.is_available():
-        props = torch.cuda.get_device_properties(device)
-        vram_gb = props.total_memory / (1024 ** 3)
-        if vram_gb >= 24:
-            rec_batch = 16
-            rec_chunk = min(safe_input, max(2048, context_limit // 2))
-            rec_dtype = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
-        elif vram_gb >= 12:
-            rec_batch = 8
-            rec_chunk = min(safe_input, max(1536, context_limit // 2))
-            rec_dtype = "float16"
-        else:
-            rec_batch = 4
-            rec_chunk = min(safe_input, max(1024, context_limit // 4))
-            rec_dtype = "float16"
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            avail_gb = free_bytes / (1024 ** 3)
+            total_gb = total_bytes / (1024 ** 3)
+        except Exception:
+            props = torch.cuda.get_device_properties(device)
+            total_gb = props.total_memory / (1024 ** 3)
+            avail_gb = total_gb * 0.80
+        rec_dtype = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
+        rec_batch = max(1, min(32, int(round(avail_gb / 2.0))))
+        mem_scale = min(1.0, max(0.25, total_gb / 24.0))
+        rec_chunk = min(safe_input, max(512, int(context_limit * 0.5 * mem_scale)))
     elif device.type == "mps":
-        rec_batch = 4
-        rec_chunk = min(safe_input, max(1024, context_limit // 4))
+        try:
+            total_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)
+        except Exception:
+            total_gb = 16.0
         rec_dtype = "float16"
+        rec_batch = max(1, min(16, int(round(total_gb / 6.0))))
+        mem_scale = min(1.0, max(0.25, total_gb / 32.0))
+        rec_chunk = min(safe_input, max(512, int(context_limit * 0.5 * mem_scale)))
     else:
-        rec_batch = 1
-        rec_chunk = min(safe_input, max(512, context_limit // 8))
+        cores = os.cpu_count() or 2
         rec_dtype = "float32"
+        rec_batch = max(1, min(4, cores // 4))
+        rec_chunk = min(safe_input, max(512, context_limit // 8))
 
     return {
         "model_name": model_name,
@@ -319,7 +326,10 @@ def resolve_dynamic_batch_size(
     tokenizer: Optional[PreTrainedTokenizerBase] = None,
     max_batch_size: int = 32,
 ) -> int:
-    """Dynamically compute the optimal concurrent batch size from live hardware memory and payload token length."""
+    """
+    Dynamically compute the optimal concurrent batch size as a continuous function of
+    the active device's live memory headroom, loaded model footprint, and payload token length.
+    """
     if isinstance(requested_batch_size, int) and requested_batch_size > 0:
         return requested_batch_size
     if isinstance(requested_batch_size, str) and requested_batch_size.strip().isdigit():
@@ -352,22 +362,23 @@ def resolve_dynamic_batch_size(
     dev_type = device.type if device is not None else "cpu"
 
     if dev_type == "cuda" and torch.cuda.is_available():
-        allocated_gb = 6.0
+        allocated_gb = 4.0
         try:
-            allocated_gb = max(2.0, torch.cuda.memory_allocated(device) / (1024 ** 3))
+            allocated_gb = max(1.0, torch.cuda.memory_allocated(device) / (1024 ** 3))
             free_bytes, _ = torch.cuda.mem_get_info(device)
-            usable_gb = (free_bytes / (1024 ** 3)) * 0.75
+            usable_gb = (free_bytes / (1024 ** 3)) * 0.70
         except Exception:
             try:
                 total_bytes = torch.cuda.get_device_properties(device).total_memory
                 allocated_bytes = torch.cuda.memory_allocated(device)
-                allocated_gb = max(2.0, allocated_bytes / (1024 ** 3))
-                usable_gb = max(1.0, ((total_bytes - allocated_bytes) / (1024 ** 3)) * 0.75)
+                allocated_gb = max(1.0, allocated_bytes / (1024 ** 3))
+                usable_gb = max(0.5, ((total_bytes - allocated_bytes) / (1024 ** 3)) * 0.70)
             except Exception:
-                usable_gb = 6.0
+                usable_gb = 4.0
 
-        # Scale per-token KV-cache + activation footprint with loaded model weight size
-        gb_per_token = max(0.00020, allocated_gb * 0.000012)
+        # Continuous per-token KV-cache + prefill activation footprint relative to loaded model weight size
+        prefill_expansion = 1.0 + (est_seq_tokens / 2048.0) * (allocated_gb / 32.0)
+        gb_per_token = (0.00015 + allocated_gb * 0.000025) * prefill_expansion
         per_seq_gb = max(0.15, est_seq_tokens * gb_per_token)
         return max(1, min(max_batch_size, int(usable_gb // per_seq_gb)))
 
@@ -376,15 +387,18 @@ def resolve_dynamic_batch_size(
             total_ram_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)
         except Exception:
             total_ram_gb = 16.0
-        if est_seq_tokens >= 2400:
-            return 4 if total_ram_gb >= 32 else 2
-        elif est_seq_tokens >= 1200:
-            return 6 if total_ram_gb >= 32 else 4
-        return 8 if total_ram_gb >= 32 else 4
+        try:
+            allocated_gb = max(1.0, torch.mps.current_allocated_memory() / (1024 ** 3))
+        except Exception:
+            allocated_gb = max(1.0, total_ram_gb * 0.25)
+        usable_gb = max(0.5, (total_ram_gb * 0.65 - allocated_gb) * 0.70)
+        prefill_expansion = 1.0 + (est_seq_tokens / 2048.0) * (allocated_gb / 32.0)
+        gb_per_token = (0.00015 + allocated_gb * 0.000025) * prefill_expansion
+        per_seq_gb = max(0.15, est_seq_tokens * gb_per_token)
+        return max(1, min(max_batch_size, int(usable_gb // per_seq_gb)))
 
-    if est_seq_tokens >= 1600:
-        return 1
-    return max(1, min(4, (os.cpu_count() or 2) // 2))
+    cores = os.cpu_count() or 2
+    return max(1, min(max_batch_size, int((cores // 2) / max(1.0, est_seq_tokens / 512.0))))
 
 
 # ==============================================================================
@@ -908,7 +922,46 @@ class BatchInferenceEngine:
             gen_kwargs["repetition_penalty"] = curr_rep_penalty
 
         gen_kwargs.update(extra_gen_kwargs)
-        output_ids = self.model.generate(**gen_kwargs)
+        try:
+            output_ids = self.model.generate(**gen_kwargs)
+        except Exception as exc:
+            is_oom = isinstance(exc, getattr(torch.cuda, "OutOfMemoryError", RuntimeError)) or (
+                "out of memory" in str(exc).lower()
+            )
+            del input_ids, attention_mask, gen_kwargs
+            clear_device_memory(target_dev)
+            if is_oom and len(formatted_prompts) > 1:
+                mid = max(1, len(formatted_prompts) // 2)
+                self.batch_size = max(1, mid)
+                logger.warning(
+                    f"Device OOM with batch_size={len(formatted_prompts)}; "
+                    f"automatically splitting batch in half ({mid} + {len(formatted_prompts) - mid}) and continuing..."
+                )
+                left_res = self.generate_batch(
+                    formatted_prompts[:mid],
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    response_prefix=response_prefix,
+                    stop_on_json_close=stop_on_json_close,
+                    **extra_gen_kwargs,
+                )
+                right_res = self.generate_batch(
+                    formatted_prompts[mid:],
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    response_prefix=response_prefix,
+                    stop_on_json_close=stop_on_json_close,
+                    **extra_gen_kwargs,
+                )
+                return left_res + right_res
+            raise
+
         generated_tokens = output_ids[:, prompt_length:]
 
         completions = self.tokenizer.batch_decode(

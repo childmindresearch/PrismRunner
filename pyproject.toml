@@ -9,18 +9,30 @@ description = "Lightweight, local-first LLM batch inference engine for structure
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.2.0",
-    "transformers>=4.40.0",
-    "accelerate>=0.28.0",
+    "torch>=2.4.0",
+    "transformers>=4.51.0",
+    "accelerate>=1.0.0",
+    "safetensors>=0.4.3",
+    "huggingface-hub>=0.26.0",
     "pydantic>=2.6.0",
     "pyarrow>=14.0.0",
     "pandas>=2.0.0",
     "pyyaml>=6.0.1",
     "rich>=13.7.0",
     "click>=8.1.0",
+    "numpy>=1.26.0",
+    "scikit-learn>=1.4.0",
+    "networkx>=3.2.0",
+    "sentence-transformers>=3.0.0",
 ]
 
 [project.optional-dependencies]
+cuda = [
+    "flash-attn>=2.6.0",
+    "causal-conv1d>=1.4.0",
+    "flash-linear-attention",
+    "bitsandbytes>=0.44.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=4.1.0",

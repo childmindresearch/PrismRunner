@@ -1,30 +1,53 @@
 # PrismRunner
 
-Lightweight, local-first LLM batch inference library for turning unstructured text, Pandas DataFrames, and datasets into validated [Pydantic v2](https://docs.pydantic.dev/) schemas on Apple Silicon (MPS), NVIDIA CUDA, or CPU.
+Lightweight, local-first LLM batch inference library for turning unstructured text, Pandas DataFrames, and datasets into validated [Pydantic v2](https://docs.pydantic.dev/) schemas on NVIDIA CUDA, Apple Silicon (MPS), or CPU.
 
 ---
 
-## Key Capabilities & Local Optimizations
+## Key Capabilities & Dynamic Optimizations
 
-- **Dynamic Hardware & Precision Detection**: Automatically detects `cuda` (Ampere+ `bfloat16` or `float16` + TF32 kernels), Apple Silicon `mps` (`float16` + unified memory configuration), or `cpu` (`float32`), and selects `flash_attention_2` (when installed on Ampere+ CUDA) or PyTorch's native `sdpa` (Scaled Dot-Product Attention).
-- **Payload-Aware Dynamic Batch & Context Sizing**: Inspects the model's `config.json` (`max_position_embeddings`, `sliding_window`), live free hardware memory (`torch.cuda.mem_get_info` on CUDA, physical unified RAM on MPS), and the **actual 90th-percentile token length** of queued prompts via [`resolve_dynamic_batch_size`](prismrunner/engine.py) to automatically scale `batch_size` (`1`–`32`) and `chunk_size` (`"auto"`) per `.run()` invocation.
-- **Windowed Length-Bucketed Batch Inference**: Sorts prompts by token length within local sliding windows (`window_size = batch_size * 8`) via [`create_length_buckets`](prismrunner/engine.py) to minimize left-padding waste while keeping multi-chunk documents contiguous, runs under `torch.inference_mode()` with KV cache enabled (`use_cache=True`), and restores the original input order afterward.
-- **Streaming Progress & Crash-Safe Checkpoint Callbacks**: Supports `on_batch_start` and `on_chunk_processed` hooks on [`PrismPipeline.run`](prismrunner/pipeline.py) so long-running jobs can log real-time progress and flush completed documents to disk incrementally as batches finish.
-- **Native Constrained JSON Decoding**: Pre-fills the assistant header with `[` or `{` to eliminate conversational preamble, and uses token-filtered [`JsonBracketStoppingCriteria`](prismrunner/engine.py) to halt `model.generate()` as soon as all sequences in the batch close their outer JSON bracket without re-decoding on non-bracket tokens.
-- **Fault-Tolerant Schema Compiler & Parser**:
-  - Compiles Pydantic v2 schemas into compact, human-readable prompt specifications (no bloated OpenAPI `$defs`/`$ref` trees) and orders `reasoning` before `category` in [`ClassificationItem`](prismrunner/schema.py) to avoid the token-1 reasoning penalty.
-  - Automatically strips `<think>...</think>` reasoning blocks, markdown code fences, and trailing commas, unwraps container dicts, filters all-null phantom objects, and salvages completed items from truncated JSON arrays cut off by `max_new_tokens`.
+Every hardware, memory, context, and batching optimization in PrismRunner is computed **dynamically and continuously relative to the active device and loaded model at runtime** (no hardcoded GPU tiers or fixed VRAM ceilings):
+
+- **Dynamic Hardware, Precision & Kernel Detection**:
+  - Automatically detects `cuda` (Ampere/Hopper/Blackwell `bfloat16` or `float16` + TF32 matrix kernels), Apple Silicon `mps` (`float16` + unified memory configuration), or `cpu` (`float32`).
+  - Automatically selects `flash_attention_2` (when `flash-attn` is installed on Ampere+ CUDA) or PyTorch's native `sdpa` (Scaled Dot-Product Attention), and enables `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to prevent CUDA allocator fragmentation across variable-length batches.
+- **Continuous Device-Relative Batch & Context Sizing**:
+  - Inspects both top-level `config` and nested `config.text_config` (`max_position_embeddings`, `seq_length`, `sliding_window`) to detect the model's native context limit automatically (`CONTEXT_WINDOW_CAP = "auto"`).
+  - Queries live free device memory (`torch.cuda.mem_get_info` on CUDA, unified physical RAM minus `torch.mps.current_allocated_memory()` on MPS), the **loaded model's actual weight footprint** (`torch.cuda.memory_allocated`), and the **90th-percentile tokenized prompt length** of the queued items via [`resolve_dynamic_batch_size`](prismrunner/engine.py) to continuously scale `batch_size` (`1`–`32`) and `chunk_size` (`"auto"`) per `.run()` call.
+- **Automatic OOM Batch-Splitting Recovery**:
+  - If a prompt batch triggers a `torch.OutOfMemoryError` during prefill or decoding (e.g., on long sequences or hybrid linear-attention architectures), [`BatchInferenceEngine.generate_batch`](prismrunner/engine.py) catches the OOM, flushes device caches via [`clear_device_memory`](prismrunner/engine.py), splits the batch in half recursively, and completes inference without crashing or losing progress.
+- **Unified Multimodal & Hybrid Architecture Support (`Qwen3` / `Qwen3.5` / `Qwen3.6`, etc.)**:
+  - Automatically falls back from `AutoModelForCausalLM` to `AutoModelForImageTextToText` / `AutoModelForMultimodalLM` when loading unified vision-text checkpoints (such as `Qwen/Qwen3.5-27B` or `Qwen/Qwen3.6-27B`) for text-only batch inference.
+  - Automatically passes `enable_thinking=False` to chat templates when `constrain_json=True` (`[` / `{` response prefixing) is active so reasoning models emit structured JSON immediately instead of reasoning prose inside JSON strings.
+- **Windowed Length-Bucketed Batch Inference**:
+  - Sorts prompts by token length within local sliding windows (`window_size = batch_size * 8`) via [`create_length_buckets`](prismrunner/engine.py) to minimize left-padding waste while keeping multi-chunk documents contiguous, runs under `torch.inference_mode()` with KV cache enabled (`use_cache=True`), and restores the exact original input order afterward.
+- **Streaming Progress & Crash-Safe Checkpoint Callbacks**:
+  - Supports `on_batch_start` and `on_chunk_processed` hooks on [`PrismPipeline.run`](prismrunner/pipeline.py) so long-running jobs log real-time batch progress and flush completed documents to disk incrementally as chunks finish.
+- **Native Constrained JSON Decoding & Fault-Tolerant Parser**:
+  - Pre-fills the assistant header with `[` or `{` to eliminate conversational preamble, and uses token-filtered [`JsonBracketStoppingCriteria`](prismrunner/engine.py) to halt `model.generate()` as soon as all sequences in the batch close their outer JSON bracket without re-decoding on non-bracket tokens.
+  - Compiles Pydantic v2 schemas into compact prompt specifications and orders `reasoning` before `category` in [`ClassificationItem`](prismrunner/schema.py) to avoid the token-1 reasoning penalty.
+  - Automatically strips `<think>...</think>` blocks, markdown code fences, and trailing commas, unwraps container dicts, filters all-null phantom objects, and salvages completed items from truncated JSON arrays cut off by `max_new_tokens`.
 
 ---
 
 ## Installation
 
-Install dependencies via `requirements.txt` or install the package in editable mode:
+Install core dependencies via `requirements.txt` or editable install:
 
 ```bash
 pip install -r requirements.txt
 # or
 pip install -e .
+```
+
+### Optional NVIDIA CUDA Kernel Accelerators
+
+On Linux with NVIDIA Ampere, Hopper, or Blackwell GPUs, install the optional `cuda` extras (or uncomment them in `requirements.txt`) for FlashAttention-2, fast Triton kernels for `Qwen3.5` / `Qwen3.6` Gated DeltaNet linear attention, and 4/8-bit quantization:
+
+```bash
+pip install -e ".[cuda]"
+# or manually:
+pip install flash-attn causal-conv1d flash-linear-attention bitsandbytes --no-build-isolation
 ```
 
 ---
@@ -57,7 +80,7 @@ df = pd.DataFrame({
 pipeline = PrismPipeline(
     model_name="Qwen/Qwen2.5-1.5B-Instruct",
     device="auto",       # "auto", "cuda", "mps", or "cpu"
-    batch_size="auto",   # Dynamically sized from available VRAM/RAM (or pass an int)
+    batch_size="auto",   # Dynamically sized from live device headroom, model size & prompt length
 )
 
 results = pipeline.run(
@@ -137,16 +160,16 @@ print(parsed.items)
 PrismRunner/
 ├── prismrunner/
 │   ├── __init__.py   # Public package exports
-│   ├── engine.py     # Hardware/dtype detection, model loading, context budget, BatchInferenceEngine
+│   ├── engine.py     # Dynamic hardware/dtype/batch detection, model loading, OOM recovery, BatchInferenceEngine
 │   ├── schema.py     # Built-in schemas, schema-to-prompt compiler, UniversalOutputParser
 │   ├── data.py       # DatasetLoader, TokenAwareChunker, DeterministicStitcher
 │   ├── prompt.py     # Default task prompts and PromptTemplate renderer
 │   ├── pipeline.py   # PrismPipeline end-to-end orchestrator
 │   └── cli.py        # Optional CLI (`prismrunner classify|extract|summarize|inspect-model`)
-├── usertests/        # Runnable user walkthroughs (.py scripts & .ipynb Jupyter Notebook)
+├── usertests/        # Runnable user walkthroughs (.py scripts, SemanticPrism1.py & .ipynb Notebook)
 ├── tests/            # Unit & mocked integration test suite
-├── requirements.txt  # Python dependencies
-└── pyproject.toml    # Package metadata & pytest configuration
+├── requirements.txt  # Core, clustering & optional CUDA kernel dependencies
+└── pyproject.toml    # Package metadata, optional [cuda] & [dev] extras, and pytest config
 ```
 
 ---

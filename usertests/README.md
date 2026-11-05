@@ -4,7 +4,7 @@ Hands-on scripts and an interactive Jupyter notebook for testing PrismRunner's f
 
 ## 1. Python Scripts (`.py`)
 
-Both scripts run in **instant dry-run mode** by default (no model download required) and support `--live` to run full local LLM inference on your GPU, Apple Silicon MPS, or CPU:
+All scripts run in **instant dry-run mode** by default (no model download required) and support `--live` (or `DRY_RUN = False` in `SemanticPrism1.py`) to run full local LLM inference on your NVIDIA CUDA GPU, Apple Silicon MPS, or CPU:
 
 ```bash
 # Test hardware detection, schema compiler, JSON parser, and quickstart pipeline
@@ -16,12 +16,17 @@ python usertests/02_custom_schemas_and_dataframes.py
 python usertests/02_custom_schemas_and_dataframes.py --live
 
 # Run the SemanticPrism Stage 1 Extraction pipeline (Theme Discovery, Master Synthesis, and SVO Triples)
-# Configured via global variables at the top of usertests/SemanticPrism1.py with incremental per-document
-# checkpoint saves and real-time console progress logging (PRINT_CHECKPOINTS = True)
 python usertests/SemanticPrism1.py
 ```
+
+### `SemanticPrism1.py` Highlights
+
+- **100% Local `PrismRunner` Execution**: Runs Phase 1 (Global Theme Discovery), Phase 1.5 (Theme Aggregation), Phase 2 (Empirical Graph Clustering + Map-Reduce Master Theme Synthesis), and Phase 3 (Master-Guided SVO Triple Extraction) without any external server dependencies.
+- **Continuous Device-Relative Auto-Tuning**:
+  - `DEVICE = "auto"`, `TORCH_DTYPE = "auto"`, `ATTN_IMPLEMENTATION = "auto"`, `BATCH_SIZE = "auto"`, and `CONTEXT_WINDOW_CAP = "auto"` adapt automatically to any GPU, Apple Silicon Mac, or CPU host.
+  - Dynamically bounds stage chunk word counts to the loaded model's context window (`_resolve_stage_max_words`), offloads the `SentenceTransformer` embedding model immediately after Phase 2 clustering to reclaim 100% of VRAM for the LLM, and automatically splits batches on OOM without losing progress.
+- **Incremental Checkpointing**: Saves per-document `{doc}_themes.json` and `{doc}_triples.json` files as soon as each document's chunks finish and logs timestamped progress to the console (`PRINT_CHECKPOINTS = True`).
 
 ## 2. Jupyter Notebook (`.ipynb`)
 
 Open [`usertests/03_interactive_walkthrough.ipynb`](03_interactive_walkthrough.ipynb) in Jupyter Lab, Jupyter Notebook, or VS Code / Antigravity to step through hardware advisories, custom Pydantic schemas, parser sanitization, DataFrame extraction, and chunking cell-by-cell.
-

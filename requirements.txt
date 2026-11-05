@@ -1,7 +1,9 @@
-# Core dependencies
-torch>=2.2.0
-transformers>=4.40.0
-accelerate>=0.28.0
+# Core PrismRunner dependencies
+torch>=2.4.0
+transformers>=4.51.0
+accelerate>=1.0.0
+safetensors>=0.4.3
+huggingface-hub>=0.26.0
 pydantic>=2.6.0
 pyarrow>=14.0.0
 pandas>=2.0.0
@@ -9,6 +11,19 @@ pyyaml>=6.0.1
 rich>=13.7.0
 click>=8.1.0
 
-# Optional / development dependencies
-pytest>=8.0.0
+# Clustering, embeddings & graph analytics (used by usertests/SemanticPrism1.py)
+numpy>=1.26.0
+scikit-learn>=1.4.0
+networkx>=3.2.0
+sentence-transformers>=3.0.0
 
+# Optional NVIDIA CUDA kernel & quantization accelerators
+# (Uncomment on Linux + NVIDIA GPUs for FlashAttention-2, Qwen3.5/3.6 Gated DeltaNet kernels, or 4/8-bit quantization)
+# flash-attn>=2.6.0
+# causal-conv1d>=1.4.0
+# flash-linear-attention
+# bitsandbytes>=0.44.0
+
+# Testing & development
+pytest>=8.0.0
+pytest-cov>=4.1.0
