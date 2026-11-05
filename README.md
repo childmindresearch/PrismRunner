@@ -32,7 +32,7 @@ Every hardware, memory, context, and batching optimization in PrismRunner is com
 
 ## Installation
 
-Install all dependencies via `requirements.txt` or editable install (on Linux, this automatically installs `causal-conv1d`, `flash-linear-attention`, `flash-attn`, and `bitsandbytes` for optimized `Qwen3.5`/`Qwen3.6` Gated DeltaNet and FlashAttention-2 kernels):
+Install all core, clustering, and Triton (`flash-linear-attention`) dependencies via `requirements.txt` or editable install:
 
 ```bash
 pip install -r requirements.txt
@@ -40,10 +40,14 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-> **Note for compiling `causal-conv1d` / `flash-attn` from source on Linux**: If prebuilt wheels are not available for your exact PyTorch/CUDA combination, pass `--no-build-isolation` after `torch` is installed:
-> ```bash
-> pip install causal-conv1d flash-linear-attention flash-attn --no-build-isolation
-> ```
+### Optional C++/CUDA Source Extensions (`causal-conv1d` & `flash-attn`)
+
+Because `causal-conv1d` and `flash-attn` import `torch` inside their `setup.py` at build time, `pip`'s default isolated build sandbox will raise `ModuleNotFoundError: No module named 'torch'` unless `--no-build-isolation` is passed **after** `torch`, `packaging`, and `ninja` are installed:
+
+```bash
+pip install --no-build-isolation causal-conv1d flash-attn
+```
+*(Note: PyTorch 2.4+ already includes FlashAttention-2 natively inside its `sdpa` backend, and `flash-linear-attention` is pure Python/Triton and installs automatically during `pip install -e .`.)*
 
 ---
 

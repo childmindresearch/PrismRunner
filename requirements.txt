@@ -10,6 +10,8 @@ pandas>=2.0.0
 pyyaml>=6.0.1
 rich>=13.7.0
 click>=8.1.0
+packaging>=24.0
+ninja>=1.11.1
 
 # Clustering, embeddings & graph analytics (used by usertests/SemanticPrism1.py)
 numpy>=1.26.0
@@ -17,11 +19,13 @@ scikit-learn>=1.4.0
 networkx>=3.2.0
 sentence-transformers>=3.0.0
 
-# Optimized NVIDIA CUDA kernels for Qwen3.5/3.6 Gated DeltaNet & FlashAttention
-causal-conv1d>=1.4.0; sys_platform == "linux"
+# Prebuilt Triton / CUDA accelerators (install cleanly with standard pip build isolation)
 flash-linear-attention; sys_platform == "linux"
-flash-attn>=2.6.0; sys_platform == "linux"
 bitsandbytes>=0.44.0; sys_platform == "linux"
+
+# Source-built CUDA C++ extensions (require `pip install --no-build-isolation causal-conv1d flash-attn` after torch is installed)
+# causal-conv1d>=1.4.0; sys_platform == "linux"
+# flash-attn>=2.6.0; sys_platform == "linux"
 
 # Testing & development
 pytest>=8.0.0
