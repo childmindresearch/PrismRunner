@@ -1,0 +1,1534 @@
+#!/usr/bin/env python3
+"""
+SemanticPrism Stage 1: Full Extraction Pipeline (Powered by PrismRunner)
+========================================================================
+Performs the exact Stage 1 Extraction workflow from:
+    https://github.com/childmindresearch/SemanticPrism
+
+Workflow Phases:
+  - Phase 1   : Global Theme Discovery (per-document chunks -> themes/{doc}_themes.json)
+  - Phase 1.5 : Theme Aggregation (-> all_themes.json)
+  - Phase 1.8 : Empirical Vector Theme Clustering (Dynamic kNN/Leiden & Fixed Ward -> clustering_summary.json)
+  - Phase 2   : Master Theme Synthesis (Map-Reduce or Single-Stage -> cluster_candidates.json, master_themes.json, theme_mapping_clusters.json)
+  - Phase 3   : Global SVO Triple Extraction with Master Theme Association (-> triples/{doc}_triplets.json)
+  - Phase 3.5 : Triple Aggregation (-> original_triplets.json, triplet_counts.csv)
+
+All LLM, input file/columns, output locations, chunking, and clustering parameters
+are configured as global variables at the top of this file.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+import json
+import logging
+import math
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+import numpy as np
+import pandas as pd
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+# Ensure PrismRunner repository root is importable when executed directly
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from prismrunner import (
+    PrismPipeline,
+    UniversalOutputParser,
+    clear_device_memory,
+)
+
+# =============================================================================
+# GLOBAL CONFIGURATION VARIABLES
+# =============================================================================
+
+# 1. LLM & Hardware Settings
+MODEL_NAME: str = "Qwen/Qwen2.5-3B-Instruct"   # Hugging Face model ID or local path (e.g., "Qwen/Qwen2.5-14B-Instruct")
+DEVICE: str = "auto"                           # "auto", "cuda", "mps", or "cpu"
+TORCH_DTYPE: str = "auto"                      # "auto", "bfloat16", "float16", or "float32"
+LOAD_IN_4BIT: bool = False                     # Enable 4-bit NF4 quantization (CUDA bitsandbytes)
+LOAD_IN_8BIT: bool = False                     # Enable 8-bit quantization (CUDA bitsandbytes)
+ATTN_IMPLEMENTATION: str = "auto"              # "auto", "flash_attention_2", "sdpa", or "eager"
+BATCH_SIZE: Union[int, str] = "auto"           # "auto" (hardware-aware) or explicit integer (e.g., 8)
+TEMPERATURE: float = 0.0                       # 0.0 for deterministic greedy decoding
+CONSTRAIN_JSON: bool = True                    # Force JSON opening bracket & bracket-balanced early stopping
+MANAGE_VRAM: bool = True                       # Purge GPU/MPS cache between major stage transitions
+DRY_RUN: bool = False                          # Set True to preview prompts without running LLM generation
+
+# 2. Input File / Directory & Column Settings
+SOURCE_TYPE: str = "parquet"                   # "parquet", "csv", "json", or "directory" (folder of .txt files)
+INPUT_PATH: str = "inputs/testdocs.parquet"    # Path to input dataset file (.parquet/.csv/.json) or folder of .txt files
+ID_COLUMN: str = "unique_val"                  # Column containing unique document IDs (SemanticPrism default: "unique_val")
+TEXT_COLUMN: str = "report"                    # Column containing raw document text (SemanticPrism default: "report")
+DOCUMENT_LIMIT: Optional[int] = None           # Optional cap on number of documents to process (None = all)
+
+# 3. Output Locations & Pipeline Resume Settings
+OUTPUT_DIR: str = "outputs/01_extraction"      # Stage 1 extraction artifacts directory
+LOG_DIR: str = "outputs/logs"                  # Error logs directory
+PAYLOAD_DIR: str = "outputs/payload_text"      # Exported initial LLM prompt inspection directory
+RESUME_MODE: str = "skip"                      # "skip" (reuse existing per-doc outputs) or "overwrite" (re-run all)
+
+# 4. Stage 1 Extraction Token & Chunking Parameters
+DOMAIN: str = "General Subjects"               # Context domain injected into extraction prompts
+THEME_CHUNK_MAX_WORDS: int = 2000              # Max words per chunk during Phase 1 Theme Discovery
+TRIPLE_CHUNK_MAX_WORDS: int = 400              # Max words per chunk during Phase 3 SVO Triple Extraction
+CONTEXT_WINDOW_CAP: int = 6000                 # Max prompt token cap per chunk
+THEME_MAX_NEW_TOKENS: int = 512                # Max generated tokens per theme discovery chunk
+MASTER_SYNTHESIS_MAX_NEW_TOKENS: int = 512     # Max generated tokens for cluster map/reduce synthesis
+TRIPLE_MAX_NEW_TOKENS: int = 768               # Max generated tokens per triple extraction chunk
+
+# 5. Empirical Theme Clustering & Master Theme Synthesis Parameters
+SYNTHESIS_STRATEGY: str = "map_reduce"         # "map_reduce" (Map per cluster + Reduce with anchors) or "single_stage"
+CLUSTERING_MODE: str = "dynamic"               # "dynamic" (kNN + Leiden modularity) or "fixed" (Ward linkage)
+TARGET_MASTER_THEME_COUNT: int = 8             # Target cluster count K for fixed Ward clustering
+EXEMPLARS_PER_CLUSTER: int = 10                # Top centroid exemplars per cluster
+MAP_MAX_THEMES_PER_CLUSTER: int = 150          # Max themes sent to Map specialist per cluster
+MAP_PAYLOAD_FORMAT: str = "title_desc"         # "title", "title_desc", or "title_desc_reasoning"
+REDUCE_ANCHOR_THEME_COUNT: int = 5             # Number of top centroid anchor themes included in Reduce prompt
+THEME_EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"# SentenceTransformer model for theme vector clustering
+THEME_EMBEDDING_PAYLOAD: str = "title_desc_reasoning"
+MANIFOLD_EDGE_THRESHOLD: float = 0.35          # Minimum cosine similarity for kNN graph edges
+MICRO_CLUSTER_RATIO: float = 0.01              # Clusters smaller than 1% of N are absorbed into nearest dominant centroid
+CONFIDENCE_HIGH_THRESHOLD: float = 0.40        # Cosine similarity threshold for "high" confidence theme mapping
+CONFIDENCE_MEDIUM_THRESHOLD: float = 0.25      # Cosine similarity threshold for "medium" confidence theme mapping
+CONFIDENCE_LOW_THRESHOLD: float = 0.15         # Cosine similarity threshold for "low" confidence theme mapping
+
+logger = logging.getLogger("SemanticPrism1")
+
+
+# =============================================================================
+# 1. SEMANTICPRISM STAGE 1 PYDANTIC SCHEMAS
+# =============================================================================
+
+class Theme(BaseModel):
+    """Represents an isolated, high-level structural theme."""
+
+    title: str = Field(description="The formal title of the extracted theme.")
+    description: Optional[str] = Field(default="", description="A brief description of the theme.")
+    reasoning: Optional[str] = Field(default="", description="Reasoning for classifying this as a critical theme.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def remap_and_clean(cls, data: Any) -> Any:
+        if isinstance(data, str):
+            return {"title": data.strip(), "description": "", "reasoning": ""}
+        if isinstance(data, dict):
+            title = data.get("title") or data.get("name") or data.get("theme") or data.get("theme_title") or ""
+            desc = data.get("description") or data.get("desc") or data.get("summary") or data.get("scope") or ""
+            reason = data.get("reasoning") or data.get("rationale") or data.get("justification") or data.get("reason") or ""
+            return {
+                "title": str(title).strip(),
+                "description": str(desc).strip(),
+                "reasoning": str(reason).strip(),
+            }
+        return data
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, v: str) -> str:
+        if not v or len(v.strip()) == 0:
+            raise ValueError("Theme title cannot be empty")
+        return v.strip()
+
+
+class ThemeDiscoveryResult(BaseModel):
+    """The aggregate output of the Theme Discovery phase."""
+
+    themes: List[Theme] = Field(default_factory=list, description="List of themes discovered in the text.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def handle_raw_payloads(cls, data: Any) -> Any:
+        if isinstance(data, list):
+            return {"themes": data}
+        if isinstance(data, dict):
+            if "themes" not in data:
+                for alt_key in ["discovered_themes", "theme_list", "raw_themes", "categories", "items", "results"]:
+                    if alt_key in data and isinstance(data[alt_key], list):
+                        data["themes"] = data[alt_key]
+                        break
+                else:
+                    if any(k in data for k in ("title", "name", "theme", "theme_title")):
+                        return {"themes": [data]}
+        return data
+
+    @field_validator("themes", mode="before")
+    @classmethod
+    def filter_and_salvage_themes(cls, v: Any) -> List[Any]:
+        if not isinstance(v, list):
+            return []
+        valid_themes = []
+        for item in v:
+            try:
+                if isinstance(item, str) and item.strip():
+                    valid_themes.append(Theme(title=item.strip()))
+                elif isinstance(item, dict):
+                    valid_themes.append(Theme.model_validate(item))
+                elif isinstance(item, Theme):
+                    valid_themes.append(item)
+            except Exception:
+                pass
+        return valid_themes
+
+
+class ClusterCandidateSynthesis(BaseModel):
+    """Intermediate candidate synthesis for an individual cluster produced during the Map phase."""
+
+    cluster_id: int = Field(default=0, description="The numeric ID of the cluster.")
+    candidate_title: str = Field(description="A concise, authoritative candidate title (3 to 6 words).")
+    scope_definition: str = Field(default="", description="1-2 sentences defining what this cluster strictly covers.")
+    key_inclusions: List[str] = Field(default_factory=list, description="Key concepts or mechanisms that strictly belong to this theme.")
+    key_exclusions: List[str] = Field(default_factory=list, description="Concepts or mechanisms that might seem related but belong elsewhere.")
+    confidence: Optional[str] = Field(default="high", description="Assessment of cluster coherence: high, medium, or low.")
+
+
+class MasterThemeSynthesisResult(BaseModel):
+    """The normalized global output consolidating multiple document themes."""
+
+    master_domain: str = Field(description="The singular, overarching domain describing the entire corpus.")
+    master_themes: List[str] = Field(description="The consolidated, deduplicated list of formal theme names.")
+
+
+class RawTriple(BaseModel):
+    """Extracts a high-fidelity subject-predicate-object relationship."""
+
+    subject: str = Field(..., description="The primary entity or concept exactly as it appears in the source text.")
+    predicate: str = Field(..., description="The relationship or action connecting subject and object.")
+    object: str = Field(..., description="The target entity, concept, or value.")
+    source_quote: str = Field(default="", description="The EXACT, verbatim substring from the text confirming this relationship.")
+    theme_association: Optional[str] = Field(default="Other", description="The master theme this triple most closely aligns with.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def align_keys(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "subject" not in data:
+                for k in ("subj", "head", "entity", "source"):
+                    if k in data:
+                        data["subject"] = data[k]
+                        break
+            if "predicate" not in data:
+                for k in ("pred", "relation", "relationship", "edge", "action"):
+                    if k in data:
+                        data["predicate"] = data[k]
+                        break
+            if "object" not in data:
+                for k in ("obj", "tail", "target", "value"):
+                    if k in data:
+                        data["object"] = data[k]
+                        break
+            if "source_quote" not in data:
+                for k in ("quote", "evidence", "sentence", "context"):
+                    if k in data:
+                        data["source_quote"] = data[k]
+                        break
+        return data
+
+    @field_validator("subject", "predicate", "object")
+    @classmethod
+    def prevent_empty(cls, v: Any) -> str:
+        if not v or len(str(v).strip()) == 0:
+            raise ValueError("Fields cannot be empty strings")
+        return str(v).strip()
+
+
+class TripleExtractionResult(BaseModel):
+    """The aggregate result grouping multiple triples from a single text block."""
+
+    triples: List[RawTriple] = Field(default_factory=list, description="The complete list of extracted node-edge relationships.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def align_triples(cls, data: Any) -> Any:
+        if isinstance(data, list):
+            return {"triples": data}
+        if isinstance(data, dict):
+            if "triples" not in data:
+                for alt_key in ("triplets", "relationships", "items", "results", "extractions"):
+                    if alt_key in data and isinstance(data[alt_key], list):
+                        data["triples"] = data[alt_key]
+                        break
+                else:
+                    if any(k in data for k in ("subject", "subj", "head")):
+                        return {"triples": [data]}
+        return data
+
+    @field_validator("triples", mode="before")
+    @classmethod
+    def drop_invalid_triples(cls, v: Any) -> List[Any]:
+        if not isinstance(v, list):
+            return []
+        valid_chunk = []
+        for item in v:
+            try:
+                if isinstance(item, dict):
+                    valid_chunk.append(RawTriple.model_validate(item))
+                elif isinstance(item, RawTriple):
+                    valid_chunk.append(item)
+            except Exception:
+                pass
+        return valid_chunk
+
+
+# =============================================================================
+# 2. SEMANTICPRISM STAGE 1 SYSTEM & USER PROMPTS
+# =============================================================================
+
+THEME_DISCOVERY_SYSTEM_PROMPT = """You are an Ontological Concept Engine.
+Your objective is to read the provided text and strictly discover the most critical underlying abstractions or structural 'forms' of information it represents, moving explicitly away from isolated specific subjects and maintaining distinction across themes.
+Examples:
+1. Rather than mapping specific instances (e.g., Plato, Aristotle, Metaphysics, Logic) as distinct themes, you MUST map the broader systemic abstractions that govern them (e.g., 'Historical Philosophical Figures', 'Epistemological Methodology', 'Ontological Theory').
+2. Rather than mapping specific instances (e.g., Metformin, HbA1c testing, Type 2 Diabetes, Insulin resistance), you MUST map the broader systemic abstractions that govern them (e.g., 'Endocrine Metabolic Disorders', 'Pharmacotherapeutic Interventions', 'Biomarker Diagnostic Metrics').
+3. Rather than mapping specific instances (e.g., Phishing email, CrowdStrike sensor, Ransomware, ISO 27001 compliance), you MUST map the broader systemic abstractions that govern them (e.g., 'Threat Vector Vectors', 'Endpoint Telemetry Mechanisms', 'Malicious Payload Typologies', 'Information Security Governance Frameworks').
+Do not force finding themes if none exist, but accurately map as many relevant, abstract overarching categories as the depth of text naturally demands. Maintaining efficiency, the exact amount of categories should be dictated dynamically by the text's content.
+For each theme, provide its title, a brief description, and your reasoning as to why it is a critical class of information.
+
+CRITICAL INSTRUCTION: You must return a single, valid JSON data object matching the schema exactly. Do NOT include conversational filler, markdown formatting blocks, or the JSON Schema definition itself."""
+
+THEME_DISCOVERY_USER_PROMPT = """Read this text and list the most critical overarching themes/classes of information based on the text:
+
+<source_text>
+{text_content}
+</source_text>"""
+
+CLUSTER_MAP_SYSTEM_PROMPT = """You are a Cluster Domain Specialist.
+You will receive an empirical cluster of themes discovered through vector embedding clustering.
+The themes are sorted in descending order of geometric proximity to the cluster centroid (most prototypical themes first).
+
+Your objective is to perform deep conceptual synthesis for this single cluster:
+1. Analyze the core themes (especially the top centroid prototypes) to discover the true semantic center of this cluster.
+2. Formulate ONE concise, authoritative candidate title (3 to 6 words) that captures the core essence of this domain.
+3. Write a clear, 1-2 sentence scope definition defining what this cluster strictly covers.
+4. List 3 to 5 key inclusions (concepts or mechanisms that strictly belong inside this theme).
+5. List 2 to 4 key exclusions (concepts that might seem superficially related but belong elsewhere).
+6. Provide a qualitative confidence assessment ("high", "medium", "low") of how cohesive the cluster is.
+
+CRITICAL: Return a single JSON object matching the ClusterCandidateSynthesis schema. Do NOT output markdown code fences or schema definitions."""
+
+CLUSTER_MAP_USER_PROMPT = """Synthesize the conceptual identity for Cluster #{cluster_id} ({theme_count} total themes in cluster, showing {displayed_count}):
+
+<cluster_themes>
+{theme_lines}
+</cluster_themes>"""
+
+CLUSTER_REDUCE_SYSTEM_PROMPT = """You are the Chief Ontological Synthesizer.
+You will receive candidate theme syntheses produced from the Map stage across all clusters discovered in the corpus.
+For each cluster, you also receive the Top Exemplar Themes closest to the mathematical centroid as empirical ground-truth anchors.
+
+Your objective is to harmonize all candidate themes into a unified, authoritative Master Ontology:
+1. Formulate ONE single overarching `master_domain` string capturing the root ontological domain of the entire corpus.
+2. Disambiguate and sharpen boundaries between any overlapping candidate titles. Use the empirical anchor themes to ensure each title faithfully reflects its cluster's centroid reality.
+3. Ensure all titles are mutually distinct, non-overlapping, and follow a consistent grammatical convention (e.g. Title Case noun phrases).
+4. The titles in the `master_themes` list MUST strictly correspond 1:1 to the cluster groups provided, maintaining the exact sequence (Cluster #1, Cluster #2, etc.).
+
+CRITICAL: Return a single JSON object containing:
+- `master_domain`: string (the unified root domain of the corpus)
+- `master_themes`: list of strings (the finalized master theme titles in exact 1:1 order with the clusters)
+Do NOT output the JSON Schema definition itself."""
+
+CLUSTER_REDUCE_USER_PROMPT = """Review the following {cluster_count} cluster candidates and their empirical anchor themes. Harmonize them into an authoritative Master Ontology:
+
+{cluster_blocks}"""
+
+MASTER_THEME_CLUSTERED_SYSTEM_PROMPT = """You are an Ontological Master Synthesizer.
+You will receive mathematically derived semantic clusters discovered across an entire corpus through vector embedding clustering.
+Each cluster represents an empirical semantic domain, characterized by its theme volume and its top prototypical exemplar themes (ranked by geometric proximity to the cluster centroid).
+
+Your objective is to formalize each mathematical cluster into an authoritative Master Theme:
+1. Formulate ONE single overarching `master_domain` string capturing the root ontological domain of the entire corpus.
+2. For EACH provided cluster, formulate ONE authoritative, concise master theme title representing that specific domain.
+3. The titles in the `master_themes` list MUST strictly correspond 1:1 to the cluster groups provided, maintaining the exact sequence.
+4. Ensure the titles are clean, distinct, and universally representative of their cluster's exemplars without overlapping with neighboring clusters.
+
+CRITICAL: You must return a single JSON data object containing:
+- `master_domain`: string (the unified corpus domain)
+- `master_themes`: list of strings (the finalized master theme titles in 1:1 order with the clusters)
+Do NOT output the JSON Schema definition itself."""
+
+MASTER_THEME_CLUSTERED_USER_PROMPT = """Review the following {cluster_count} mathematically derived semantic clusters and formalize each into an authoritative Master Theme:
+
+{cluster_exemplars_block}"""
+
+TRIPLE_EXTRACTION_SYSTEM_PROMPT = """You are a High-Precision Triple Extractor Agent running schema-mapped knowledge discovery.
+Your objective is to comprehensively extract all factual assertions, clinical findings, behaviors, diagnoses, relationships, and actions from the source text into atomic (Subject, Predicate, Object) triples.
+
+### EXTRACTION OBJECTIVES:
+1. Comprehensive Recall & Graph Density: Extract EVERY meaningful relationship across the entire text chunk. Do not stop after 2 or 3 triples. A rich, informative document chunk typically contains 10 to 30 valid factual triples.
+2. Atomic Entities: Keep subjects and objects clear and concise (e.g., "patient", "WISC-V evaluation", "ADHD", "morning drop-offs", "processing speed bottleneck") so they form clean, connected knowledge graph nodes.
+3. Descriptive Predicates: Use active, meaningful relationships (e.g., "was diagnosed with", "demonstrates", "yielded Full Scale IQ of", "impairs", "resides with", "was referred by", "presents with"). Never empty.
+4. Source Quote (Verbatim): For EVERY extracted relationship, you MUST provide the exact, verbatim substring from the source text confirming it. Do NOT summarize, shorten, or alter the quote.
+5. Theme Association: Set `theme_association` to the exact matching string from the 'Allowed theme_association values' list. If none fit cleanly, set `theme_association` to "Other".
+
+### EXAMPLE STRUCTURE:
+```json
+{
+  "triples": [
+    {
+      "subject": "patient",
+      "predicate": "meets diagnostic criteria for",
+      "object": "Separation Anxiety Disorder",
+      "source_quote": "Patient meets diagnostic criteria for Attention-Deficit/Hyperactivity Disorder, Combined Presentation, and Separation Anxiety Disorder.",
+      "theme_association": "Clinical Diagnoses"
+    },
+    {
+      "subject": "WISC-V evaluation",
+      "predicate": "yielded Full Scale IQ of",
+      "object": "102",
+      "source_quote": "Psychometric evaluation utilizing the Wechsler Intelligence Scale for Children, Fifth Edition (WISC-V) yielded a Full Scale IQ of 102.",
+      "theme_association": "Psychometric Testing"
+    }
+  ]
+}
+```
+
+### CRITICAL RULES:
+- Output ALL extracted triples in the `triples` array. Do NOT summarize, abbreviate, or use ellipses ("...").
+- Do not invent facts not stated in the text. Every triple must be grounded by its verbatim `source_quote`."""
+
+TRIPLE_EXTRACTION_USER_PROMPT = """Extract all atomic relationship triples from the following text:
+
+<source_text>
+{text_content}
+</source_text>"""
+
+TRIPLE_REFORMAT_SYSTEM_PROMPT = """You are an expert JSON repair assistant.
+Your job is to repair malformed JSON output to strictly match the TripleExtractionResult schema.
+
+### TARGET SCHEMA:
+```json
+{
+  "triples": [
+    {
+      "subject": "string (non-empty)",
+      "predicate": "string (non-empty)",
+      "object": "string (non-empty)",
+      "source_quote": "string (exact verbatim quote from text)",
+      "theme_association": "string (matching allowed themes or 'Other')"
+    }
+  ]
+}
+```
+
+### REPAIR RULES:
+- Repair syntax errors, fix unescaped characters, and correct mismatched key names (e.g. remap "subj"/"head" -> "subject", "pred"/"relation" -> "predicate", "obj"/"tail" -> "object", "quote"/"evidence" -> "source_quote").
+- Retain all valid triples extracted from the input.
+- Do NOT hallucinate new facts or entities not present in the malformed text.
+- Output pure JSON only."""
+
+
+# =============================================================================
+# 3. EMPIRICAL VECTOR THEME CLUSTERING
+# =============================================================================
+
+
+def format_theme_embedding_text(theme: Any, mode: str = "title_desc_reasoning") -> str:
+    """Format a Theme model or dict into text for vector embedding."""
+    if hasattr(theme, "title"):
+        title = str(theme.title or "").strip()
+        desc = str(getattr(theme, "description", "") or "").strip()
+        reason = str(getattr(theme, "reasoning", "") or "").strip()
+    elif isinstance(theme, dict):
+        title = str(theme.get("title", "") or "").strip()
+        desc = str(theme.get("description", "") or "").strip()
+        reason = str(theme.get("reasoning", "") or "").strip()
+    else:
+        return str(theme).strip()
+
+    if mode == "title":
+        return title
+    if mode == "title_desc":
+        return f"{title}: {desc}" if desc else title
+    if desc and reason:
+        return f"{title}: {desc} (Reasoning: {reason})"
+    if desc:
+        return f"{title}: {desc}"
+    return title
+
+
+class ThemeClusteringEngine:
+    """
+    Empirical vector theme clustering engine matching SemanticPrism's ThemeClusteringEngine.
+    Uses SentenceTransformer embeddings (with deterministic TF-IDF cosine fallback if offline),
+    computes dynamic kNN/Leiden modularity partitions and fixed Ward partitions, ranks themes
+    by centroid cosine similarity, and exports 'clustering_summary.json'.
+    """
+
+    def __init__(
+        self,
+        themes_path: Path,
+        output_dir: Path,
+        embedding_model_name: str = THEME_EMBEDDING_MODEL,
+        fixed_k: int = TARGET_MASTER_THEME_COUNT,
+        exemplar_count: int = EXEMPLARS_PER_CLUSTER,
+        clustering_mode: str = CLUSTERING_MODE,
+        synthesis_strategy: str = SYNTHESIS_STRATEGY,
+        map_max_themes: int = MAP_MAX_THEMES_PER_CLUSTER,
+        map_payload_format: str = MAP_PAYLOAD_FORMAT,
+        reduce_anchor_count: int = REDUCE_ANCHOR_THEME_COUNT,
+        theme_embedding_payload: str = THEME_EMBEDDING_PAYLOAD,
+    ):
+        self.themes_path = Path(themes_path)
+        self.output_dir = Path(output_dir)
+        self.master_themes_path = self.output_dir / "master_themes.json"
+        self.embedding_model_name = embedding_model_name
+        self.fixed_k = fixed_k
+        self.exemplar_count = exemplar_count
+        self.clustering_mode = clustering_mode
+        self.synthesis_strategy = synthesis_strategy
+        self.map_max_themes = map_max_themes
+        self.map_payload_format = map_payload_format
+        self.reduce_anchor_count = reduce_anchor_count
+        self.theme_embedding_payload = theme_embedding_payload
+
+        self.raw_themes: List[Dict[str, Any]] = []
+        self.embeddings: Optional[np.ndarray] = None
+        self.partitions: Dict[str, Any] = {}
+        self.active_exemplars: List[Dict[str, Any]] = []
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _compute_embeddings(self, texts: List[str]) -> np.ndarray:
+        """Compute L2-normalized embeddings via SentenceTransformer or TF-IDF fallback."""
+        try:
+            from sentence_transformers import SentenceTransformer
+            models_dir = Path("models/embeddings")
+            models_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                model = SentenceTransformer(self.embedding_model_name, cache_folder=str(models_dir), local_files_only=True)
+            except Exception:
+                model = SentenceTransformer(self.embedding_model_name, cache_folder=str(models_dir), local_files_only=False)
+            emb = model.encode(texts, normalize_embeddings=True)
+            return np.asarray(emb, dtype=np.float32)
+        except Exception:
+            vocab: Dict[str, int] = {}
+            tokenized: List[List[str]] = []
+            for t in texts:
+                words = [w for w in re.findall(r"[a-z0-9]{2,}", t.lower())]
+                tokenized.append(words)
+                for w in set(words):
+                    vocab[w] = vocab.get(w, 0) + 1
+            terms = sorted(vocab.keys())
+            if not terms:
+                return np.eye(max(1, len(texts)), dtype=np.float32)
+            term_idx = {w: i for i, w in enumerate(terms)}
+            n_docs = len(texts)
+            mat = np.zeros((n_docs, len(terms)), dtype=np.float32)
+            for d_i, words in enumerate(tokenized):
+                for w in words:
+                    if w in term_idx:
+                        mat[d_i, term_idx[w]] += 1.0
+            idf = np.log((1.0 + n_docs) / (1.0 + np.array([vocab[w] for w in terms], dtype=np.float32))) + 1.0
+            mat = mat * idf
+            norms = np.linalg.norm(mat, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            return mat / norms
+
+    def _build_partition_dict(
+        self,
+        name: str,
+        labels: np.ndarray,
+        raw_themes: List[Dict[str, Any]],
+        embeddings: np.ndarray,
+    ) -> Dict[str, Any]:
+        unique_ids = sorted(set(int(x) for x in labels))
+        clusters: Dict[int, Dict[str, Any]] = {}
+        assignments: List[Dict[str, Any]] = []
+        n_total = max(1, len(raw_themes))
+
+        for new_cid, orig_cid in enumerate(unique_ids):
+            idxs = [i for i, lbl in enumerate(labels) if int(lbl) == orig_cid]
+            cluster_embs = embeddings[idxs]
+            centroid = cluster_embs.mean(axis=0)
+            c_norm = np.linalg.norm(centroid)
+            if c_norm > 0:
+                centroid = centroid / c_norm
+
+            sims = cluster_embs @ centroid
+            ranked_pairs = sorted(zip(idxs, sims), key=lambda x: float(x[1]), reverse=True)
+
+            all_cluster_themes = []
+            for r_idx, sim_val in ranked_pairs:
+                t_obj = raw_themes[r_idx]
+                all_cluster_themes.append({
+                    "theme_index": int(r_idx),
+                    "title": t_obj.get("title", ""),
+                    "description": t_obj.get("description", ""),
+                    "reasoning": t_obj.get("reasoning", ""),
+                    "similarity_to_centroid": round(float(sim_val), 4),
+                })
+
+            top_exemplars = all_cluster_themes[: self.exemplar_count]
+            lead_title = top_exemplars[0]["title"] if top_exemplars else f"Cluster #{new_cid + 1}"
+            clusters[new_cid] = {
+                "cluster_id": new_cid,
+                "label": f"Cluster #{new_cid + 1}: {lead_title}",
+                "count": len(idxs),
+                "percentage": round(len(idxs) * 100.0 / n_total, 2),
+                "exemplars": top_exemplars,
+                "all_themes": all_cluster_themes,
+            }
+
+            for item in all_cluster_themes:
+                assignments.append({
+                    "theme_index": item["theme_index"],
+                    "title": item["title"],
+                    "cluster_id": new_cid,
+                    "cluster_label": clusters[new_cid]["label"],
+                    "similarity_to_centroid": item["similarity_to_centroid"],
+                })
+
+        return {
+            "name": name,
+            "cluster_count": len(clusters),
+            "clusters": clusters,
+            "assignments": sorted(assignments, key=lambda x: x["theme_index"]),
+        }
+
+    def cluster_themes(self) -> Dict[str, Any]:
+        if not self.themes_path.exists():
+            raise FileNotFoundError(f"Missing themes file: {self.themes_path}")
+        with open(self.themes_path, "r", encoding="utf-8") as f:
+            self.raw_themes = json.load(f)
+
+        n = len(self.raw_themes)
+        if n == 0:
+            self.partitions = {}
+            self.active_exemplars = []
+            return {"partitions": {}, "active_exemplars": [], "raw_themes": []}
+
+        texts = [format_theme_embedding_text(t, mode=self.theme_embedding_payload) for t in self.raw_themes]
+        self.embeddings = self._compute_embeddings(texts)
+
+        # 1. Dynamic Partition (Leiden / Modularity community detection or adaptive k)
+        dynamic_k = max(1, min(self.fixed_k, int(round(math.sqrt(n / 2.0))) or 1))
+        dyn_labels = np.zeros(n, dtype=int)
+        if n > 2:
+            try:
+                import networkx as nx
+                sim_matrix = self.embeddings @ self.embeddings.T
+                k_neighbors = int(np.clip(round(2 * math.log2(max(2, n))), 2, min(30, n - 1)))
+                graph = nx.Graph()
+                for i in range(n):
+                    graph.add_node(i)
+                    row = sim_matrix[i]
+                    top_nbrs = np.argsort(row)[::-1][1 : k_neighbors + 1]
+                    for j in top_nbrs:
+                        w = float(row[j])
+                        if w >= MANIFOLD_EDGE_THRESHOLD:
+                            graph.add_edge(i, int(j), weight=w)
+                communities = list(nx.community.greedy_modularity_communities(graph, weight="weight"))
+                for c_idx, comm in enumerate(communities):
+                    for node_idx in comm:
+                        dyn_labels[int(node_idx)] = c_idx
+            except Exception:
+                dyn_labels = np.array([i % dynamic_k for i in range(n)], dtype=int)
+
+        # 2. Fixed Ward Linkage Partition
+        fixed_k = max(1, min(self.fixed_k, n))
+        if n > 1 and fixed_k > 1:
+            try:
+                from sklearn.cluster import AgglomerativeClustering
+                ward = AgglomerativeClustering(n_clusters=fixed_k, linkage="ward")
+                ward_labels = ward.fit_predict(self.embeddings)
+            except Exception:
+                ward_labels = np.array([i % fixed_k for i in range(n)], dtype=int)
+        else:
+            ward_labels = np.zeros(n, dtype=int)
+
+        self.partitions = {
+            "dynamic_leiden": self._build_partition_dict(
+                "Dynamic Topological Leiden", dyn_labels, self.raw_themes, self.embeddings
+            ),
+            "fixed_ward": self._build_partition_dict(
+                f"Fixed Variance-Minimized (Ward K={fixed_k})", ward_labels, self.raw_themes, self.embeddings
+            ),
+        }
+
+        active_part = self.get_active_partition(self.partitions)
+        self.active_exemplars = [
+            {
+                "cluster_id": c_id,
+                "theme_count": c_data["count"],
+                "percentage": c_data["percentage"],
+                "exemplars": c_data["exemplars"],
+            }
+            for c_id, c_data in sorted(active_part["clusters"].items())
+        ]
+
+        return {
+            "partitions": self.partitions,
+            "active_exemplars": self.active_exemplars,
+            "raw_themes": self.raw_themes,
+        }
+
+    def get_active_partition_key(self) -> str:
+        return "fixed_ward" if self.clustering_mode == "fixed" else "dynamic_leiden"
+
+    def get_active_partition(self, partitions: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        parts = partitions or self.partitions
+        key = self.get_active_partition_key()
+        return parts.get(key) or next(iter(parts.values()), {"clusters": {}, "assignments": []})
+
+    def get_map_payload(self, max_themes_per_cluster: int = 150, payload_format: str = "title_desc") -> List[Dict[str, Any]]:
+        active_part = self.get_active_partition()
+        payloads = []
+        for c_id, c_data in sorted(active_part.get("clusters", {}).items()):
+            all_t = c_data.get("all_themes", [])
+            displayed = all_t[:max_themes_per_cluster]
+            lines = []
+            for idx, t in enumerate(displayed, start=1):
+                formatted = format_theme_embedding_text(t, mode=payload_format)
+                lines.append(f"{idx}. {formatted} (sim={t.get('similarity_to_centroid', 0.0):.3f})")
+            payloads.append({
+                "cluster_id": c_id,
+                "theme_count": len(all_t),
+                "displayed_count": len(displayed),
+                "theme_lines": "\n".join(lines),
+            })
+        return payloads
+
+    def get_reduce_anchors(self, top_n: int = 5) -> Dict[int, List[Dict[str, Any]]]:
+        active_part = self.get_active_partition()
+        anchors: Dict[int, List[Dict[str, Any]]] = {}
+        for c_id, c_data in sorted(active_part.get("clusters", {}).items()):
+            anchors[c_id] = c_data.get("all_themes", [])[:top_n]
+        return anchors
+
+    def export_clustering_summary(
+        self,
+        master_themes: Optional[List[str]] = None,
+        master_domain: Optional[str] = None,
+    ) -> Path:
+        if not self.partitions:
+            self.cluster_themes()
+
+        active_key = self.get_active_partition_key()
+        active_part = self.partitions.get(active_key, {})
+
+        if active_part and master_themes:
+            active_part["master_domain"] = master_domain or DOMAIN
+            for idx, (c_id, c_data) in enumerate(sorted(active_part.get("clusters", {}).items())):
+                if idx < len(master_themes):
+                    clean_name = re.sub(r"^(?:Cluster\s*\d+[\s:.-]*|\d+[\s:.-]+)", "", str(master_themes[idx])).strip()
+                    c_data["master_theme_name"] = clean_name
+                    c_data["label"] = f"Master Theme #{idx + 1}: {clean_name}"
+
+        summary_path = self.output_dir / "clustering_summary.json"
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "master_domain": master_domain or DOMAIN,
+                    "active_partition": active_key,
+                    "total_themes": len(self.raw_themes),
+                    "partitions": self.partitions,
+                },
+                f,
+                indent=2,
+            )
+        return summary_path
+
+
+# =============================================================================
+# 4. SEMANTICPRISM STAGE 1 PIPELINE ORCHESTRATOR
+# =============================================================================
+
+class PipelineRunContext:
+    """State tracking object persisting discovered themes, master ontology, and SVO triples."""
+
+    def __init__(self):
+        self.all_discovered_themes: List[Theme] = []
+        self.cluster_candidates: List[ClusterCandidateSynthesis] = []
+        self.master_themes: Optional[MasterThemeSynthesisResult] = None
+        self.raw_triples: List[Dict[str, Any]] = []
+        self.processed_documents: Set[str] = set()
+
+
+class SemanticPrismStage1Pipeline:
+    """
+    Executes the complete SemanticPrism Stage 1 Extraction workflow using PrismRunner
+    for local hardware-optimized batch LLM inference.
+    """
+
+    def __init__(
+        self,
+        context: Optional[PipelineRunContext] = None,
+        prism_pipeline: Optional[PrismPipeline] = None,
+    ):
+        self.context = context or PipelineRunContext()
+        self.out_dir = Path(OUTPUT_DIR)
+        self.themes_dir = self.out_dir / "themes"
+        self.triples_dir = self.out_dir / "triples"
+        self.log_dir = Path(LOG_DIR)
+        self.payload_dir = Path(PAYLOAD_DIR)
+
+        for d in (self.out_dir, self.themes_dir, self.triples_dir, self.log_dir, self.payload_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        if prism_pipeline is not None:
+            self.prism = prism_pipeline
+        else:
+            self.prism = PrismPipeline(
+                model_name=MODEL_NAME,
+                device=DEVICE,
+                batch_size=BATCH_SIZE,
+                config={
+                    "model": {
+                        "name": MODEL_NAME,
+                        "device": DEVICE,
+                        "torch_dtype": TORCH_DTYPE,
+                        "load_in_4bit": LOAD_IN_4BIT,
+                        "load_in_8bit": LOAD_IN_8BIT,
+                        "attn_implementation": ATTN_IMPLEMENTATION,
+                    },
+                    "inference": {
+                        "batch_size": BATCH_SIZE,
+                        "temperature": TEMPERATURE,
+                        "constrain_json": CONSTRAIN_JSON,
+                    },
+                },
+            )
+
+        if self.context.master_themes is None:
+            self.load_master_themes()
+
+    @staticmethod
+    def sanitize_filename(name: str) -> str:
+        """Sanitize document identifiers to be filesystem-safe."""
+        return re.sub(r'[\\/:*?"<>|]', "_", str(name))
+
+    def clear_stage_logs(self, phase: Optional[str] = None) -> None:
+        log_map = {
+            "themes": ["stage_01_theme_discovery_errors.json"],
+            "master": ["stage_01_master_theme_errors.json"],
+            "triples": ["stage_01_triple_extraction_errors.json"],
+        }
+        targets = log_map.get(phase, [
+            "stage_01_theme_discovery_errors.json",
+            "stage_01_master_theme_errors.json",
+            "stage_01_triple_extraction_errors.json",
+        ])
+        for log_file in targets:
+            p = self.log_dir / log_file
+            if p.exists():
+                p.unlink()
+
+    def _save_payload_text(self, filename: str, content: str) -> None:
+        target_path = self.payload_dir / filename
+        if not target_path.exists():
+            target_path.write_text(content, encoding="utf-8")
+
+    @staticmethod
+    def chunk_text(text: str, max_words: int) -> List[Tuple[str, int, int]]:
+        """
+        SemanticPrism's exact word-based sentence-boundary lookahead chunker.
+        Returns a list of tuples: (chunk_text, start_word_index, end_word_index).
+        """
+        words = text.split()
+        chunks: List[Tuple[str, int, int]] = []
+        start = 0
+        while start < len(words):
+            end = min(start + max_words, len(words))
+            if end < len(words):
+                while end < len(words) and not words[end - 1].endswith((".", "!", "?", '."', '!"', '?"')):
+                    end += 1
+            chunk = " ".join(words[start:end])
+            chunks.append((chunk, start, end))
+            if end >= len(words):
+                break
+            start = end
+        return chunks
+
+    @staticmethod
+    def load_input_documents(
+        input_path: Optional[Union[str, Path, pd.DataFrame, List[Dict[str, Any]]]] = None,
+        source_type: str = SOURCE_TYPE,
+        id_column: str = ID_COLUMN,
+        text_column: str = TEXT_COLUMN,
+        limit: Optional[int] = DOCUMENT_LIMIT,
+    ) -> List[Dict[str, str]]:
+        """
+        Load input documents using global settings (Parquet, CSV, JSON, DataFrame, or directory of .txt files).
+        Returns a list of dicts: [{'id': str, 'text': str}].
+        """
+        target = input_path if input_path is not None else INPUT_PATH
+        docs: List[Dict[str, str]] = []
+
+        if isinstance(target, pd.DataFrame):
+            df = target
+        elif isinstance(target, list):
+            for i, item in enumerate(target):
+                if isinstance(item, dict):
+                    doc_id = str(item.get(id_column) or item.get("id") or f"doc_{i:04d}")
+                    txt = str(item.get(text_column) or item.get("text") or "")
+                    if txt.strip():
+                        docs.append({"id": doc_id, "text": txt})
+                elif isinstance(item, str) and item.strip():
+                    docs.append({"id": f"doc_{i:04d}", "text": item})
+            return docs[:limit] if limit else docs
+        else:
+            p = Path(target)
+            if not p.exists() and (REPO_ROOT / p).exists():
+                p = REPO_ROOT / p
+            if not p.exists():
+                raise FileNotFoundError(f"Input path not found at: {target}")
+
+            if p.is_dir() or source_type == "directory":
+                print(f"Loading input documents from Directory: {p}")
+                for txt_file in sorted(p.glob("*.txt")):
+                    text = txt_file.read_text(encoding="utf-8")
+                    if text.strip():
+                        docs.append({"id": txt_file.name, "text": text})
+                return docs[:limit] if limit else docs
+
+            if p.suffix.lower() in (".parquet", ".pq"):
+                print(f"Loading input documents from Parquet file: {p}")
+                df = pd.read_parquet(p)
+            elif p.suffix.lower() == ".csv":
+                print(f"Loading input documents from CSV file: {p}")
+                df = pd.read_csv(p)
+            elif p.suffix.lower() in (".json", ".jsonl"):
+                print(f"Loading input documents from JSON file: {p}")
+                df = pd.read_json(p, lines=p.suffix.lower() == ".jsonl")
+            else:
+                raise ValueError(f"Unsupported input file extension: {p.suffix}")
+
+        # Resolve ID and text columns (with fallback if custom column names differ)
+        col_map = {str(c).lower().strip(): c for c in df.columns}
+        resolved_id = id_column if id_column in df.columns else col_map.get(id_column.lower())
+        if not resolved_id:
+            for cand in ("unique_val", "id", "doc_id", "record_id", "identifier", "patient_id"):
+                if cand in col_map:
+                    resolved_id = col_map[cand]
+                    break
+
+        resolved_text = text_column if text_column in df.columns else col_map.get(text_column.lower())
+        if not resolved_text:
+            for cand in ("report", "text", "anonymized", "content", "clinical_report", "note", "body"):
+                if cand in col_map:
+                    resolved_text = col_map[cand]
+                    break
+
+        if not resolved_text:
+            raise ValueError(f"text_column '{text_column}' not found in columns: {list(df.columns)}")
+
+        for idx, row in df.iterrows():
+            doc_id = str(row[resolved_id]) if resolved_id and pd.notna(row[resolved_id]) else f"doc_{idx:04d}"
+            text = str(row[resolved_text]) if pd.notna(row[resolved_text]) else ""
+            if text.strip() and text.strip().lower() != "nan":
+                docs.append({"id": doc_id, "text": text})
+
+        return docs[:limit] if limit else docs
+
+    def load_master_themes(self) -> Optional[MasterThemeSynthesisResult]:
+        """Load master_themes.json from disk into context if it exists."""
+        master_path = self.out_dir / "master_themes.json"
+        if master_path.exists():
+            try:
+                with open(master_path, "r", encoding="utf-8") as f:
+                    self.context.master_themes = MasterThemeSynthesisResult(**json.load(f))
+            except Exception as e:
+                print(f"Warning: Failed to load master themes from {master_path}: {e}")
+        return self.context.master_themes
+
+    # =========================================================================
+    # PHASE 1: GLOBAL THEME DISCOVERY & AGGREGATION
+    # =========================================================================
+
+    def discover_themes_across_documents(
+        self,
+        documents: List[Dict[str, str]],
+        dry_run: bool = DRY_RUN,
+    ) -> List[Theme]:
+        """
+        Phase 1: Discover abstract overarching themes across all documents using
+        SemanticPrism's exact word-chunking + prompts, batched through PrismPipeline.
+        """
+        print(f"=== Phase 1: Global Theme Discovery (Model: {MODEL_NAME}) ===")
+        chunk_rows: List[Dict[str, Any]] = []
+        doc_expected_chunks: Dict[str, int] = {}
+
+        for doc in documents:
+            doc_id = doc["id"]
+            safe_name = self.sanitize_filename(doc_id)
+            theme_file_path = self.themes_dir / f"{safe_name}_themes.json"
+
+            if RESUME_MODE == "skip" and theme_file_path.exists():
+                print(f"-> Skipping theme discovery for: {doc_id} (already exists on disk)")
+                try:
+                    cached = json.loads(theme_file_path.read_text(encoding="utf-8"))
+                    for t in cached:
+                        self.context.all_discovered_themes.append(Theme.model_validate(t))
+                except Exception:
+                    pass
+                continue
+
+            print(f"-> Discovering themes in: {doc_id}")
+            doc_chunks = self.chunk_text(doc["text"], THEME_CHUNK_MAX_WORDS)
+            doc_expected_chunks[doc_id] = len(doc_chunks)
+
+            for chunk_idx, (chunk_str, start_w, end_w) in enumerate(doc_chunks):
+                user_prompt = THEME_DISCOVERY_USER_PROMPT.format(text_content=chunk_str)
+                full_prompt = f"=== SYSTEM PROMPT ===\n{THEME_DISCOVERY_SYSTEM_PROMPT}\n\n=== USER PROMPT ===\n{user_prompt}"
+                self._save_payload_text("stage_01_theme_discovery.txt", full_prompt)
+                chunk_rows.append({
+                    "chunk_uid": f"{doc_id}__chunk_{chunk_idx}",
+                    "doc_id": doc_id,
+                    "start_word": start_w,
+                    "end_word": end_w,
+                    "text": chunk_str,
+                })
+
+        if not chunk_rows:
+            return self.aggregate_themes()
+
+        theme_template = {
+            "version": "1.0",
+            "task": "theme_discovery",
+            "system_prompt": THEME_DISCOVERY_SYSTEM_PROMPT,
+            "prompt": f"{THEME_DISCOVERY_USER_PROMPT.replace('{text_content}', '{{ text }}')}\n\n{{schema_block}}",
+        }
+
+        results = self.prism.run(
+            task="extract",
+            input_data=chunk_rows,
+            text_column="text",
+            id_column="chunk_uid",
+            schema_cls=ThemeDiscoveryResult,
+            prompt_template=theme_template,
+            system_prompt=THEME_DISCOVERY_SYSTEM_PROMPT,
+            chunk=False,
+            as_array=False,
+            max_new_tokens=THEME_MAX_NEW_TOKENS,
+            temperature=TEMPERATURE,
+            constrain_json=CONSTRAIN_JSON,
+            dry_run=dry_run,
+        )
+
+        if dry_run:
+            return self.context.all_discovered_themes
+
+        themes_by_doc: Dict[str, List[Theme]] = {doc_id: [] for doc_id in doc_expected_chunks}
+        for row_meta, res in zip(chunk_rows, results):
+            doc_id = row_meta["doc_id"]
+            items = res.get("extracted_items") or res.get("parsed_items") or []
+            if not items and not res.get("parse_success", True):
+                err_rec = {
+                    "source_document": doc_id,
+                    "start_word": row_meta["start_word"],
+                    "end_word": row_meta["end_word"],
+                    "error": res.get("parse_error", "Validation error"),
+                    "chunk_text": row_meta["text"],
+                }
+                with open(self.log_dir / "stage_01_theme_discovery_errors.json", "a", encoding="utf-8") as ef:
+                    ef.write(json.dumps(err_rec) + "\n")
+                continue
+
+            for item in items:
+                if isinstance(item, ThemeDiscoveryResult):
+                    themes_by_doc[doc_id].extend(item.themes)
+                elif isinstance(item, Theme):
+                    themes_by_doc[doc_id].append(item)
+                elif isinstance(item, dict):
+                    try:
+                        parsed_res = ThemeDiscoveryResult.model_validate(item)
+                        themes_by_doc[doc_id].extend(parsed_res.themes)
+                    except Exception:
+                        pass
+
+        for doc_id, doc_themes in themes_by_doc.items():
+            safe_name = self.sanitize_filename(doc_id)
+            out_file = self.themes_dir / f"{safe_name}_themes.json"
+            with open(out_file, "w", encoding="utf-8") as f:
+                json.dump([t.model_dump() for t in doc_themes], f, indent=2)
+            self.context.all_discovered_themes.extend(doc_themes)
+
+        return self.aggregate_themes()
+
+    def aggregate_themes(self) -> List[Theme]:
+        """Phase 1.5: Consolidate individual *_themes.json files into all_themes.json."""
+        print("\n=== Phase 1.5: Theme Aggregation ===")
+        all_themes: List[Dict[str, Any]] = []
+        for fpath in sorted(self.themes_dir.glob("*_themes.json")):
+            try:
+                data = json.loads(fpath.read_text(encoding="utf-8"))
+                all_themes.extend(data)
+            except Exception as e:
+                print(f"Warning: Failed to load theme file {fpath.name}: {e}")
+
+        if not all_themes and (self.out_dir / "all_themes.json").exists():
+            all_themes = json.loads((self.out_dir / "all_themes.json").read_text(encoding="utf-8"))
+
+        self.context.all_discovered_themes = [Theme.model_validate(t) for t in all_themes]
+        if all_themes:
+            with open(self.out_dir / "all_themes.json", "w", encoding="utf-8") as f:
+                json.dump([t.model_dump() for t in self.context.all_discovered_themes], f, indent=2)
+        return self.context.all_discovered_themes
+
+    # =========================================================================
+    # PHASE 2: EMPIRICAL CLUSTERING & MASTER THEME SYNTHESIS
+    # =========================================================================
+
+    def _export_cluster_theme_mapping(self, active_partition: Dict[str, Any], synthesized_master_names: List[str]) -> None:
+        theme_mapping: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        clusters = active_partition.get("clusters", {})
+        cluster_items = sorted(clusters.items()) if isinstance(clusters, dict) else list(enumerate(clusters))
+
+        for idx, (c_id, c_data) in enumerate(cluster_items):
+            if idx < len(synthesized_master_names):
+                raw_val = str(synthesized_master_names[idx]).strip()
+                cleaned = re.sub(r"^(?:Cluster\s*\d+[\s:.-]*|\d+[\s:.-]+)", "", raw_val).strip()
+                master_name = cleaned if cleaned else raw_val
+            else:
+                master_name = c_data.get("label", f"Cluster_{c_id}")
+
+            for t_item in c_data.get("all_themes", []):
+                sim = float(t_item.get("similarity_to_centroid", 0.0))
+                if sim >= CONFIDENCE_HIGH_THRESHOLD:
+                    conf = "high"
+                elif sim >= CONFIDENCE_MEDIUM_THRESHOLD:
+                    conf = "medium"
+                elif sim >= CONFIDENCE_LOW_THRESHOLD:
+                    conf = "low"
+                else:
+                    conf = "unassigned"
+
+                theme_mapping[master_name].append({
+                    "raw_theme": t_item["title"],
+                    "confidence": conf,
+                    "similarity_score": round(sim, 4),
+                })
+
+        mapping_path = self.out_dir / "theme_mapping_clusters.json"
+        with open(mapping_path, "w", encoding="utf-8") as f:
+            json.dump(theme_mapping, f, indent=2)
+        print(f"-> Exported theme consolidation mapping directly to: {mapping_path}")
+
+    def synthesize_master_themes(self, force: bool = False, dry_run: bool = DRY_RUN) -> Optional[MasterThemeSynthesisResult]:
+        """
+        Phase 2: Cluster global aggregated themes with ThemeClusteringEngine and
+        synthesize the authoritative Master Ontology via Map-Reduce or Single-Stage.
+        """
+        print(f"\n=== Phase 2: Master Theme Synthesis (Model: {MODEL_NAME}) ===")
+        self.aggregate_themes()
+        if not self.context.all_discovered_themes:
+            print("Warning: No themes found in themes directory or all_themes.json. Skipping master theme synthesis.")
+            return None
+
+        master_path = self.out_dir / "master_themes.json"
+        mapping_path = self.out_dir / "theme_mapping_clusters.json"
+
+        if not force and RESUME_MODE == "skip" and master_path.exists() and mapping_path.exists():
+            print("-> Skipping master theme synthesis (already exists on disk). Loading existing master themes...")
+            return self.load_master_themes()
+
+        cluster_engine = ThemeClusteringEngine(
+            themes_path=self.out_dir / "all_themes.json",
+            output_dir=self.out_dir,
+        )
+        cluster_results = cluster_engine.cluster_themes()
+        partitions = cluster_results["partitions"]
+        exemplar_groups = cluster_results["active_exemplars"]
+        active_partition = cluster_engine.get_active_partition(partitions)
+
+        if SYNTHESIS_STRATEGY == "map_reduce":
+            map_payloads = cluster_engine.get_map_payload(
+                max_themes_per_cluster=MAP_MAX_THEMES_PER_CLUSTER,
+                payload_format=MAP_PAYLOAD_FORMAT,
+            )
+            map_inputs = []
+            for c_info in map_payloads:
+                c_id = c_info["cluster_id"]
+                u_prompt = CLUSTER_MAP_USER_PROMPT.format(
+                    cluster_id=c_id + 1,
+                    theme_count=c_info["theme_count"],
+                    displayed_count=c_info["displayed_count"],
+                    theme_lines=c_info["theme_lines"],
+                )
+                self._save_payload_text(
+                    "stage_01_master_theme_map.txt",
+                    f"=== SYSTEM PROMPT ===\n{CLUSTER_MAP_SYSTEM_PROMPT}\n\n=== USER PROMPT ===\n{u_prompt}",
+                )
+                map_inputs.append({"id": f"cluster_{c_id}", "cluster_id": c_id, "text": u_prompt, "theme_lines": c_info["theme_lines"]})
+
+            map_template = {
+                "version": "1.0",
+                "task": "cluster_map",
+                "system_prompt": CLUSTER_MAP_SYSTEM_PROMPT,
+                "prompt": "{{ text }}\n\n{schema_block}",
+            }
+            map_results = self.prism.run(
+                task="extract",
+                input_data=map_inputs,
+                text_column="text",
+                id_column="id",
+                schema_cls=ClusterCandidateSynthesis,
+                prompt_template=map_template,
+                system_prompt=CLUSTER_MAP_SYSTEM_PROMPT,
+                chunk=False,
+                as_array=False,
+                max_new_tokens=MASTER_SYNTHESIS_MAX_NEW_TOKENS,
+                temperature=TEMPERATURE,
+                constrain_json=CONSTRAIN_JSON,
+                dry_run=dry_run,
+            )
+            if dry_run:
+                return None
+
+            map_candidates: List[ClusterCandidateSynthesis] = []
+            for m_in, m_res in zip(map_inputs, map_results):
+                c_id = m_in["cluster_id"]
+                items = m_res.get("extracted_items") or m_res.get("parsed_items") or []
+                cand: Optional[ClusterCandidateSynthesis] = None
+                for it in items:
+                    if isinstance(it, ClusterCandidateSynthesis):
+                        cand = it
+                        break
+                    if isinstance(it, dict):
+                        try:
+                            cand = ClusterCandidateSynthesis.model_validate(it)
+                            break
+                        except Exception:
+                            pass
+                if cand is None:
+                    first_line = m_in["theme_lines"].split("\n")[0] if m_in["theme_lines"] else f"Cluster #{c_id + 1}"
+                    clean_title = first_line.split(".", 1)[-1].split(":", 1)[0].strip() or f"Theme Domain {c_id + 1}"
+                    cand = ClusterCandidateSynthesis(
+                        cluster_id=c_id,
+                        candidate_title=clean_title,
+                        scope_definition=f"Domain encompassing core conceptual themes centered on {clean_title}.",
+                        key_inclusions=[clean_title],
+                        key_exclusions=[],
+                        confidence="low",
+                    )
+                cand.cluster_id = c_id
+                map_candidates.append(cand)
+
+            self.context.cluster_candidates = map_candidates
+            with open(self.out_dir / "cluster_candidates.json", "w", encoding="utf-8") as f:
+                json.dump([c.model_dump() for c in map_candidates], f, indent=2)
+
+            reduce_anchors = cluster_engine.get_reduce_anchors(top_n=REDUCE_ANCHOR_THEME_COUNT)
+            cluster_blocks = []
+            for cand in map_candidates:
+                anchors = reduce_anchors.get(cand.cluster_id, [])
+                anchor_lines = [f"     - {a['title']}: {a['description']}" for a in anchors]
+                cluster_blocks.append(
+                    f"### Cluster #{cand.cluster_id + 1}:\n"
+                    f"- Proposed Master Theme Title: {cand.candidate_title}\n"
+                    f"- Scope Definition: {cand.scope_definition}\n"
+                    f"- Key Inclusions: {', '.join(cand.key_inclusions) or 'None specified'}\n"
+                    f"- Key Exclusions: {', '.join(cand.key_exclusions) or 'None specified'}\n"
+                    f"- Cohesion Confidence: {cand.confidence or 'high'}\n"
+                    f"- Top {len(anchors)} Exemplar Themes (Empirical Anchors):\n" + "\n".join(anchor_lines)
+                )
+            reduce_user_prompt = CLUSTER_REDUCE_USER_PROMPT.format(
+                cluster_count=len(map_candidates),
+                cluster_blocks="\n\n".join(cluster_blocks),
+            )
+            reduce_sys_prompt = CLUSTER_REDUCE_SYSTEM_PROMPT
+            self._save_payload_text(
+                "stage_01_master_theme_reduce.txt",
+                f"=== SYSTEM PROMPT ===\n{reduce_sys_prompt}\n\n=== USER PROMPT ===\n{reduce_user_prompt}",
+            )
+        else:
+            cluster_blocks = []
+            for grp in exemplar_groups:
+                lines = [f"   - {ex['title']}: {ex['description']}" for ex in grp["exemplars"]]
+                cluster_blocks.append(
+                    f"### Cluster #{grp['cluster_id'] + 1} ({grp['theme_count']} themes, {grp['percentage']}% of corpus)\n"
+                    f"Top Prototypical Themes (Ranked by Centroid Proximity):\n" + "\n".join(lines)
+                )
+            reduce_user_prompt = MASTER_THEME_CLUSTERED_USER_PROMPT.format(
+                cluster_count=len(exemplar_groups),
+                cluster_exemplars_block="\n\n".join(cluster_blocks),
+            )
+            reduce_sys_prompt = MASTER_THEME_CLUSTERED_SYSTEM_PROMPT
+            self._save_payload_text(
+                "stage_01_master_theme_synthesis.txt",
+                f"=== SYSTEM PROMPT ===\n{reduce_sys_prompt}\n\n=== USER PROMPT ===\n{reduce_user_prompt}",
+            )
+
+        reduce_template = {
+            "version": "1.0",
+            "task": "master_reduce",
+            "system_prompt": reduce_sys_prompt,
+            "prompt": "{{ text }}\n\n{schema_block}",
+        }
+        reduce_results = self.prism.run(
+            task="extract",
+            input_data=reduce_user_prompt,
+            schema_cls=MasterThemeSynthesisResult,
+            prompt_template=reduce_template,
+            system_prompt=reduce_sys_prompt,
+            chunk=False,
+            as_array=False,
+            batch_size=1,
+            max_new_tokens=MASTER_SYNTHESIS_MAX_NEW_TOKENS,
+            temperature=TEMPERATURE,
+            constrain_json=CONSTRAIN_JSON,
+            dry_run=dry_run,
+        )
+        if dry_run:
+            return None
+
+        master_res: Optional[MasterThemeSynthesisResult] = None
+        for r in reduce_results:
+            for it in (r.get("extracted_items") or r.get("parsed_items") or []):
+                if isinstance(it, MasterThemeSynthesisResult):
+                    master_res = it
+                    break
+                if isinstance(it, dict):
+                    try:
+                        master_res = MasterThemeSynthesisResult.model_validate(it)
+                        break
+                    except Exception:
+                        pass
+
+        if master_res is None:
+            fallback_titles = [
+                c.candidate_title for c in self.context.cluster_candidates
+            ] or [
+                grp["exemplars"][0]["title"] if grp["exemplars"] else f"Theme {grp['cluster_id'] + 1}"
+                for grp in exemplar_groups
+            ]
+            master_res = MasterThemeSynthesisResult(
+                master_domain=DOMAIN,
+                master_themes=fallback_titles,
+            )
+
+        cleaned_themes = []
+        for t in master_res.master_themes:
+            c_str = re.sub(r"^(?:Cluster\s*\d+[\s:.-]*|\d+[\s:.-]+)", "", str(t)).strip()
+            cleaned_themes.append(c_str if c_str else str(t))
+        master_res.master_themes = cleaned_themes
+        self.context.master_themes = master_res
+
+        with open(master_path, "w", encoding="utf-8") as f:
+            f.write(master_res.model_dump_json(indent=2))
+
+        cluster_engine.export_clustering_summary(
+            master_themes=master_res.master_themes,
+            master_domain=master_res.master_domain,
+        )
+        self._export_cluster_theme_mapping(active_partition, master_res.master_themes)
+        return master_res
+
+    # =========================================================================
+    # PHASE 3: GLOBAL SVO TRIPLE EXTRACTION & AGGREGATION
+    # =========================================================================
+
+    def extract_triples_across_documents(
+        self,
+        documents: List[Dict[str, str]],
+        dry_run: bool = DRY_RUN,
+    ) -> List[Dict[str, Any]]:
+        """
+        Phase 3: Extract atomic (Subject, Predicate, Object) triples across all documents
+        using Master Themes context and verbatim source_quote grounding.
+        """
+        print(f"\n=== Phase 3: Global Triple Extraction (Model: {MODEL_NAME}) ===")
+        if not self.context.master_themes:
+            self.load_master_themes()
+
+        if self.context.master_themes and self.context.master_themes.master_themes:
+            theme_list = ", ".join([f'"{t}"' for t in self.context.master_themes.master_themes])
+            sys_context = f'\nAllowed theme_association values: [{theme_list}, "Other"]'
+        else:
+            sys_context = '\nAllowed theme_association values: ["Other"]'
+
+        full_sys_prompt = f"{TRIPLE_EXTRACTION_SYSTEM_PROMPT}\n{sys_context}"
+
+        chunk_rows: List[Dict[str, Any]] = []
+        pending_doc_ids: List[str] = []
+
+        for doc in documents:
+            doc_id = doc["id"]
+            self.context.processed_documents.add(doc_id)
+            safe_name = self.sanitize_filename(doc_id)
+            triple_file_path = self.triples_dir / f"{safe_name}_triplets.json"
+
+            if RESUME_MODE == "skip" and triple_file_path.exists():
+                print(f"-> Skipping triple extraction for: {doc_id} (already exists on disk)")
+                continue
+
+            print(f"-> Extracting triples from: {doc_id}")
+            pending_doc_ids.append(doc_id)
+            triple_chunks = self.chunk_text(doc["text"], TRIPLE_CHUNK_MAX_WORDS)
+            for chunk_idx, (chunk_str, start_w, end_w) in enumerate(triple_chunks):
+                user_prompt = TRIPLE_EXTRACTION_USER_PROMPT.format(text_content=chunk_str)
+                self._save_payload_text(
+                    "stage_01_triple_extraction.txt",
+                    f"=== SYSTEM PROMPT ===\n{full_sys_prompt}\n\n=== USER PROMPT ===\n{user_prompt}",
+                )
+                chunk_rows.append({
+                    "chunk_uid": f"{doc_id}__tchunk_{chunk_idx}",
+                    "doc_id": doc_id,
+                    "start_word": start_w,
+                    "end_word": end_w,
+                    "text": chunk_str,
+                })
+
+        if not chunk_rows:
+            return self.aggregate_triplets()
+
+        triple_template = {
+            "version": "1.0",
+            "task": "triple_extraction",
+            "system_prompt": full_sys_prompt,
+            "prompt": f"{TRIPLE_EXTRACTION_USER_PROMPT.replace('{text_content}', '{{ text }}')}\n\n{{schema_block}}",
+        }
+
+        results = self.prism.run(
+            task="extract",
+            input_data=chunk_rows,
+            text_column="text",
+            id_column="chunk_uid",
+            schema_cls=TripleExtractionResult,
+            prompt_template=triple_template,
+            system_prompt=full_sys_prompt,
+            chunk=False,
+            as_array=False,
+            max_new_tokens=TRIPLE_MAX_NEW_TOKENS,
+            temperature=TEMPERATURE,
+            constrain_json=CONSTRAIN_JSON,
+            dry_run=dry_run,
+        )
+
+        if dry_run:
+            return self.context.raw_triples
+
+        triples_by_doc: Dict[str, List[Dict[str, Any]]] = {doc_id: [] for doc_id in pending_doc_ids}
+        allowed_themes = set(self.context.master_themes.master_themes) if (self.context.master_themes and self.context.master_themes.master_themes) else set()
+
+        for row_meta, res in zip(chunk_rows, results):
+            doc_id = row_meta["doc_id"]
+            items = res.get("extracted_items") or res.get("parsed_items") or []
+            extracted_triples: List[RawTriple] = []
+
+            for item in items:
+                if isinstance(item, TripleExtractionResult):
+                    extracted_triples.extend(item.triples)
+                elif isinstance(item, RawTriple):
+                    extracted_triples.append(item)
+                elif isinstance(item, dict):
+                    try:
+                        parsed_tr = TripleExtractionResult.model_validate(item)
+                        extracted_triples.extend(parsed_tr.triples)
+                    except Exception:
+                        pass
+
+            for t in extracted_triples:
+                t_dict = t.model_dump()
+                if allowed_themes and t_dict.get("theme_association") not in allowed_themes:
+                    t_dict["theme_association"] = "Other"
+                t_dict["source_document"] = doc_id
+                triples_by_doc[doc_id].append(t_dict)
+
+        for doc_id, doc_triples in triples_by_doc.items():
+            safe_name = self.sanitize_filename(doc_id)
+            with open(self.triples_dir / f"{safe_name}_triplets.json", "w", encoding="utf-8") as f:
+                json.dump(doc_triples, f, indent=2)
+
+        return self.aggregate_triplets()
+
+    def aggregate_triplets(self) -> List[Dict[str, Any]]:
+        """Phase 3.5: Consolidate all *_triplets.json files into original_triplets.json and triplet_counts.csv."""
+        print("\n=== Phase 3.5: Triple Aggregation ===")
+        all_triples: List[Dict[str, Any]] = []
+        processed_docs: Set[str] = set()
+
+        for fpath in sorted(self.triples_dir.glob("*_triplets.json")):
+            try:
+                triples_data = json.loads(fpath.read_text(encoding="utf-8"))
+                all_triples.extend(triples_data)
+                for t in triples_data:
+                    doc = t.get("source_document")
+                    if doc:
+                        processed_docs.add(doc)
+            except Exception as e:
+                print(f"Warning: Failed to load triplet file {fpath.name}: {e}")
+
+        self.context.raw_triples = all_triples
+        self.context.processed_documents = processed_docs
+
+        with open(self.out_dir / "original_triplets.json", "w", encoding="utf-8") as f:
+            json.dump(all_triples, f, indent=2)
+
+        counts = {doc: 0 for doc in processed_docs}
+        for t in all_triples:
+            doc = t.get("source_document", "unknown")
+            counts[doc] = counts.get(doc, 0) + 1
+
+        csv_path = self.out_dir / "triplet_counts.csv"
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("document_name,triplet_count\n")
+            for doc, count in sorted(counts.items()):
+                f.write(f"{doc},{count}\n")
+
+        return all_triples
+
+    # =========================================================================
+    # FULL STAGE 1 ORCHESTRATOR
+    # =========================================================================
+
+    def run_stage_1(
+        self,
+        input_data: Optional[Union[str, Path, pd.DataFrame, List[Dict[str, Any]]]] = None,
+        dry_run: bool = DRY_RUN,
+    ) -> Dict[str, Any]:
+        """Execute Stage 1 Part 1 (Themes & Master Synthesis) and Stage 1 Part 2 (SVO Triples)."""
+        print("=== SemanticPrism Stage 1: Full Extraction Pipeline ===")
+        stage_start = time.time()
+
+        if RESUME_MODE != "skip":
+            self.clear_stage_logs()
+
+        documents = self.load_input_documents(input_path=input_data)
+        print(f"Found {len(documents)} document(s) to process.\n")
+
+        # Part 1: Theme Discovery, Aggregation, Empirical Clustering & Master Synthesis
+        self.discover_themes_across_documents(documents, dry_run=dry_run)
+        self.synthesize_master_themes(dry_run=dry_run)
+        if MANAGE_VRAM:
+            clear_device_memory()
+
+        # Part 2: SVO Triple Extraction & Aggregation
+        self.extract_triples_across_documents(documents, dry_run=dry_run)
+        if MANAGE_VRAM:
+            clear_device_memory()
+
+        total_duration = time.time() - stage_start
+        print("\n" + "=" * 60)
+        print("STAGE 1 FULL EXTRACTION PIPELINE COMPLETE!")
+        print(f"Total Stage 1 Time: {total_duration:.2f} seconds")
+        print(f"Outputs saved in '{self.out_dir}':")
+        print(" - all_themes.json")
+        print(" - clustering_summary.json")
+        print(" - cluster_candidates.json")
+        print(" - master_themes.json")
+        print(" - theme_mapping_clusters.json")
+        print(" - original_triplets.json")
+        print(" - triplet_counts.csv")
+        print("=" * 60 + "\n")
+
+        return {
+            "themes_count": len(self.context.all_discovered_themes),
+            "master_themes": self.context.master_themes.model_dump() if self.context.master_themes else None,
+            "triples_count": len(self.context.raw_triples),
+            "output_dir": str(self.out_dir),
+        }
+
+
+def main() -> None:
+    pipeline = SemanticPrismStage1Pipeline()
+    pipeline.run_stage_1()
+
+
+if __name__ == "__main__":
+    main()

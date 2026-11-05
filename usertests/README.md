@@ -14,6 +14,9 @@ python usertests/01_quickstart_and_hardware.py --live
 # Test Pandas DataFrame extraction, custom classification variables, and sliding-window chunking
 python usertests/02_custom_schemas_and_dataframes.py
 python usertests/02_custom_schemas_and_dataframes.py --live
+
+# Run the SemanticPrism Stage 1 Extraction pipeline (Theme Discovery, Master Synthesis, and SVO Triples)
+python usertests/SemanticPrism1.py
 ```
 
 ## 2. Jupyter Notebook (`.ipynb`)

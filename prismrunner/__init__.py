@@ -82,6 +82,9 @@ __all__ = [
     "create_length_buckets",
     "restore_original_order",
     "EXTRACTION_GEN_CONFIG",
+    "DEFAULT_MODEL_NAME",
+    "configure_hardware_backends",
+    "resolve_optimal_attention",
     "JsonBracketStoppingCriteria",
     "is_json_bracket_balanced",
 ]
