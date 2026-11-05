@@ -290,9 +290,19 @@ def generate_hardware_advisory(
     max_new_tokens: int = 512,
 ) -> Dict[str, Any]:
     """Provide continuous, device-relative recommendations for batch sizes, precision, and chunking."""
-    budget = ContextBudget(model_context_limit=context_limit, max_new_tokens=max_new_tokens)
-    safe_input = budget.max_input_tokens
-    rec_batch = resolve_dynamic_batch_size(device=device, requested_batch_size="auto", max_new_tokens=max_new_tokens)
+    effective_max_new = min(max_new_tokens, max(32, context_limit // 2))
+    try:
+        budget = ContextBudget.from_tokenizer(
+            tokenizer=None,
+            context_limit=context_limit,
+            max_new_tokens=effective_max_new,
+        )
+        safe_input = budget.max_input_tokens
+        reserved = budget.reserved_tokens
+    except ValueError:
+        safe_input = max(64, context_limit // 2)
+        reserved = max(0, context_limit - safe_input)
+    rec_batch = resolve_dynamic_batch_size(device=device, requested_batch_size="auto", max_new_tokens=effective_max_new)
 
     if device.type == "cuda" and torch.cuda.is_available():
         props = torch.cuda.get_device_properties(device)
@@ -325,7 +335,7 @@ def generate_hardware_advisory(
         "recommended_batch_size": rec_batch,
         "recommended_chunk_size": rec_chunk,
         "max_safe_input_tokens": safe_input,
-        "reserved_budget_tokens": budget.reserved_tokens,
+        "reserved_budget_tokens": reserved,
     }
 
 
@@ -681,6 +691,12 @@ class JsonBracketStoppingCriteria(StoppingCriteria):
         self.response_prefix = response_prefix.strip() if response_prefix else "["
         self.open_char = "{" if self.response_prefix.startswith("{") else "["
         self.close_char = "}" if self.open_char == "{" else "]"
+        if isinstance(eos_token_id, (list, tuple, set)):
+            self.eos_token_ids = {int(x) for x in eos_token_id if x is not None}
+        elif eos_token_id is not None:
+            self.eos_token_ids = {int(eos_token_id)}
+        else:
+            self.eos_token_ids = set()
         self.eos_token_id = eos_token_id
         self._token_has_close: Dict[int, bool] = {}
         self._finished: Optional[List[bool]] = None
@@ -713,7 +729,7 @@ class JsonBracketStoppingCriteria(StoppingCriteria):
                 if self._finished[idx]:
                     continue
                 last_tid = int(last_tokens[idx])
-                if self.eos_token_id is not None and last_tid == self.eos_token_id:
+                if last_tid in self.eos_token_ids:
                     self._finished[idx] = True
                     continue
                 if self._has_closing_char(last_tid):
@@ -736,7 +752,7 @@ class JsonBracketStoppingCriteria(StoppingCriteria):
             for idx, text in enumerate(decoded_batch):
                 if self._finished[idx]:
                     continue
-                if self.eos_token_id is not None and (gen_slice[idx] == self.eos_token_id).any():
+                if self.eos_token_ids and any(int(t) in self.eos_token_ids for t in gen_slice[idx].tolist()):
                     self._finished[idx] = True
                     continue
                 candidate = text.lstrip()

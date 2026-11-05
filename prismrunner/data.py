@@ -155,14 +155,27 @@ class DatasetLoader:
         else:
             chosen_id_col = _detect_id_column(cols)
 
+        def _is_scalar_na(val: Any) -> bool:
+            if val is None:
+                return True
+            if isinstance(val, (list, tuple, dict, set)) or hasattr(val, "__len__") and not isinstance(val, (str, bytes)):
+                return False
+            try:
+                res = pd.isna(val)
+                return bool(res) if isinstance(res, (bool, int)) else False
+            except Exception:
+                return False
+
         records: List[Record] = []
         for idx, row_dict in enumerate(df.to_dict(orient="records")):
-            rec_id = str(row_dict[chosen_id_col]) if chosen_id_col and pd.notna(row_dict.get(chosen_id_col)) else f"rec_{idx + 1:06d}"
-            text_val = str(row_dict.get(chosen_text_col, ""))
+            raw_id = row_dict.get(chosen_id_col) if chosen_id_col else None
+            rec_id = str(raw_id) if (chosen_id_col and not _is_scalar_na(raw_id)) else f"rec_{idx + 1:06d}"
+            raw_text = row_dict.get(chosen_text_col, "")
+            text_val = "" if _is_scalar_na(raw_text) else str(raw_text)
 
             meta = {}
             for k, v in row_dict.items():
-                if k == chosen_text_col or pd.isna(v):
+                if k == chosen_text_col or _is_scalar_na(v):
                     continue
                 if metadata_columns is not None and k not in metadata_columns:
                     continue

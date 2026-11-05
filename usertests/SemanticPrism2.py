@@ -63,14 +63,19 @@ from prismrunner import (
 # GLOBAL CONFIGURATION VARIABLES
 # =============================================================================
 
-# 1. LLM & Hardware Settings (PrismRunner Backend)
-MODEL_NAME: str = "Qwen/Qwen2.5-3B-Instruct"   # Hugging Face model ID or local path (e.g., "Qwen/Qwen3.6-27B")
+# 1. Generative LLM & Embedding Model Settings
+#    - MODEL_NAME      : Generative Causal LLM used in Step 3 for Taxonomic Hypernym Lifting (e.g., "Qwen/Qwen3.6-27B")
+#    - EMBEDDING_MODEL : SentenceTransformer vector encoder used in Step 2 (SVO clustering) & Step 4 (sentence fidelity)
+#                        (e.g., "all-MiniLM-L6-v2" [384d] or "BAAI/bge-large-en-v1.5" [1024d])
+MODEL_NAME: str = "Qwen/Qwen2.5-3B-Instruct"   # Generative LLM for Step 3 Hypernym Lifting (e.g., "Qwen/Qwen3.6-27B")
+EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"      # Vector encoder for Step 2 & 4 (e.g., "BAAI/bge-large-en-v1.5")
 DEVICE: str = "auto"                           # "auto", "cuda", "mps", or "cpu"
 TORCH_DTYPE: str = "auto"                      # "auto", "bfloat16", "float16", or "float32"
 LOAD_IN_4BIT: bool = False                     # Enable 4-bit NF4 quantization (CUDA bitsandbytes)
 LOAD_IN_8BIT: bool = False                     # Enable 8-bit quantization (CUDA bitsandbytes)
 ATTN_IMPLEMENTATION: str = "auto"              # "auto", "flash_attention_2", "sdpa", or "eager"
 BATCH_SIZE: Union[int, str] = "auto"           # "auto" (continuous device-relative) or explicit int (e.g., 8)
+EMBEDDING_BATCH_SIZE: Union[int, str] = "auto" # "auto" (dynamically sized from device memory) or explicit int (e.g., 128)
 TEMPERATURE: float = 0.0                       # 0.0 for deterministic greedy decoding
 CONSTRAIN_JSON: bool = True                    # Force JSON '{' prefix & bracket-balanced early stopping
 MANAGE_VRAM: bool = True                       # Flush and offload GPU/MPS memory between embedding & LLM steps
@@ -90,9 +95,7 @@ DOMAIN: str = "auto"                           # "auto" (load master_domain from
 CONTEXT_WINDOW_CAP: Union[int, str] = "auto"   # "auto" (detect from model config via PrismRunner) or integer token cap
 LIFT_MAX_NEW_TOKENS: int = 256                 # Max generated tokens per TaxonomicVerification JSON response
 
-# 4. Embedding & SVO Taxonomic Lifting Controls (Stage 2 Hypernym Resolution)
-EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"      # SentenceTransformer model for SVO clustering & sentence grounding
-EMBEDDING_BATCH_SIZE: Union[int, str] = "auto" # "auto" (dynamically sized from device memory) or explicit int (e.g., 128)
+# 4. SVO Taxonomic Lifting Controls (Stage 2 Hypernym Resolution)
 ENABLE_TAXONOMIC_LIFTING: bool = True          # Master switch for taxonomic lifting pipeline
 LIFT_SUBJECTS: bool = True                     # Abstract entity subjects into canonical hypernyms
 LIFT_PREDICATES: bool = False                  # Abstract relational predicates into canonical hypernyms
@@ -327,6 +330,16 @@ class RefinementPipeline:
 
         self.embedding_model = None
         self.embedding_model_name = EMBEDDING_MODEL
+
+        # Guard against putting an encoder-only embedding model into MODEL_NAME instead of EMBEDDING_MODEL
+        _lower_llm = str(MODEL_NAME).lower()
+        if any(pat in _lower_llm for pat in ("bge-", "minilm", "mpnet", "sentence-transformers/", "e5-", "nomic-embed")):
+            raise ValueError(
+                f"MODEL_NAME is set to '{MODEL_NAME}', which is an encoder-only embedding model (not a generative LLM).\n"
+                f"In SemanticPrism2.py:\n"
+                f"  - Set EMBEDDING_MODEL = \"{MODEL_NAME}\"  (for Step 2 SVO clustering & Step 4 sentence vectors)\n"
+                f"  - Set MODEL_NAME      = \"Qwen/Qwen3.6-27B\" (or another generative LLM for Step 3 Taxonomic Lifting)"
+            )
 
         # Clear previous error log if starting fresh
         log_file = self.log_dir / "stage_02_refinement_errors.json"
@@ -1037,7 +1050,7 @@ class RefinementPipeline:
                 "fallback_candidates": fallback_candidates,
                 "text": user_prompt,
             }
-            pending_rows.append(row_meta)
+            pending_rows.append({"uid": uid, "label": label, "text": user_prompt})
             pending_meta_by_uid[uid] = row_meta
 
         if not pending_rows:
