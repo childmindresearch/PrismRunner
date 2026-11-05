@@ -352,18 +352,23 @@ def resolve_dynamic_batch_size(
     dev_type = device.type if device is not None else "cpu"
 
     if dev_type == "cuda" and torch.cuda.is_available():
+        allocated_gb = 6.0
         try:
+            allocated_gb = max(2.0, torch.cuda.memory_allocated(device) / (1024 ** 3))
             free_bytes, _ = torch.cuda.mem_get_info(device)
             usable_gb = (free_bytes / (1024 ** 3)) * 0.75
         except Exception:
             try:
                 total_bytes = torch.cuda.get_device_properties(device).total_memory
                 allocated_bytes = torch.cuda.memory_allocated(device)
+                allocated_gb = max(2.0, allocated_bytes / (1024 ** 3))
                 usable_gb = max(1.0, ((total_bytes - allocated_bytes) / (1024 ** 3)) * 0.75)
             except Exception:
                 usable_gb = 6.0
 
-        per_seq_gb = max(0.12, est_seq_tokens * 0.00018)
+        # Scale per-token KV-cache + activation footprint with loaded model weight size
+        gb_per_token = max(0.00020, allocated_gb * 0.000012)
+        per_seq_gb = max(0.15, est_seq_tokens * gb_per_token)
         return max(1, min(max_batch_size, int(usable_gb // per_seq_gb)))
 
     if dev_type == "mps":
@@ -390,16 +395,20 @@ def get_context_window(
     model_or_config: Any,
     tokenizer: Optional[PreTrainedTokenizerBase] = None,
 ) -> int:
-    """Dynamically inspect model/config and tokenizer to determine context window length."""
+    """Dynamically inspect model/config (including nested text_config) and tokenizer for context window length."""
     cfg = getattr(model_or_config, "config", model_or_config)
-    for attr in ("max_position_embeddings", "seq_length", "n_positions", "max_sequence_length", "sliding_window"):
-        val = getattr(cfg, attr, None)
-        if val and isinstance(val, int) and 512 <= val <= 1_000_000:
-            return val
+    text_cfg = getattr(cfg, "text_config", None)
+    for target_cfg in (cfg, text_cfg):
+        if target_cfg is None:
+            continue
+        for attr in ("max_position_embeddings", "seq_length", "n_positions", "max_sequence_length", "sliding_window"):
+            val = getattr(target_cfg, attr, None)
+            if val and isinstance(val, int) and 512 <= val <= 2_000_000:
+                return val
 
     if tokenizer is not None:
         tok_max = getattr(tokenizer, "model_max_length", None)
-        if tok_max and isinstance(tok_max, int) and 512 <= tok_max <= 1_000_000:
+        if tok_max and isinstance(tok_max, int) and 512 <= tok_max <= 2_000_000:
             return tok_max
     return 4096
 
@@ -492,6 +501,17 @@ def load_model_and_tokenizer(
                 compat_kwargs = dict(kwargs)
                 compat_kwargs["torch_dtype"] = compat_kwargs.pop("dtype")
                 return AutoModelForCausalLM.from_pretrained(model_name_or_path, **compat_kwargs)
+            raise
+        except ValueError as exc:
+            if "Unrecognized configuration class" in str(exc):
+                import transformers as _tf
+                for auto_cls_name in ("AutoModelForImageTextToText", "AutoModelForMultimodalLM"):
+                    auto_cls = getattr(_tf, auto_cls_name, None)
+                    if auto_cls is not None:
+                        try:
+                            return auto_cls.from_pretrained(model_name_or_path, **kwargs)
+                        except ValueError:
+                            continue
             raise
 
     try:
@@ -781,14 +801,24 @@ class BatchInferenceEngine:
         """Render messages via tokenizer.apply_chat_template with optional JSON prefix pre-filling."""
         rendered = None
         if hasattr(self.tokenizer, "apply_chat_template") and self.tokenizer.chat_template is not None:
+            template_kwargs: Dict[str, Any] = {
+                "tokenize": False,
+                "add_generation_prompt": True,
+            }
+            if response_prefix and "enable_thinking" in str(self.tokenizer.chat_template):
+                template_kwargs["enable_thinking"] = False
             try:
-                candidate = self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
+                candidate = self.tokenizer.apply_chat_template(messages, **template_kwargs)
                 if isinstance(candidate, str):
                     rendered = candidate
+            except TypeError:
+                template_kwargs.pop("enable_thinking", None)
+                try:
+                    candidate = self.tokenizer.apply_chat_template(messages, **template_kwargs)
+                    if isinstance(candidate, str):
+                        rendered = candidate
+                except Exception as e:
+                    logger.debug(f"apply_chat_template raised {e}, falling back to ChatML formatting")
             except Exception as e:
                 logger.debug(f"apply_chat_template raised {e}, falling back to ChatML formatting")
 
@@ -799,6 +829,9 @@ class BatchInferenceEngine:
             rendered += "<|im_start|>assistant\n"
 
         if response_prefix:
+            # Ensure Qwen3 / Qwen3.5 open <think> prompt suffix is closed before pre-filling JSON bracket
+            if rendered.rstrip().endswith("<think>"):
+                rendered = rendered.rstrip() + "\n</think>\n\n"
             rendered += response_prefix
         return rendered
 
