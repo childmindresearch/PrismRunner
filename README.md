@@ -165,7 +165,7 @@ PrismRunner/
 │   ├── prompt.py     # Default task prompts and PromptTemplate renderer
 │   ├── pipeline.py   # PrismPipeline end-to-end orchestrator
 │   └── cli.py        # Optional CLI (`prismrunner classify|extract|summarize|inspect-model`)
-├── usertests/        # Runnable user walkthroughs (.py scripts, SemanticPrism1.py & .ipynb Notebook)
+├── usertests/        # Runnable user walkthroughs (.py scripts, SemanticPrism1/2/4.py & .ipynb Notebook)
 ├── tests/            # Unit & mocked integration test suite
 ├── requirements.txt  # Core, clustering & optional CUDA kernel dependencies
 └── pyproject.toml    # Package metadata, optional [cuda] & [dev] extras, and pytest config
@@ -188,5 +188,6 @@ python usertests/01_quickstart_and_hardware.py
 python usertests/02_custom_schemas_and_dataframes.py
 python usertests/SemanticPrism1.py
 python usertests/SemanticPrism2.py
+python usertests/SemanticPrism4.py
 # Or open usertests/03_interactive_walkthrough.ipynb in Jupyter / VS Code
 ```

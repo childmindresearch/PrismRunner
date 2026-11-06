@@ -21,6 +21,10 @@ python usertests/SemanticPrism1.py
 # Run the SemanticPrism Stage 2 Refinement pipeline (Two-Tier SVO Clustering, Taxonomic Hypernym Lifting, and Contextual Fidelity)
 python usertests/SemanticPrism2.py
 python usertests/SemanticPrism2.py --fidelity-only
+
+# Run the SemanticPrism Stage 4 Synthesis pipeline (Target Resolution, Enum Clustering, Community Schema Synthesis, and Master Ontology Consolidation)
+python usertests/SemanticPrism4.py
+python usertests/SemanticPrism4.py --dry-run
 ```
 
 ### `SemanticPrism1.py` Highlights
