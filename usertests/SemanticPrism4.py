@@ -99,21 +99,23 @@ except ImportError:
 #                       (e.g., "BAAI/bge-large-en-v1.5" [1024d] or "all-MiniLM-L6-v2" [384d]).
 
 # --- 1. Generative LLM, Embedding Model & Hardware Settings ---
-MODEL_NAME: str = "Qwen/Qwen2.5-Coder-14B-Instruct"  # Causal/Coding LLM for Stage 4 Schema Synthesis
-EMBEDDING_MODEL: str = "BAAI/bge-large-en-v1.5"      # Vector encoder for Phase 0 & Phase 1 concept vectors
-DEVICE: str = "auto"                                 # "auto", "cuda", "mps", or "cpu"
-TORCH_DTYPE: str = "auto"                            # "auto", "bfloat16", "float16", or "float32"
-LOAD_IN_4BIT: bool = False                           # Enable 4-bit NF4 quantization (CUDA bitsandbytes)
-LOAD_IN_8BIT: bool = False                           # Enable 8-bit quantization (CUDA bitsandbytes)
-ATTN_IMPLEMENTATION: str = "auto"                    # "auto", "flash_attention_2", "sdpa", or "eager"
-BATCH_SIZE: Union[int, str] = "auto"                 # "auto" (continuous device-relative) or explicit int
-EMBEDDING_BATCH_SIZE: Union[int, str] = "auto"       # "auto" (dynamically sized from device memory) or explicit int
-CONTEXT_WINDOW_CAP: Union[int, str] = 16384          # Context window cap for synthesis & consolidation ("auto" or int)
-MAX_NEW_TOKENS: int = 4096                           # Max generated tokens per synthesized Python schema module
-TEMPERATURE: float = 0.0                             # 0.0 for deterministic greedy decoding
-CONSTRAIN_JSON: bool = True                          # Force JSON '{' prefix & bracket-balanced early stopping
-MANAGE_VRAM: bool = True                             # Flush and offload GPU/MPS memory between embedding & LLM phases
-DRY_RUN: bool = False                                # Set True to preview prompts without running LLM generation
+MODEL_NAME: str = "Qwen/Qwen3-Coder-30B-A3B-Instruct"  # Causal/Coding LLM for Stage 4 (256K native context)
+EMBEDDING_MODEL: str = "BAAI/bge-large-en-v1.5"        # Vector encoder for Phase 0 & Phase 1 concept vectors
+DEVICE: str = "auto"                                   # "auto", "cuda", "mps", or "cpu"
+TORCH_DTYPE: str = "auto"                              # "auto", "bfloat16", "float16", or "float32"
+LOAD_IN_4BIT: bool = False                             # Enable 4-bit NF4 quantization (CUDA bitsandbytes)
+LOAD_IN_8BIT: bool = False                             # Enable 8-bit quantization (CUDA bitsandbytes)
+ATTN_IMPLEMENTATION: str = "auto"                      # "auto", "flash_attention_2", "sdpa", or "eager"
+BATCH_SIZE: Union[int, str] = "auto"                   # "auto" (continuous device-relative) or explicit int
+EMBEDDING_BATCH_SIZE: Union[int, str] = "auto"         # "auto" (dynamically sized from device memory) or explicit int
+CONTEXT_WINDOW_CAP: Union[int, str] = "auto"           # "auto" = full native model context window (e.g. 262,144 tokens), or int cap
+MAX_NEW_TOKENS: int = 16384                            # Max generated tokens per Phase 1/2 schema module
+CONSOLIDATION_MAX_NEW_TOKENS: int = 32768              # Max generated tokens for Phase 3/4 consolidated master ontologies
+TEMPERATURE: float = 0.0                               # 0.0 for deterministic greedy decoding
+REPETITION_PENALTY: float = 1.08                       # Mild penalty to prevent combinatorial Enum repetition loops
+CONSTRAIN_JSON: bool = True                            # Force JSON '{' prefix & bracket-balanced early stopping
+MANAGE_VRAM: bool = True                               # Flush and offload GPU/MPS memory between embedding & LLM phases
+DRY_RUN: bool = False                                  # Set True to preview prompts without running LLM generation
 
 # --- 2. Input & Output Paths ---
 REFINED_TRIPLETS_PATH: str = "outputs/02_refinement/refined_triplets.json"
@@ -134,18 +136,22 @@ RESUME_EXISTING_SCHEMAS: bool = False                # If True, skips Phase 2 ta
 EXECUTION_MODE: str = "community"
 SCHEMA_PASS_MODE: str = "both"                       # "both", "normalized", or "raw"
 PAYLOAD_VALUES_MODE: str = "raw_text"                # "raw_text", "triples", or "both"
-MIN_CLUSTER_SIZE: int = 5                            # Minimum entity count required for a community to receive its own schema
-MAX_TRIPLETS_PER_TARGET: int = 2000                  # Upper cap on ranked SVO triplets evaluated per community target
+MIN_CLUSTER_SIZE: int = 15                           # Minimum entity count required for a community to receive its own schema
+MAX_TRIPLETS_PER_TARGET: int = 1200                  # Maximum triplets per schema target payload (PageRank intra-community cap)
 
-# --- 4. Orphan & Enum Vector Clustering (Phase 1: enums.py) ---
+# --- 4. Orphan & Enum Vector Clustering & Atomic Bounds (Phase 1: enums.py) ---
 ENUM_CLUSTERING_ENABLED: bool = True
-ENUM_MIN_CLUSTER_SIZE: int = 3
-ENUM_DISTANCE_THRESHOLD: float = 0.35
-ENUM_MIN_COHESION_SCORE: float = 0.65
+ENUM_MIN_CLUSTER_SIZE: int = 4
+ENUM_DISTANCE_THRESHOLD: float = 0.48
+ENUM_MIN_COHESION_SCORE: float = 0.55
 ENUM_MAX_CLUSTERS_PER_BATCH: int = 25
+ENUM_MAX_TERMS_PER_CLUSTER: int = 15                 # Max candidate terms fed per Enum cluster
+MAX_ENUM_MEMBER_WORDS: int = 4                       # Max words per Enum member identifier (<= 3 underscores)
+MAX_ENUM_MEMBER_CHARS: int = 35                      # Max character length per Enum member identifier
+MAX_ENUM_MEMBERS_PER_CLASS: int = 12                 # Max distinct members allowed per Enum class
 
 # --- 5. Domain Term Scoring (C-TF-IDF) ---
-TOP_DOMAIN_TERMS_COUNT: int = 12
+TOP_DOMAIN_TERMS_COUNT: int = 5
 DOMAIN_TERMS_IDF_EXPONENT: float = 1.5
 DOMAIN_TERMS_MULTI_WORD_BOOST: float = 1.2
 GENERIC_EXCLUSIONS: List[str] = [
@@ -238,14 +244,18 @@ You will receive `candidate_clusters`, each containing:
 
 CRITICAL MODELING RULES:
 1. **Lean into Slight Semantic Abstraction:** Do NOT mechanically transcribe hyper-specific, anecdotal, or idiosyncratic phrases verbatim (e.g., avoid `FOUR_HOURS_OF_SLEEP_IN_FORTY_EIGHT_HOURS` or `TAKING_MEDS_WITH_MY_PRISTIQ`). Instead, abstract them into canonical, generalizable domain concepts (e.g., `ACUTE_SLEEP_DEPRIVATION`, `MORNING_ADMINISTRATION`).
-2. **Consolidate Synonyms:** Group terms sharing the same core meaning into a single standardized Enum member or Literal option.
-3. **Discard Outliers:** If a term is an ungeneralizable conversational fragment, discard it.
-4. **Valid Python Identifiers & Typing:**
+2. **Strict Atomic Enum Bounds (NO Sentence Fragments or Permutations):**
+   - Each `Enum` member identifier MUST be an atomic concept of **at most 4 words (`<= 3` underscores, `<= 35` characters)**, such as `VERY_LOW`, `LOW`, `LOW_AVERAGE`, `AVERAGE`, `HIGH_AVERAGE`, `VERY_HIGH`, or `WITHIN_NORMAL_LIMITS`.
+   - NEVER emit conversational or prepositional phrase permutations such as `WITHIN_THE_AVERAGE_RANGE_FOR_HIS_AGE_GROUP...`, `..._AS_COMPARED_TO_SAME_AGED_PEERS`, or `..._FOR_THE_SPELLING_SUBTEST`.
+   - Each `Enum` class MUST contain **at most 10 distinct members**.
+3. **Consolidate Synonyms:** Group terms sharing the same core meaning into a single standardized Enum member or Literal option.
+4. **Discard Outliers:** If a term is an ungeneralizable conversational fragment, discard it.
+5. **Valid Python Identifiers & Typing:**
    - Define Enums inheriting from `(str, Enum)` for seamless serialization (e.g., `class SymptomSeverity(str, Enum):`).
    - Class names MUST use `PascalCase`.
    - Enum member names MUST be valid Python identifiers in `UPPER_SNAKE_CASE` (alphanumeric and underscores only).
    - Use clean, human-readable string values for members.
-5. **Self-Contained Code:** The code must include all required imports (`from enum import Enum`, `from typing import Literal`).
+6. **Self-Contained Code:** The code must include all required imports (`from enum import Enum`, `from typing import Literal`).
 
 OUTPUT SCHEMA INSTRUCTIONS:
 Return a JSON object conforming to the GeneratedModule schema:
@@ -265,7 +275,10 @@ INPUT STRUCTURE:
 CRITICAL MODELING RULES:
 1. **Synthesize Domain Workflows, Do Not Transcribe:** Do NOT mechanically turn every term into a separate class. Step back, understand the domain narrative, and design 1 or more intuitive, cohesive Pydantic `BaseModel` classes modeling the core subject matter (e.g., ClinicalEvaluation, AssessmentProtocol, PatientCondition).
 2. **Model Real-World Attributes:** Derive concrete attributes and fields directly from the details in `thematic_observations` (e.g., status, duration, severity, modalities, operational metrics).
-3. **Use Enums/Literals with Semantic Abstraction:** Type fields representing discrete categories, severities, or classifications using Python `Enum` or `Literal` types instead of open-ended strings. Abstract nuanced terms into reusable categories.
+3. **Use Atomic Enums/Literals with Semantic Abstraction (NO Sentence-Fragment Enums):**
+   - Type fields representing discrete categories, severities, or classifications using Python `Enum` or `Literal` types instead of open-ended strings.
+   - Every `Enum` member MUST be a short, atomic concept of **at most 4 words (`<= 3` underscores, `<= 35` characters)** (e.g., `LOW`, `LOW_AVERAGE`, `AVERAGE`, `HIGH_AVERAGE`, `VERY_HIGH`), with **at most 10 members per Enum class**.
+   - NEVER bake pronouns, age groups, comparison clauses, or specific subtest names into Enum values (e.g., NEVER generate `WITHIN_THE_AVERAGE_RANGE_FOR_HIS_AGE_GROUP_FOR_THE_SPELLING_SUBTEST`). Instead, decompose them into separate Pydantic fields (e.g., `subtest_name: Optional[str]`, `score_range: Optional[PsychometricScoreRange]`, `normative_comparison: Optional[str]`).
 4. **Field Descriptions & Optionality:** Declare model attributes using `Field(default=None, description="...")`, providing a concise explanation of the domain meaning derived from `thematic_observations`.
    - Field names MUST be valid Python identifiers in `snake_case` (alphanumeric and underscores only, NEVER hyphens like `field-name`).
 5. **Self-Contained & Valid Imports:** The source code must include all necessary imports:
@@ -293,10 +306,11 @@ CRITICAL RULES:
 1. **Deduplicate & Merge (Strict Class Name Uniqueness):** Identify classes modeling the same core concept across files. Merge their fields into ONE single unified class using the most descriptive and comprehensive names.
    - NEVER define two classes with the exact same name in the file (e.g., do NOT emit multiple `class EmotionalDysregulationAssessment`).
    - NEVER define an Enum and a BaseModel sharing the exact same class name.
-2. **Preserve Hierarchy & Relationships:** Maintain valid class inheritance and typed cross-model references.
-3. **Preserve Field Descriptions:** Retain attributes declared as `Field(default=None, description="...")`, preserving the most detailed and descriptive `description` string across merged attributes.
-4. **Valid Python Identifiers:** All attribute names must be valid Python identifiers in `snake_case` (alphanumeric and underscores only, NEVER hyphens like `help-seeking_barriers`).
-5. **Self-Contained Imports:** Ensure all necessary Pydantic and typing imports are included at the top of the file.
+2. **Atomic Enum Hygiene:** Keep `Enum` classes concise and canonical (`<= 10` members per Enum, `<= 4` words / `<= 35` characters per member). Discard any verbose sentence-fragment Enum members (e.g., `WITHIN_THE_AVERAGE_RANGE_FOR_HIS_AGE_GROUP...`).
+3. **Preserve Hierarchy & Relationships:** Maintain valid class inheritance and typed cross-model references.
+4. **Preserve Field Descriptions:** Retain attributes declared as `Field(default=None, description="...")`, preserving the most detailed and descriptive `description` string across merged attributes.
+5. **Valid Python Identifiers:** All attribute names must be valid Python identifiers in `snake_case` (alphanumeric and underscores only, NEVER hyphens like `help-seeking_barriers`).
+6. **Self-Contained Imports:** Ensure all necessary Pydantic and typing imports are included at the top of the file.
 
 OUTPUT SCHEMA INSTRUCTIONS:
 Return a JSON object conforming to the GeneratedModule schema:
@@ -308,7 +322,7 @@ FINAL_ONTOLOGY_SYSTEM_PROMPT = """You are the Lead Master Ontologist.
 Merge the provided `enums.py`, `raw_master_ontology.py`, and `normalized_master_ontology.py` into a single standalone `comprehensive_ontology.py` module.
 
 CRITICAL RULES:
-1. **Embed Enums Directly:** Copy and define all `Enum` and `Literal` classes from `enums.py` at the top of the file. Do not use external or relative imports.
+1. **Embed Enums Directly (Concise & Atomic Only):** Copy and define `Enum` and `Literal` classes from `enums.py` at the top of the file (`<= 10` atomic members per Enum, `<= 4` words per member; discard any long conversational phrase members). Do not use external or relative imports.
 2. **Merge Classes & Strict Uniqueness:** Combine raw and normalized models by unioning their fields into single, comprehensive classes.
    - NEVER declare multiple classes with the same name.
    - NEVER define an Enum and a BaseModel with the same name.
@@ -338,7 +352,7 @@ TARGET SCHEMA:
 REPAIR RULES:
 1. Fix all Python syntax errors, indentation issues, or missing imports (`from pydantic import BaseModel, Field`, `from enum import Enum`, `from typing import ...`).
 2. Ensure all Pydantic fields use valid syntax: `field_name: Optional[Type] = Field(default=None, description="...")`.
-3. Ensure Enum member names use valid `UPPER_SNAKE_CASE` identifiers and inherit from `(str, Enum)`.
+3. Ensure Enum member names use valid `UPPER_SNAKE_CASE` identifiers, inherit from `(str, Enum)`, and contain **at most 10 concise atomic members (`<= 4` words / `<= 35` characters each)**. Strip any runaway or conversational Enum members (such as `WITHIN_THE_AVERAGE_RANGE_FOR_HIS_AGE_GROUP...`).
 4. ABSOLUTE BAN ON META-MODELS: If the malformed input or code contains meta-models like `class ThemeObservation` or `class GeneratedModule` inside `source_code`, DISCARD them completely. Replace them with substantive domain Pydantic models based on the domain concepts and key terms.
 5. Return pure JSON matching the GeneratedModule schema only. Do NOT output markdown explanations or conversational text."""
 
@@ -409,18 +423,25 @@ class TargetResolver:
 
     @staticmethod
     def filter_and_cap_triplets(
-        target_nodes: set,
-        triplets: List[Dict[str, Any]],
+        target_nodes: Any,
+        triplets: Any,
         topology: Optional[Dict[str, Any]] = None,
-        max_triplets_cap: int = 1800,
+        max_triplets_cap: int = MAX_TRIPLETS_PER_TARGET,
         target_id: Any = "global",
         path_type: str = "community",
         config: Optional[Dict[str, Any]] = None,
+        exclude_hubs: Optional[bool] = None,
+        raw_hubs: Optional[Iterable[str]] = None,
+        strictly_intra_only: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """
         Filters triplets incident to target_nodes and prioritizes them using a
         pure Local Community Centrality engine.
         """
+        # Gracefully handle if caller passed (triplets, target_nodes) in reverse order
+        if isinstance(target_nodes, list) and target_nodes and isinstance(target_nodes[0], dict):
+            target_nodes, triplets = triplets, target_nodes
+
         target_nodes_norm = {str(n).lower().strip() for n in target_nodes}
 
         if config:
@@ -431,11 +452,15 @@ class TargetResolver:
             )
         else:
             sem_cfg = {}
-        exclude_hubs = sem_cfg.get("exclude_hub_triplets_from_communities", False)
-        strictly_intra = sem_cfg.get("triplet_payload_mode", "include_boundary") == "strictly_intra_only"
+        if exclude_hubs is None:
+            exclude_hubs = sem_cfg.get("exclude_hub_triplets_from_communities", False)
+        if strictly_intra_only is None:
+            strictly_intra = sem_cfg.get("triplet_payload_mode", "include_boundary") == "strictly_intra_only"
+        else:
+            strictly_intra = bool(strictly_intra_only)
 
-        raw_hubs = set(topology.get("global_hubs", [])) if topology else set()
-        raw_hubs_norm = {str(h).lower().strip() for h in raw_hubs}
+        resolved_hubs = set(raw_hubs) if raw_hubs is not None else (set(topology.get("global_hubs", [])) if topology else set())
+        raw_hubs_norm = {str(h).lower().strip() for h in resolved_hubs}
 
         local_degree = Counter()
         edge_frequencies = Counter()
@@ -1070,6 +1095,44 @@ class TargetResolver:
 # (Exact match with src/synthesis/synthesizer.py)
 # ============================================================================
 
+def _normalize_candidate_enum_term(term: str) -> Optional[str]:
+    """
+    Strips conversational boilerplate from candidate Enum terms and rejects
+    verbose multi-clause sentence fragments (e.g., 'within the average range for his age group...').
+    """
+    cleaned = str(term).strip()
+    if not cleaned:
+        return None
+    lower = cleaned.lower()
+
+    # Strip leading conversational prefixes
+    for prefix in ("within the ", "in the ", "within ", "at the "):
+        if lower.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip()
+            lower = cleaned.lower()
+
+    # Strip trailing comparison / age-group clauses
+    cleaned = re.sub(
+        r"\s+(?:as compared to|compared to|relative to|for (?:his|her|their|its) age group|for the .*?subtest|for the .*?task|for the .*?measure|for the .*?assessment|for the .*?index).*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+    cleaned = re.sub(r"\s+range$", "", cleaned, flags=re.IGNORECASE).strip()
+    lower = cleaned.lower()
+
+    # Reject if still a multi-clause fragment or overly long
+    words = [w for w in re.split(r"[\s_-]+", lower) if w]
+    if not words or len(words) > MAX_ENUM_MEMBER_WORDS or len(cleaned) > MAX_ENUM_MEMBER_CHARS:
+        return None
+    if any(
+        marker in f" {lower} "
+        for marker in (" for his ", " for her ", " age group ", " same aged ", " subtest ", " compared to ")
+    ):
+        return None
+    return cleaned
+
+
 def cluster_enum_candidates(
     enum_nodes: List[str],
     concept_embeddings: Dict[str, np.ndarray],
@@ -1077,20 +1140,31 @@ def cluster_enum_candidates(
 ) -> List[Dict[str, Any]]:
     """
     Groups orphan and low-density nodes into high-cohesion semantic clusters
-    using pre-computed concept vectors. Discards isolated terms and weak clusters.
+    using pre-computed concept vectors. Discards isolated terms, conversational
+    sentence fragments, and weak clusters.
     """
     enum_cfg = config.get("synthesis", {}).get("enum_clustering", {})
-    min_cluster_size = enum_cfg.get("min_cluster_size", 2)
-    dist_threshold = enum_cfg.get("distance_threshold", 0.48)
-    min_cohesion = enum_cfg.get("min_cohesion_score", 0.55)
+    min_cluster_size = enum_cfg.get("min_cluster_size", ENUM_MIN_CLUSTER_SIZE)
+    dist_threshold = enum_cfg.get("distance_threshold", ENUM_DISTANCE_THRESHOLD)
+    min_cohesion = enum_cfg.get("min_cohesion_score", ENUM_MIN_COHESION_SCORE)
+    max_terms_per_cluster = enum_cfg.get("max_terms_per_cluster", ENUM_MAX_TERMS_PER_CLUSTER)
 
     valid_terms = []
     vector_list = []
+    seen_norm = set()
     for term in enum_nodes:
-        clean_key = str(term).lower().strip()
-        if clean_key in concept_embeddings:
-            valid_terms.append(str(term).strip())
-            vector_list.append(concept_embeddings[clean_key])
+        raw_key = str(term).lower().strip()
+        if raw_key not in concept_embeddings:
+            continue
+        cleaned_term = _normalize_candidate_enum_term(term)
+        if not cleaned_term:
+            continue
+        norm_cleaned = cleaned_term.lower()
+        if norm_cleaned in seen_norm:
+            continue
+        seen_norm.add(norm_cleaned)
+        valid_terms.append(cleaned_term)
+        vector_list.append(concept_embeddings[raw_key])
 
     if len(valid_terms) < min_cluster_size:
         return []
@@ -1126,17 +1200,130 @@ def cluster_enum_candidates(
         avg_cohesion = float(np.mean(sims))
 
         if avg_cohesion >= min_cohesion:
-            prototypical_idx = int(np.argmax(sims))
+            ranked_indices = np.argsort(sims)[::-1]
+            top_indices = ranked_indices[:max_terms_per_cluster]
+            prototypical_idx = int(ranked_indices[0])
+            capped_terms = [terms[int(i)] for i in top_indices]
             strong_clusters.append({
                 "cluster_id": int(c_id),
                 "suggested_category": terms[prototypical_idx],
                 "cohesion_score": round(avg_cohesion, 3),
-                "member_count": len(terms),
-                "terms": terms,
+                "member_count": len(capped_terms),
+                "terms": capped_terms,
             })
 
     strong_clusters.sort(key=lambda c: (c["member_count"], c["cohesion_score"]), reverse=True)
     return strong_clusters
+
+
+def _is_verbose_or_runaway_enum_member(member_name: str, member_val: Optional[str] = None) -> bool:
+    """
+    Returns True if an Enum member identifier or string value is a verbose sentence fragment
+    or combinatorial permutation (e.g. WITHIN_THE_AVERAGE_RANGE_FOR_HIS_AGE_GROUP_FOR_THE_...).
+    """
+    ident = str(member_name).strip().upper()
+    if not ident:
+        return True
+    words = [w for w in ident.split("_") if w]
+    if len(words) > MAX_ENUM_MEMBER_WORDS or len(ident) > MAX_ENUM_MEMBER_CHARS:
+        return True
+    banned_substrings = (
+        "WITHIN_THE_",
+        "_FOR_HIS_",
+        "_FOR_HER_",
+        "_FOR_THEIR_",
+        "_FOR_THE_",
+        "_AGE_GROUP",
+        "_SAME_AGED",
+        "_AS_COMPARED_TO",
+        "_COMPARED_TO_",
+        "_SUBTEST",
+        "_IN_THE_RANGE",
+    )
+    if any(b in ident for b in banned_substrings):
+        return True
+    if member_val is not None:
+        val_str = str(member_val).strip()
+        val_words = [w for w in re.split(r"[\s_-]+", val_str) if w]
+        if len(val_words) > MAX_ENUM_MEMBER_WORDS + 1 or len(val_str) > MAX_ENUM_MEMBER_CHARS + 5:
+            return True
+    return False
+
+
+def _sanitize_ast_enums(code: str) -> str:
+    """
+    AST post-processor that strips verbose sentence-fragment Enum members, deduplicates
+    Enum members within each class, and caps Enum classes to MAX_ENUM_MEMBERS_PER_CLASS.
+    """
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return code
+
+    def is_enum_class(node: ast.ClassDef) -> bool:
+        for b in node.bases:
+            if isinstance(b, ast.Name) and "Enum" in b.id:
+                return True
+            if isinstance(b, ast.Attribute) and "Enum" in b.attr:
+                return True
+        return False
+
+    new_body: List[ast.AST] = []
+    modified = False
+
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and is_enum_class(node):
+            kept_stmts: List[ast.stmt] = []
+            seen_names: set = set()
+            seen_vals: set = set()
+            member_count = 0
+
+            for stmt in node.body:
+                m_name = None
+                m_val = None
+                if isinstance(stmt, ast.Assign) and stmt.targets and isinstance(stmt.targets[0], ast.Name):
+                    m_name = stmt.targets[0].id
+                    if isinstance(stmt.value, ast.Constant):
+                        m_val = stmt.value.value
+                elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                    m_name = stmt.target.id
+                    if stmt.value and isinstance(stmt.value, ast.Constant):
+                        m_val = stmt.value.value
+
+                if m_name is not None:
+                    if (
+                        _is_verbose_or_runaway_enum_member(m_name, m_val)
+                        or m_name in seen_names
+                        or (m_val is not None and str(m_val).lower().strip() in seen_vals)
+                        or member_count >= MAX_ENUM_MEMBERS_PER_CLASS
+                    ):
+                        modified = True
+                        continue
+                    seen_names.add(m_name)
+                    if m_val is not None:
+                        seen_vals.add(str(m_val).lower().strip())
+                    member_count += 1
+                    kept_stmts.append(stmt)
+                else:
+                    # Docstring or pass statement
+                    kept_stmts.append(stmt)
+
+            if member_count > 0:
+                node.body = kept_stmts
+                new_body.append(node)
+            else:
+                modified = True
+        else:
+            new_body.append(node)
+
+    if not modified:
+        return code
+
+    tree.body = new_body
+    try:
+        return ast.unparse(tree)
+    except Exception:
+        return code
 
 
 def clean_python_code(code: str) -> str:
@@ -1193,6 +1380,7 @@ def clean_python_code(code: str) -> str:
         code,
         flags=re.DOTALL,
     )
+    code = _sanitize_ast_enums(code.strip())
     return code.strip()
 
 
@@ -1353,6 +1541,7 @@ class SynthesisPipeline:
                         "batch_size": BATCH_SIZE,
                         "max_new_tokens": MAX_NEW_TOKENS,
                         "temperature": TEMPERATURE,
+                        "repetition_penalty": REPETITION_PENALTY,
                         "constrain_json": CONSTRAIN_JSON,
                     },
                 },
@@ -1391,6 +1580,7 @@ class SynthesisPipeline:
                 batch_size=BATCH_SIZE,
                 max_new_tokens=MAX_NEW_TOKENS,
                 temperature=TEMPERATURE,
+                repetition_penalty=REPETITION_PENALTY,
             )
             eff_ctx = self._apply_context_window_cap()
             self._checkpoint(
@@ -1436,6 +1626,7 @@ class SynthesisPipeline:
         phase_label: str,
         default_module_name: str = "domain_schema",
         allow_reformat_repair: bool = True,
+        max_new_tokens: int = MAX_NEW_TOKENS,
         on_valid_module_ready: Optional[Callable[[Dict[str, Any], str, str], None]] = None,
     ) -> List[Dict[str, Any]]:
         """
@@ -1545,8 +1736,9 @@ class SynthesisPipeline:
             as_array=False,
             dedup=False,
             batch_size=BATCH_SIZE,
-            max_new_tokens=MAX_NEW_TOKENS,
+            max_new_tokens=max_new_tokens,
             temperature=TEMPERATURE,
+            repetition_penalty=REPETITION_PENALTY,
             constrain_json=CONSTRAIN_JSON,
             dry_run=DRY_RUN,
             on_batch_start=_on_batch_start,
@@ -1633,8 +1825,9 @@ class SynthesisPipeline:
                 as_array=False,
                 dedup=False,
                 batch_size=BATCH_SIZE,
-                max_new_tokens=MAX_NEW_TOKENS,
+                max_new_tokens=max_new_tokens,
                 temperature=TEMPERATURE,
+                repetition_penalty=REPETITION_PENALTY,
                 constrain_json=CONSTRAIN_JSON,
                 dry_run=DRY_RUN,
             )
@@ -1868,14 +2061,19 @@ class SynthesisPipeline:
         print(f"   -> [{path_label}] Phase 2: Schema Generation...")
         print(f"      -> Target Composition: {len(targets)} qualified schema targets (global hubs routed to enums.py)")
 
-        payload_mode = synth_cfg.get("payload_values", "raw_text")
-        max_sentences_per_target = synth_cfg.get("max_sentences_per_target", 60)
-        top_domain_terms_count = synth_cfg.get("top_domain_terms_count", 12)
-        min_sentence_length = synth_cfg.get("min_sentence_length", 15)
-        domain_terms_idf_exponent = float(synth_cfg.get("domain_terms_idf_exponent", 1.5))
-        domain_terms_multi_word_boost = float(synth_cfg.get("domain_terms_multi_word_boost", 1.2))
-        observation_overlap_weight = float(synth_cfg.get("observation_overlap_weight", 0.25))
-        observation_overlap_max_cap = int(synth_cfg.get("observation_overlap_max_cap", 4))
+        payload_mode = synth_cfg.get("payload_values", PAYLOAD_VALUES_MODE)
+        max_triplets_per_target = int(synth_cfg.get("max_triplets_per_target", MAX_TRIPLETS_PER_TARGET))
+        max_sentences_per_target = int(synth_cfg.get("max_sentences_per_target", MAX_SENTENCES_PER_TARGET))
+        top_domain_terms_count = int(synth_cfg.get("top_domain_terms_count", TOP_DOMAIN_TERMS_COUNT))
+        min_sentence_length = int(synth_cfg.get("min_sentence_length", MIN_SENTENCE_LENGTH))
+        domain_terms_idf_exponent = float(synth_cfg.get("domain_terms_idf_exponent", DOMAIN_TERMS_IDF_EXPONENT))
+        domain_terms_multi_word_boost = float(synth_cfg.get("domain_terms_multi_word_boost", DOMAIN_TERMS_MULTI_WORD_BOOST))
+        observation_overlap_weight = float(synth_cfg.get("observation_overlap_weight", OBSERVATION_OVERLAP_WEIGHT))
+        observation_overlap_max_cap = int(synth_cfg.get("observation_overlap_max_cap", OBSERVATION_OVERLAP_MAX_CAP))
+        print(
+            f"      -> Payload Limits: max_triplets_per_target={max_triplets_per_target}, "
+            f"max_sentences_per_target={max_sentences_per_target}, top_domain_terms={top_domain_terms_count}"
+        )
 
         # Precompute global target counts to score community-specificity of terms (C-TF-IDF)
         global_target_counts = Counter()
@@ -1990,14 +2188,15 @@ class SynthesisPipeline:
             mode: str,
             merged_from: Optional[List[Any]] = None,
         ) -> str:
-            top_terms = extract_top_domain_terms(target_nodes, subset, top_k=top_domain_terms_count)
+            capped_subset = subset[:max_triplets_per_target] if max_triplets_per_target > 0 else subset
+            top_terms = extract_top_domain_terms(target_nodes, capped_subset, top_k=top_domain_terms_count)
             observations = extract_thematic_observations(
-                subset, target_nodes, max_sentences=max_sentences_per_target, mode=mode
+                capped_subset, target_nodes, max_sentences=max_sentences_per_target, mode=mode
             )
 
             theme_counts = Counter(
                 tr.get("theme_association")
-                for tr in subset
+                for tr in capped_subset
                 if tr.get("theme_association") and tr.get("theme_association") != "Other"
             )
             primary_theme = theme_counts.most_common(1)[0][0] if theme_counts else ""
@@ -2037,7 +2236,9 @@ class SynthesisPipeline:
             merged_from = target.get("merged_from", [target_id])
 
             if run_norm:
-                norm_subset = target.get("triplets", [])
+                norm_subset = list(target.get("triplets", []))
+                if max_triplets_per_target > 0:
+                    norm_subset = norm_subset[:max_triplets_per_target]
                 if norm_subset:
                     existing_norm = list(norm_dir.glob(f"{i:02d}_*.py")) if RESUME_EXISTING_SCHEMAS else []
                     if existing_norm:
@@ -2045,7 +2246,7 @@ class SynthesisPipeline:
                     else:
                         print(
                             f"         -> Queuing Target {i}/{len(targets)} ({target_type} {target_id}) - normalized "
-                            f"(Size: {len(target_nodes)} nodes, {len(norm_subset)} triplets)..."
+                            f"(Size: {len(target_nodes)} nodes, {len(norm_subset)}/{max_triplets_per_target} max triplets)..."
                         )
                         user_payload = format_phase2_payload(
                             target_id, list(target_nodes), norm_subset, payload_mode, merged_from=merged_from
@@ -2089,6 +2290,25 @@ class SynthesisPipeline:
                         if q and q not in existing_quotes:
                             raw_subset.append(extra)
                             existing_quotes.add(q)
+                if max_triplets_per_target > 0 and len(raw_subset) > max_triplets_per_target:
+                    raw_subset = TargetResolver.filter_and_cap_triplets(
+                        raw_subset,
+                        list(target_nodes),
+                        max_triplets_cap=max_triplets_per_target,
+                        exclude_hubs=exclude_hubs,
+                        raw_hubs=targets_data.get("global_hubs", []),
+                        strictly_intra_only=strictly_intra,
+                    )
+                if max_triplets_per_target > 0 and len(raw_subset) > max_triplets_per_target:
+                    raw_subset = TargetResolver.filter_and_cap_triplets(
+                        target_nodes,
+                        raw_subset,
+                        topology=targets_data,
+                        max_triplets_cap=max_triplets_per_target,
+                        target_id=target_id,
+                        path_type=path_type,
+                        config=self.config,
+                    )
                 if raw_subset:
                     existing_raw = list(raw_dir.glob(f"{i:02d}_*.py")) if RESUME_EXISTING_SCHEMAS else []
                     if existing_raw:
@@ -2096,7 +2316,7 @@ class SynthesisPipeline:
                     else:
                         print(
                             f"         -> Queuing Target {i}/{len(targets)} ({target_type} {target_id}) - raw "
-                            f"(Size: {len(target_nodes)} nodes, {len(raw_subset)} triplets)..."
+                            f"(Size: {len(target_nodes)} nodes, {len(raw_subset)}/{max_triplets_per_target} max triplets)..."
                         )
                         user_payload = format_phase2_payload(
                             target_id, list(target_nodes), raw_subset, payload_mode, merged_from=merged_from
@@ -2167,10 +2387,10 @@ class SynthesisPipeline:
             code = re.sub(r"\n\s*\n", "\n", code)
             return code.strip()
 
-        raw_cap = synth_cfg.get("context_window_cap", CONTEXT_WINDOW_CAP)
-        synthesis_cap = int(raw_cap) if isinstance(raw_cap, int) and raw_cap > 0 else 16384
+        self._ensure_engine_loaded("Phase 3: Consolidation")
+        synthesis_cap = self._apply_context_window_cap()
         sys_tokens = estimate_tokens(CONSOLIDATION_SYSTEM_PROMPT)
-        max_payload_tokens = max(500, synthesis_cap - sys_tokens - 1000)
+        max_payload_tokens = max(500, synthesis_cap - sys_tokens - CONSOLIDATION_MAX_NEW_TOKENS)
 
         def run_consolidation_single(payload: str, label: str) -> str:
             res_list = self._run_module_batch(
@@ -2179,6 +2399,7 @@ class SynthesisPipeline:
                 phase_label=f"Phase 3: Consolidation ({label})",
                 default_module_name="master_ontology",
                 allow_reformat_repair=True,
+                max_new_tokens=CONSOLIDATION_MAX_NEW_TOKENS,
             )
             if res_list and res_list[0]["success"]:
                 return res_list[0]["source_code"]
@@ -2283,6 +2504,7 @@ class SynthesisPipeline:
             phase_label="Phase 4: Comprehensive Ontology",
             default_module_name="comprehensive_ontology",
             allow_reformat_repair=True,
+            max_new_tokens=CONSOLIDATION_MAX_NEW_TOKENS,
         )
         if final_results and final_results[0]["success"]:
             final_code = deduplicate_consolidated_classes(final_results[0]["source_code"])
@@ -2379,6 +2601,7 @@ def build_default_config() -> Dict[str, Any]:
                 "distance_threshold": ENUM_DISTANCE_THRESHOLD,
                 "min_cohesion_score": ENUM_MIN_COHESION_SCORE,
                 "max_clusters_per_batch": ENUM_MAX_CLUSTERS_PER_BATCH,
+                "max_terms_per_cluster": ENUM_MAX_TERMS_PER_CLUSTER,
             },
             "top_domain_terms_count": TOP_DOMAIN_TERMS_COUNT,
             "domain_terms_idf_exponent": DOMAIN_TERMS_IDF_EXPONENT,
