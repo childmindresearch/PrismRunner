@@ -7,23 +7,14 @@ Drop-in replacement for SemanticPrism's Stage 4 Ontological Schema Synthesis pip
 with PrismRunner's local HuggingFace batch inference engine.
 
 Workflow Phases & Output Artifacts:
-  - Phase 0 : Dynamic Target Resolution & Architectural Tier Partitioning
+  - Phase 0 : Dynamic Target Resolution
               * outputs/03_topology/03_paths/community/resolved_community_targets.json
-              * outputs/03_topology/03_paths/community/community_architectural_tiers.json
-              * outputs/03_topology/03_paths/community/community_architectural_tiers.csv
-              * outputs/03_topology/03_paths/community/tier_partitioning_diagnostics.json
-  - Phase 1 : Semantic Enum Vector Clustering & Synthesis
-              * outputs/04_synthesis/logs/enum_clusters_community.json
-              * outputs/04_synthesis/schemas/community/normalized/enums.py
-              * outputs/04_synthesis/schemas/community/raw/enums.py
-  - Phase 2 : Community Path Schema Synthesis (Normalized & Raw Passes via PrismRunner Batch Inference)
-              * outputs/04_synthesis/schemas/community/normalized/<01_module_name>.py ...
-              * outputs/04_synthesis/schemas/community/raw/<01_module_name>.py ...
-  - Phase 3 : Global Schema Consolidation & AST Class Deduplication
-              * outputs/04_synthesis/schemas/community/normalized/master_ontology.py
-              * outputs/04_synthesis/schemas/community/raw/master_ontology.py
-  - Phase 4 : Master Comprehensive Ontology Synthesis
+  - Phase 1 : Community Path Schema Synthesis (Single Pass from Raw Source Sentence Text)
+              * outputs/04_synthesis/schemas/community/<01_module_name>.py ...
+  - Phase 2 : Global Schema Consolidation & AST Class Deduplication
+              * outputs/04_synthesis/schemas/community/master_ontology.py
               * outputs/04_synthesis/schemas/community/comprehensive_ontology.py
+              * outputs/04_synthesis/logs/schema_sanitization.log
               * outputs/04_synthesis/logs/synthesis_community_errors.log
 """
 
@@ -32,11 +23,8 @@ from __future__ import annotations
 import argparse
 import ast
 from collections import Counter, defaultdict
-import csv
 from datetime import datetime
 import json
-import logging
-import math
 import os
 from pathlib import Path
 import re
@@ -45,15 +33,11 @@ import subprocess
 import sys
 import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-import warnings
 
-# Prevent PyTorch CUDA allocator fragmentation when switching between embedding and LLM stages
+# Prevent PyTorch CUDA allocator fragmentation
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-warnings.filterwarnings("ignore", message=r".*n_jobs value.*overridden to 1.*", category=UserWarning)
 
-import numpy as np
 from pydantic import BaseModel, Field, model_validator
-from sklearn.cluster import AgglomerativeClustering
 
 # Ensure local prismrunner package is importable when running from usertests/
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -61,11 +45,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from prismrunner import (
-    ContextBudget,
     PrismPipeline,
     clear_device_memory,
-    get_optimal_device,
-    resolve_dynamic_batch_size,
 )
 
 try:
@@ -92,103 +73,54 @@ except ImportError:
 # synthesis hyperparameters.
 #
 # NOTE:
-#   - MODEL_NAME      : Generative Causal/Coding LLM used by PrismRunner for Pydantic v2
-#                       schema synthesis and ontology consolidation (e.g., "Qwen/Qwen3-Coder-Next",
-#                       "Qwen/Qwen3.6-27B", or "Qwen/Qwen2.5-Coder-32B-Instruct").
-#   - EMBEDDING_MODEL : SentenceTransformer vector encoder used for concept embeddings
-#                       (e.g., "BAAI/bge-large-en-v1.5" [1024d] or "all-MiniLM-L6-v2" [384d]).
+#   - MODEL_NAME : Generative Causal/Coding LLM used by PrismRunner for Pydantic v2
+#                  schema synthesis and ontology consolidation (e.g., "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+#                  "Qwen/Qwen3-Coder-Next", or "Qwen/Qwen2.5-Coder-32B-Instruct").
 
-# --- 1. Generative LLM, Embedding Model & Hardware Settings ---
+# --- 1. Generative LLM & Hardware Settings ---
 MODEL_NAME: str = "Qwen/Qwen3-Coder-30B-A3B-Instruct"  # Causal/Coding LLM for Stage 4 (256K native context)
-EMBEDDING_MODEL: str = "BAAI/bge-large-en-v1.5"        # Vector encoder for Phase 0 & Phase 1 concept vectors
 DEVICE: str = "auto"                                   # "auto", "cuda", "mps", or "cpu"
 TORCH_DTYPE: str = "auto"                              # "auto", "bfloat16", "float16", or "float32"
 LOAD_IN_4BIT: bool = False                             # Enable 4-bit NF4 quantization (CUDA bitsandbytes)
 LOAD_IN_8BIT: bool = False                             # Enable 8-bit quantization (CUDA bitsandbytes)
 ATTN_IMPLEMENTATION: str = "auto"                      # "auto", "flash_attention_2", "sdpa", or "eager"
 BATCH_SIZE: Union[int, str] = "auto"                   # "auto" (continuous device-relative) or explicit int
-EMBEDDING_BATCH_SIZE: Union[int, str] = "auto"         # "auto" (dynamically sized from device memory) or explicit int
 CONTEXT_WINDOW_CAP: Union[int, str] = "auto"           # "auto" = full native model context window (e.g. 262,144 tokens), or int cap
-MAX_NEW_TOKENS: int = 16384                            # Max generated tokens per Phase 1/2 schema module
-CONSOLIDATION_MAX_NEW_TOKENS: int = 32768              # Max generated tokens for Phase 3/4 consolidated master ontologies
+MAX_NEW_TOKENS: int = 16384                            # Max generated tokens per community schema module
+CONSOLIDATION_MAX_NEW_TOKENS: int = 32768              # Max generated tokens for consolidated master ontology
 TEMPERATURE: float = 0.0                               # 0.0 for deterministic greedy decoding
-REPETITION_PENALTY: float = 1.08                       # Mild penalty to prevent combinatorial Enum repetition loops
+REPETITION_PENALTY: float = 1.08                       # Mild penalty to prevent greedy repetition loops
 CONSTRAIN_JSON: bool = True                            # Force JSON '{' prefix & bracket-balanced early stopping
-MANAGE_VRAM: bool = True                               # Flush and offload GPU/MPS memory between embedding & LLM phases
+MANAGE_VRAM: bool = True                               # Flush and offload GPU/MPS memory after synthesis completes
 DRY_RUN: bool = False                                  # Set True to preview prompts without running LLM generation
 
 # --- 2. Input & Output Paths ---
+OUTPUTS_DIR: str = "outputs"
 REFINED_TRIPLETS_PATH: str = "outputs/02_refinement/refined_triplets.json"
-ORIGINAL_TRIPLETS_PATH: str = "outputs/01_extraction/original_triplets.json"
-TAXONOMIC_MAP_PATH: str = "outputs/02_refinement/taxonomic_map.json"
-MASTER_THEMES_PATH: str = "outputs/01_extraction/master_themes.json"
 TOPOLOGY_PARTITIONS_PATH: str = "outputs/03_topology/03_paths/community/topology_partitions.json"
 RESOLVED_TARGETS_OUTPUT_DIR: str = "outputs/03_topology/03_paths/community"
-VECTOR_CACHE_DIR: str = "outputs/02_refinement/cache"
-OUTPUTS_DIR: str = "outputs"
-SYNTHESIS_OUTPUT_DIR: str = "outputs/04_synthesis"
 SAVE_LLM_PAYLOADS: bool = True
-PAYLOAD_OUTPUT_DIR: str = "outputs/payload_text/stage_04_synthesis"
 PRINT_CHECKPOINTS: bool = True                       # Print real-time timestamped checkpoint messages to console
-RESUME_EXISTING_SCHEMAS: bool = False                # If True, skips Phase 2 targets whose .py files already exist
+RESUME_EXISTING_SCHEMAS: bool = False                # If True, skips community targets whose .py files already exist
 
-# --- 3. Execution Scope & Target Qualification (Phase 0 & Phase 2) ---
-EXECUTION_MODE: str = "community"
-SCHEMA_PASS_MODE: str = "both"                       # "both", "normalized", or "raw"
-PAYLOAD_VALUES_MODE: str = "raw_text"                # "raw_text", "triples", or "both"
+# --- 3. Target Qualification & Triplet Filtering ---
 MIN_CLUSTER_SIZE: int = 15                           # Minimum entity count required for a community to receive its own schema
-MAX_TRIPLETS_PER_TARGET: int = 1200                  # Maximum triplets per schema target payload (PageRank intra-community cap)
+MAX_TRIPLETS_PER_TARGET: int = 1200                  # Maximum triplets per schema target payload (intra-community centrality cap)
+TRIPLET_PAYLOAD_MODE: str = "strictly_intra_only"    # "strictly_intra_only" or "include_boundary"
 
-# --- 4. Orphan & Enum Vector Clustering & Atomic Bounds (Phase 1: enums.py) ---
-ENUM_CLUSTERING_ENABLED: bool = True
-ENUM_MIN_CLUSTER_SIZE: int = 4
-ENUM_DISTANCE_THRESHOLD: float = 0.48
-ENUM_MIN_COHESION_SCORE: float = 0.55
-ENUM_MAX_CLUSTERS_PER_BATCH: int = 25
-ENUM_MAX_TERMS_PER_CLUSTER: int = 15                 # Max candidate terms fed per Enum cluster
-MAX_ENUM_MEMBER_WORDS: int = 4                       # Max words per Enum member identifier (<= 3 underscores)
-MAX_ENUM_MEMBER_CHARS: int = 35                      # Max character length per Enum member identifier
+# --- 4. Schema Cardinality Bounds ---
 MAX_ENUM_MEMBERS_PER_CLASS: int = 12                 # Max distinct members allowed per Enum class
+MAX_BASEMODEL_FIELDS_PER_CLASS: int = 12             # Max fields allowed per Pydantic BaseModel class
 
 # --- 5. Domain Term Scoring (C-TF-IDF) ---
 TOP_DOMAIN_TERMS_COUNT: int = 5
 DOMAIN_TERMS_IDF_EXPONENT: float = 1.5
-DOMAIN_TERMS_MULTI_WORD_BOOST: float = 1.2
-GENERIC_EXCLUSIONS: List[str] = [
-    "person", "name", "support", "organization", "thing", "things", "away", "-",
-    "other", "none", "user", "people", "system", "systems", "someone", "something",
-    "anyone", "anything", "everyone", "everything", "item", "items", "concept", "concepts",
-    "state", "states", "data", "info", "information", "value", "values", "lot", "lots",
-    "bit", "bits", "day", "days", "time", "times", "year", "years", "week", "weeks",
-    "part", "parts", "case", "cases", "type", "types", "category", "categories", "cat",
-]
 
-# --- 6. Thematic Observation Evidence Scoring (Phase 2 Context Quotes) ---
+# --- 6. Thematic Observation Evidence Scoring (Phase 1 Context Quotes) ---
 MAX_SENTENCES_PER_TARGET: int = 200
 MIN_SENTENCE_LENGTH: int = 15
 OBSERVATION_OVERLAP_WEIGHT: float = 0.25
 OBSERVATION_OVERLAP_MAX_CAP: int = 4
-
-# --- 7. Topology & Architectural Tier Settings (Used by Phase 0 TargetResolver) ---
-CENTER_AGGLOMERATION_EMBEDDINGS: bool = True
-TRIPLET_PAYLOAD_MODE: str = "strictly_intra_only"    # "include_boundary" or "strictly_intra_only"
-EXCLUDE_HUB_TRIPLETS_FROM_COMMUNITIES: bool = False
-ARCHITECTURAL_TIERS_ENABLED: bool = True
-TIER_WEIGHT_PROTOTYPICALITY: float = 0.40
-TIER_WEIGHT_CENTRALITY: float = 0.40
-TIER_WEIGHT_FIDELITY: float = 0.20
-TIER_1_PERCENTILE: float = 0.80
-TIER_1_MIN_ENTITIES: int = 2
-TIER_1_MAX_ENTITIES: int = 8
-TIER_2_PERCENTILE: float = 0.30
-MIN_FIDELITY_TIER_1: float = 0.10
-BOUNDARY_DISCOUNT: float = 0.5
-FALLBACK_PROTOTYPICALITY: float = 0.30
-FALLBACK_FIDELITY: float = 0.28
-EXPORT_TIER_CSV: bool = True
-EXPORT_DIAGNOSTICS: bool = True
-
-logger = logging.getLogger("SemanticPrism4")
 
 
 # ============================================================================
@@ -200,7 +132,12 @@ class GeneratedModule(BaseModel):
         description="The functional title abstracting the core semantic nodes, formatted strictly as a snake_case string (e.g., 'core_database_architecture')."
     )
     source_code: str = Field(
-        description="The raw Python source code containing the generated Pydantic BaseModels and Enums, including all necessary import statements."
+        description=(
+            "The raw Python source code containing the generated Pydantic BaseModels and Enums, including all necessary "
+            f"import statements. Every BaseModel class MUST have at most {MAX_BASEMODEL_FIELDS_PER_CLASS} fields (decompose sub-entities into separate "
+            "models instead of prefix-flattened fields, and use List/Enum fields instead of boolean flag lists). "
+            f"Every Enum class MUST have at most {MAX_ENUM_MEMBERS_PER_CLASS} concise atomic members (<= 4 words each)."
+        )
     )
 
     @model_validator(mode="before")
@@ -229,41 +166,10 @@ class GeneratedModule(BaseModel):
 
 
 # ============================================================================
-# STAGE 4 SYSTEM PROMPTS (Exact match with src/synthesis/prompts.py)
+# STAGE 4 SYSTEM PROMPTS
 # ============================================================================
 
-ORPHAN_SYNTHESIS_SYSTEM_PROMPT = """You are an Ontological Structuring Agent.
-Analyze the provided semantic clusters and synthesize a cohesive suite of reusable, standardized Python `Enum` and `Literal` classes.
-
-INPUT STRUCTURE:
-You will receive `candidate_clusters`, each containing:
-- `cluster_id` (int): Numeric identifier of the cluster.
-- `category_hint` (str): Representative anchor concept (use as inspiration for the Enum class name).
-- `cohesion_score` (float): Semantic density score of the cluster.
-- `terms` (list of str): Concept terms to consolidate into discrete standardized members.
-
-CRITICAL MODELING RULES:
-1. **Lean into Slight Semantic Abstraction:** Do NOT mechanically transcribe hyper-specific, anecdotal, or idiosyncratic phrases verbatim (e.g., avoid `FOUR_HOURS_OF_SLEEP_IN_FORTY_EIGHT_HOURS` or `TAKING_MEDS_WITH_MY_PRISTIQ`). Instead, abstract them into canonical, generalizable domain concepts (e.g., `ACUTE_SLEEP_DEPRIVATION`, `MORNING_ADMINISTRATION`).
-2. **Strict Atomic Enum Bounds (NO Sentence Fragments or Permutations):**
-   - Each `Enum` member identifier MUST be an atomic concept of **at most 4 words (`<= 3` underscores, `<= 35` characters)**, such as `VERY_LOW`, `LOW`, `LOW_AVERAGE`, `AVERAGE`, `HIGH_AVERAGE`, `VERY_HIGH`, or `WITHIN_NORMAL_LIMITS`.
-   - NEVER emit conversational or prepositional phrase permutations such as `WITHIN_THE_AVERAGE_RANGE_FOR_HIS_AGE_GROUP...`, `..._AS_COMPARED_TO_SAME_AGED_PEERS`, or `..._FOR_THE_SPELLING_SUBTEST`.
-   - Each `Enum` class MUST contain **at most 10 distinct members**.
-3. **Consolidate Synonyms:** Group terms sharing the same core meaning into a single standardized Enum member or Literal option.
-4. **Discard Outliers:** If a term is an ungeneralizable conversational fragment, discard it.
-5. **Valid Python Identifiers & Typing:**
-   - Define Enums inheriting from `(str, Enum)` for seamless serialization (e.g., `class SymptomSeverity(str, Enum):`).
-   - Class names MUST use `PascalCase`.
-   - Enum member names MUST be valid Python identifiers in `UPPER_SNAKE_CASE` (alphanumeric and underscores only).
-   - Use clean, human-readable string values for members.
-6. **Self-Contained Code:** The code must include all required imports (`from enum import Enum`, `from typing import Literal`).
-
-OUTPUT SCHEMA INSTRUCTIONS:
-Return a JSON object conforming to the GeneratedModule schema:
-- `module_name`: Set strictly to "enums".
-- `source_code`: The complete, executable Python code containing all defined Enum and Literal classes."""
-
-
-SCHEMA_SYNTHESIS_PROMPT = """You are an Expert Domain Modeling and Ontological Architect.
+SCHEMA_SYNTHESIS_PROMPT = f"""You are an Expert Domain Modeling and Ontological Architect.
 You will receive an extracted thematic cluster of domain concepts and real-world source text observations.
 Your job is to interpret the underlying domain workflows, entities, and attributes, and synthesize a clean, practical, and coherent Pydantic (v2) schema module.
 
@@ -273,12 +179,15 @@ INPUT STRUCTURE:
 3. `thematic_observations`: Authentic source text sentences organized by theme. Study these narrative observations to understand real-world workflows, data types, entity interactions, and field constraints.
 
 CRITICAL MODELING RULES:
-1. **Synthesize Domain Workflows, Do Not Transcribe:** Do NOT mechanically turn every term into a separate class. Step back, understand the domain narrative, and design 1 or more intuitive, cohesive Pydantic `BaseModel` classes modeling the core subject matter (e.g., ClinicalEvaluation, AssessmentProtocol, PatientCondition).
-2. **Model Real-World Attributes:** Derive concrete attributes and fields directly from the details in `thematic_observations` (e.g., status, duration, severity, modalities, operational metrics).
-3. **Use Atomic Enums/Literals with Semantic Abstraction (NO Sentence-Fragment Enums):**
-   - Type fields representing discrete categories, severities, or classifications using Python `Enum` or `Literal` types instead of open-ended strings.
-   - Every `Enum` member MUST be a short, atomic concept of **at most 4 words (`<= 3` underscores, `<= 35` characters)** (e.g., `LOW`, `LOW_AVERAGE`, `AVERAGE`, `HIGH_AVERAGE`, `VERY_HIGH`), with **at most 10 members per Enum class**.
-   - NEVER bake pronouns, age groups, comparison clauses, or specific subtest names into Enum values (e.g., NEVER generate `WITHIN_THE_AVERAGE_RANGE_FOR_HIS_AGE_GROUP_FOR_THE_SPELLING_SUBTEST`). Instead, decompose them into separate Pydantic fields (e.g., `subtest_name: Optional[str]`, `score_range: Optional[PsychometricScoreRange]`, `normative_comparison: Optional[str]`).
+1. **Synthesize Domain Workflows, Do Not Transcribe:** Do NOT mechanically turn every term into a separate class. Step back, understand the domain narrative, and design 1 or more intuitive, cohesive Pydantic `BaseModel` classes modeling the core subject matter.
+2. **Strict BaseModel Field Budget (`<= {MAX_BASEMODEL_FIELDS_PER_CLASS}` Fields Maximum) & Anti-Bloat Rules:**
+   - Every Pydantic `BaseModel` class MUST contain **between 4 and {MAX_BASEMODEL_FIELDS_PER_CLASS} fields maximum (`<= {MAX_BASEMODEL_FIELDS_PER_CLASS}` fields)**. Prioritize the most essential, high-level domain attributes.
+   - **NO Prefix-Flattened Sub-Object Dumps:** NEVER flatten a related sub-entity into dozens of prefixed fields on a parent model (e.g., NEVER emit `digital_tool_used`, `digital_tool_description`, `digital_tool_accessibility`, `digital_tool_subscription_cost`, etc.). Instead, either compose a separate compact `BaseModel` (`<= {MAX_BASEMODEL_FIELDS_PER_CLASS}` fields) referenced by a single field, or use 1–2 high-level summary fields.
+   - **NO Boolean-Flag Lists:** NEVER turn list items, goals, capabilities, or roles into individual `Optional[bool]` fields (e.g., NEVER emit `time_management_improvement: Optional[bool]`, `planning_skills_improvement: Optional[bool]`, `organization_improvement: Optional[bool]`). Group them into a single `Optional[List[str]]` or `Optional[List[Enum]]` field (e.g., `target_outcomes: Optional[List[str]]`).
+3. **Field-Grounded Atomic Enums/Literals (NO Orphan or Sentence-Fragment Enums):**
+   - Define an `Enum` class ONLY when it is directly referenced as the type of at least one field on a `BaseModel` in this module.
+   - Every `Enum` member MUST be a short, atomic category label of **at most 4 words (`<= 3` underscores, `<= 35` characters)**, with **at most {MAX_ENUM_MEMBERS_PER_CLASS} members per Enum class**.
+   - NEVER encode full sentences, prepositional clauses, or multi-attribute combinations inside `Enum` values; decompose distinct dimensions into separate `BaseModel` fields.
 4. **Field Descriptions & Optionality:** Declare model attributes using `Field(default=None, description="...")`, providing a concise explanation of the domain meaning derived from `thematic_observations`.
    - Field names MUST be valid Python identifiers in `snake_case` (alphanumeric and underscores only, NEVER hyphens like `field-name`).
 5. **Self-Contained & Valid Imports:** The source code must include all necessary imports:
@@ -294,22 +203,21 @@ CRITICAL MODELING RULES:
 OUTPUT SCHEMA INSTRUCTIONS:
 Return a JSON object conforming to the GeneratedModule schema:
 - `module_name` (string): A concise, descriptive `snake_case` name for this module (e.g., "patient_assessment_workflow").
-- `source_code` (string): The complete, executable Python code defining the Pydantic BaseModels and any localized Enums."""
-
-LEIDEN_SCHEMA_SYNTHESIS_PROMPT = SCHEMA_SYNTHESIS_PROMPT
+- `source_code` (string): The complete, executable Python code defining the Pydantic BaseModels and any field-referenced Enums."""
 
 
-CONSOLIDATION_SYSTEM_PROMPT = """You are a Master Ontologist.
-Merge, deduplicate, and consolidate the provided fragmented Pydantic schema files into a unified `master_ontology.py` module.
+CONSOLIDATION_SYSTEM_PROMPT = f"""You are a Master Ontologist.
+Merge, deduplicate, and consolidate the provided community Pydantic schema files into a single unified, standalone `master_ontology.py` module.
 
 CRITICAL RULES:
-1. **Deduplicate & Merge (Strict Class Name Uniqueness):** Identify classes modeling the same core concept across files. Merge their fields into ONE single unified class using the most descriptive and comprehensive names.
-   - NEVER define two classes with the exact same name in the file (e.g., do NOT emit multiple `class EmotionalDysregulationAssessment`).
+1. **Deduplicate & Merge (Strict Class Name Uniqueness & `<= {MAX_BASEMODEL_FIELDS_PER_CLASS}` Fields Per BaseModel):** Identify classes modeling the same core concept across files. Merge their core fields into ONE single unified class using the most descriptive and comprehensive names, keeping **at most {MAX_BASEMODEL_FIELDS_PER_CLASS} high-value fields per `BaseModel`**.
+   - NEVER define two classes with the exact same name in the file.
    - NEVER define an Enum and a BaseModel sharing the exact same class name.
-2. **Atomic Enum Hygiene:** Keep `Enum` classes concise and canonical (`<= 10` members per Enum, `<= 4` words / `<= 35` characters per member). Discard any verbose sentence-fragment Enum members (e.g., `WITHIN_THE_AVERAGE_RANGE_FOR_HIS_AGE_GROUP...`).
+   - Consolidate repetitive boolean flags or prefixed sub-attributes into clean `List[str]` / `Enum` fields or composed child models rather than bloating a single class past {MAX_BASEMODEL_FIELDS_PER_CLASS} fields.
+2. **Atomic Enum Hygiene:** Embed and deduplicate `Enum` classes at the top of the file (`<= {MAX_ENUM_MEMBERS_PER_CLASS}` members per Enum, `<= 4` words / `<= 35` characters per member). Discard any verbose sentence-fragment Enum members.
 3. **Preserve Hierarchy & Relationships:** Maintain valid class inheritance and typed cross-model references.
 4. **Preserve Field Descriptions:** Retain attributes declared as `Field(default=None, description="...")`, preserving the most detailed and descriptive `description` string across merged attributes.
-5. **Valid Python Identifiers:** All attribute names must be valid Python identifiers in `snake_case` (alphanumeric and underscores only, NEVER hyphens like `help-seeking_barriers`).
+5. **Valid Python Identifiers:** All attribute names must be valid Python identifiers in `snake_case` (alphanumeric and underscores only, NEVER hyphens).
 6. **Self-Contained Imports:** Ensure all necessary Pydantic and typing imports are included at the top of the file.
 
 OUTPUT SCHEMA INSTRUCTIONS:
@@ -318,41 +226,22 @@ Return a JSON object conforming to the GeneratedModule schema:
 - `source_code`: The complete, consolidated Python source code."""
 
 
-FINAL_ONTOLOGY_SYSTEM_PROMPT = """You are the Lead Master Ontologist.
-Merge the provided `enums.py`, `raw_master_ontology.py`, and `normalized_master_ontology.py` into a single standalone `comprehensive_ontology.py` module.
-
-CRITICAL RULES:
-1. **Embed Enums Directly (Concise & Atomic Only):** Copy and define `Enum` and `Literal` classes from `enums.py` at the top of the file (`<= 10` atomic members per Enum, `<= 4` words per member; discard any long conversational phrase members). Do not use external or relative imports.
-2. **Merge Classes & Strict Uniqueness:** Combine raw and normalized models by unioning their fields into single, comprehensive classes.
-   - NEVER declare multiple classes with the same name.
-   - NEVER define an Enum and a BaseModel with the same name.
-3. **Standardize Fields & Descriptions:** Keep all attributes declared with `Field(default=None, description="...")`, ensuring informative descriptions are retained across models, and leverage embedded Enums/Literals for typed fields.
-4. **Valid Python Identifiers:** All attribute names must be valid Python identifiers in `snake_case` (alphanumeric and underscores only, NEVER hyphens).
-5. **No Synthetic Identifiers:** Ensure no synthetic `id`, `uuid`, or surrogate key fields are generated unless explicitly substantiated by source domain data.
-6. **Formatting:** Output pure, executable Python code with all necessary imports.
-
-OUTPUT SCHEMA INSTRUCTIONS:
-Return a JSON object conforming to the GeneratedModule schema:
-- `module_name`: Set strictly to "comprehensive_ontology".
-- `source_code`: The complete, standalone Python source code."""
-
-
-SCHEMA_REFORMAT_SYSTEM_PROMPT = """You are an expert Ontological Schema Repair Assistant.
+SCHEMA_REFORMAT_SYSTEM_PROMPT = f"""You are an expert Ontological Schema Repair Assistant.
 You will receive a Python module attempt and the specific validation or syntax error that occurred.
 Your job is to repair the Python code to strictly conform to the expected GeneratedModule schema structure.
 
 TARGET SCHEMA:
 ```json
-{
+{{
   "module_name": "string (snake_case identifier)",
   "source_code": "string (valid, executable Python source code)"
-}
+}}
 ```
 
 REPAIR RULES:
 1. Fix all Python syntax errors, indentation issues, or missing imports (`from pydantic import BaseModel, Field`, `from enum import Enum`, `from typing import ...`).
-2. Ensure all Pydantic fields use valid syntax: `field_name: Optional[Type] = Field(default=None, description="...")`.
-3. Ensure Enum member names use valid `UPPER_SNAKE_CASE` identifiers, inherit from `(str, Enum)`, and contain **at most 10 concise atomic members (`<= 4` words / `<= 35` characters each)**. Strip any runaway or conversational Enum members (such as `WITHIN_THE_AVERAGE_RANGE_FOR_HIS_AGE_GROUP...`).
+2. Ensure all Pydantic fields use valid syntax: `field_name: Optional[Type] = Field(default=None, description="...")`, and keep **at most {MAX_BASEMODEL_FIELDS_PER_CLASS} fields per `BaseModel` class** (removing repetitive prefixed sub-fields or boolean flag series).
+3. Ensure Enum member names use valid `UPPER_SNAKE_CASE` identifiers, inherit from `(str, Enum)`, and contain **at most {MAX_ENUM_MEMBERS_PER_CLASS} concise atomic members (`<= 4` words / `<= 35` characters each)**. Strip any multi-clause phrase Enum members.
 4. ABSOLUTE BAN ON META-MODELS: If the malformed input or code contains meta-models like `class ThemeObservation` or `class GeneratedModule` inside `source_code`, DISCARD them completely. Replace them with substantive domain Pydantic models based on the domain concepts and key terms.
 5. Return pure JSON matching the GeneratedModule schema only. Do NOT output markdown explanations or conversational text."""
 
@@ -364,74 +253,45 @@ REPAIR RULES:
 class TargetResolver:
     """
     Target qualification and triplet filtering criteria used by Stage 4 for LLM synthesis.
-    Provides methods to resolve qualified spoke targets, rank/cap global hubs, aggregate enum nodes,
-    and filter/cap triplet payloads based on PageRank and intra-cluster edge priority.
+    Provides methods to resolve qualified community targets and filter/cap triplet payloads
+    based on local community centrality and intra-cluster edge priority.
     """
-    _memory_cache: Dict[Tuple[str, str], Dict[str, np.ndarray]] = {}
-    _raw_matrix_cache: Dict[Tuple[str, str], Tuple[np.ndarray, Dict[str, int], List[str]]] = {}
 
     @staticmethod
     def qualify_and_resolve_targets(
         topology: Dict[str, Any],
-        path_type: str = "community",
         config: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+    ) -> List[Dict[str, Any]]:
         """
-        Resolves qualified community targets (>= min_cluster_size),
-        and aggregates low-density cluster nodes, orphans, and global hubs into all_enum_nodes.
+        Resolves qualified community targets (>= min_cluster_size).
         """
-        min_cluster_size = config.get("synthesis", {}).get("min_cluster_size", 15) if config else 15
+        min_cluster_size = (
+            config.get("synthesis", {}).get("min_cluster_size", MIN_CLUSTER_SIZE)
+            if config
+            else MIN_CLUSTER_SIZE
+        )
 
-        # 1. Global hubs are routed directly into Enum synthesis (enums.py)
-        raw_hubs = list(topology.get("global_hubs", []))
-
-        # 2. Aggregate Orphans + Low-Density Nodes + Global Hubs (Enums)
-        orphans = list(topology.get("orphans", []))
-        small_cluster_nodes = []
-
-        for comm in topology.get("communities", []):
-            nodes = comm.get("nodes", [])
-            if len(nodes) < min_cluster_size:
-                small_cluster_nodes.extend(nodes)
-
-        all_enum_nodes = sorted(list(set(orphans + small_cluster_nodes + raw_hubs)))
-
-        # 3. Consolidate Qualified Community Targets (>= min_cluster_size)
         targets = []
-        raw_hubs_set = set(raw_hubs)
         for comm in topology.get("communities", []):
-            nodes_in_comm = comm.get("nodes", [])
-            clean_nodes = [n for n in nodes_in_comm if n not in raw_hubs_set]
-            if len(clean_nodes) >= min_cluster_size:
+            nodes_in_comm = list(comm.get("nodes", []))
+            if len(nodes_in_comm) >= min_cluster_size:
                 c_id = comm.get("community_id")
                 targets.append({
                     "type": "community",
                     "id": c_id,
-                    "nodes": clean_nodes,
+                    "nodes": nodes_in_comm,
                     "merged_from": comm.get("merged_from", [c_id]),
                 })
 
         targets.sort(key=lambda x: len(x["nodes"]), reverse=True)
-
-        # Invariant: Mutually Disjoint Community and Enum Partitioning
-        all_target_nodes = set()
-        for t in targets:
-            all_target_nodes.update(t["nodes"])
-        clean_enum_nodes = sorted([n for n in all_enum_nodes if n not in all_target_nodes])
-
-        return targets, clean_enum_nodes
+        return targets
 
     @staticmethod
     def filter_and_cap_triplets(
         target_nodes: Any,
         triplets: Any,
-        topology: Optional[Dict[str, Any]] = None,
         max_triplets_cap: int = MAX_TRIPLETS_PER_TARGET,
-        target_id: Any = "global",
-        path_type: str = "community",
         config: Optional[Dict[str, Any]] = None,
-        exclude_hubs: Optional[bool] = None,
-        raw_hubs: Optional[Iterable[str]] = None,
         strictly_intra_only: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """
@@ -452,15 +312,11 @@ class TargetResolver:
             )
         else:
             sem_cfg = {}
-        if exclude_hubs is None:
-            exclude_hubs = sem_cfg.get("exclude_hub_triplets_from_communities", False)
+
         if strictly_intra_only is None:
-            strictly_intra = sem_cfg.get("triplet_payload_mode", "include_boundary") == "strictly_intra_only"
+            strictly_intra = sem_cfg.get("triplet_payload_mode", TRIPLET_PAYLOAD_MODE) == "strictly_intra_only"
         else:
             strictly_intra = bool(strictly_intra_only)
-
-        resolved_hubs = set(raw_hubs) if raw_hubs is not None else (set(topology.get("global_hubs", [])) if topology else set())
-        raw_hubs_norm = {str(h).lower().strip() for h in resolved_hubs}
 
         local_degree = Counter()
         edge_frequencies = Counter()
@@ -471,9 +327,6 @@ class TargetResolver:
             pred = str(t.get("predicate", "")).strip()
 
             if not subj or not obj:
-                continue
-
-            if exclude_hubs and (subj in raw_hubs_norm or obj in raw_hubs_norm):
                 continue
 
             is_subj_in = subj in target_nodes_norm
@@ -492,9 +345,6 @@ class TargetResolver:
             obj = str(t.get("object", "")).lower().strip()
 
             if not subj or not obj:
-                continue
-
-            if exclude_hubs and (subj in raw_hubs_norm or obj in raw_hubs_norm):
                 continue
 
             is_subj_in = subj in target_nodes_norm
@@ -527,469 +377,38 @@ class TargetResolver:
         return [t for _, t in scored_triplets[:max_triplets_cap]]
 
     @staticmethod
-    def _get_or_load_concept_embeddings(
-        nodes: List[str],
-        cache_dir: Path = Path("outputs/02_refinement/cache"),
-        model_name: Optional[str] = None,
-    ) -> Dict[str, np.ndarray]:
-        """
-        Loads L2-normalized concept embeddings from refinement caches (subject, object, concept),
-        and encodes any missing terms using the active SentenceTransformer model, then frees GPU memory.
-        """
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        if not model_name:
-            for meta_f in sorted(cache_dir.glob("*_meta.json")):
-                try:
-                    with open(meta_f, "r", encoding="utf-8") as mf:
-                        m_data = json.load(mf)
-                    if "model_name" in m_data and m_data["model_name"]:
-                        model_name = m_data["model_name"]
-                        break
-                except Exception:
-                    pass
-            if not model_name:
-                model_name = EMBEDDING_MODEL or "all-MiniLM-L6-v2"
-
-        model_slug = re.sub(r"[^a-zA-Z0-9_]", "_", model_name)
-        cache_key = (str(cache_dir.resolve()), model_slug)
-
-        if cache_key in TargetResolver._memory_cache:
-            node_map = TargetResolver._memory_cache[cache_key]
-            norm_nodes = [str(n).strip() for n in nodes if str(n).strip()]
-            missing = [n for n in norm_nodes if n.lower().strip() not in node_map]
-            if not missing:
-                return node_map
-        else:
-            node_map = {}
-
-        concept_npy = cache_dir / f"concept_{model_slug}_embeddings.npy"
-        concept_meta = cache_dir / f"concept_{model_slug}_meta.json"
-
-        # 1. Try unified concept cache first
-        if concept_npy.exists() and concept_meta.exists():
-            try:
-                with open(concept_meta, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                vocab = meta.get("vocab", [])
-                arr = np.load(concept_npy)
-                if len(vocab) == len(arr):
-                    for idx, term in enumerate(vocab):
-                        node_map[str(term).lower().strip()] = arr[idx]
-            except Exception as e:
-                print(f"      -> Warning reading concept cache: {e}")
-
-        norm_nodes = [str(n).strip() for n in nodes if str(n).strip()]
-        missing = [n for n in norm_nodes if n.lower().strip() not in node_map]
-
-        if not missing:
-            TargetResolver._memory_cache[cache_key] = node_map
-            return node_map
-
-        # 2. Try loading from subject/object caches
-        for prefix in ["subject", "object"]:
-            sub_npy = cache_dir / f"{prefix}_{model_slug}_embeddings.npy"
-            sub_meta = cache_dir / f"{prefix}_{model_slug}_meta.json"
-            if sub_npy.exists() and sub_meta.exists():
-                try:
-                    with open(sub_meta, "r", encoding="utf-8") as f:
-                        meta = json.load(f)
-                    vocab = meta.get("vocab", [])
-                    arr = np.load(sub_npy)
-                    if len(vocab) == len(arr):
-                        for idx, term in enumerate(vocab):
-                            k = str(term).lower().strip()
-                            if k not in node_map:
-                                node_map[k] = arr[idx]
-                except Exception:
-                    pass
-
-        missing_still = [n for n in norm_nodes if n.lower().strip() not in node_map]
-        if missing_still:
-            try:
-                import torch
-                from sentence_transformers import SentenceTransformer
-
-                unique_missing = sorted(list(set(missing_still)))
-                models_dir = Path("models/embeddings")
-                models_dir.mkdir(parents=True, exist_ok=True)
-                try:
-                    embedder = SentenceTransformer(
-                        model_name, cache_folder=str(models_dir), local_files_only=True
-                    )
-                except Exception:
-                    embedder = SentenceTransformer(
-                        model_name, cache_folder=str(models_dir), local_files_only=False
-                    )
-                emb_batch_size = resolve_dynamic_batch_size(
-                    device=get_optimal_device(DEVICE),
-                    requested_batch_size=EMBEDDING_BATCH_SIZE,
-                    items=[{"prompt": t} for t in unique_missing],
-                )
-                with torch.inference_mode():
-                    new_vecs = embedder.encode(
-                        unique_missing,
-                        normalize_embeddings=True,
-                        show_progress_bar=False,
-                        batch_size=emb_batch_size,
-                    )
-                for idx, term in enumerate(unique_missing):
-                    node_map[term.lower().strip()] = new_vecs[idx]
-
-                # Offload and delete SentenceTransformer immediately so GPU VRAM is clean for PrismRunner
-                try:
-                    embedder.to("cpu")
-                except Exception:
-                    pass
-                del embedder
-                if MANAGE_VRAM:
-                    clear_device_memory()
-
-                all_terms = list(node_map.keys())
-                all_arr = np.array([node_map[t] for t in all_terms])
-                np.save(concept_npy, all_arr)
-                with open(concept_meta, "w", encoding="utf-8") as f:
-                    json.dump(
-                        {
-                            "model_name": model_name,
-                            "dimensions": int(all_arr.shape[1]),
-                            "vocab": all_terms,
-                        },
-                        f,
-                        indent=2,
-                    )
-                print(f"      -> Unified concept cache saved: {concept_npy.name} ({len(all_terms)} concepts)")
-            except Exception as e:
-                print(f"      -> Warning: SentenceTransformer encoding error: {e}")
-
-        TargetResolver._memory_cache[cache_key] = node_map
-        return node_map
-
-    @staticmethod
-    def center_concept_embeddings(
-        concept_vecs: Dict[str, np.ndarray],
-        mean_vec: Optional[np.ndarray] = None,
-    ) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
-        """
-        Centers concept embeddings by subtracting the corpus mean vector mu and L2-normalizing:
-            v_centered = (v - mu) / ||v - mu||_2
-        """
-        if not concept_vecs:
-            return {}, np.zeros(0)
-
-        if mean_vec is None:
-            all_arr = np.array(list(concept_vecs.values()))
-            mean_vec = np.mean(all_arr, axis=0)
-
-        centered_dict = {}
-        for k, v in concept_vecs.items():
-            diff = v - mean_vec
-            norm = np.linalg.norm(diff)
-            centered_dict[k] = diff / norm if norm > 1e-9 else diff
-
-        return centered_dict, mean_vec
-
-    @staticmethod
-    def compute_architectural_tiers(
-        target_nodes: set,
-        triplets: List[Dict[str, Any]],
-        config: Dict[str, Any],
-        concept_embeddings: Dict[str, np.ndarray],
-        community_id: Any = None,
-        community_label: str = "Community",
-    ) -> Dict[str, Any]:
-        """
-        Computes hybrid geometric-topological architectural tiers for a community target:
-          - Tier 1: Thematic Nucleus
-          - Tier 2: Relational Mechanics
-          - Tier 3: Contextual Modifiers & Noise
-        """
-        tier_cfg = (
-            config.get("topology", {}).get("architectural_tiers", {})
-            if "topology" in config
-            else config.get("architectural_tiers", {})
-        )
-        weights = tier_cfg.get("weights", {})
-        w_proto = float(weights.get("prototypicality", 0.40))
-        w_cent = float(weights.get("centrality", 0.40))
-        w_fid = float(weights.get("fidelity", 0.20))
-
-        p_t1 = float(tier_cfg.get("tier_1_percentile", 0.80))
-        min_t1 = int(tier_cfg.get("tier_1_min_entities", 2))
-        max_t1 = int(tier_cfg.get("tier_1_max_entities", 8))
-        p_t2 = float(tier_cfg.get("tier_2_percentile", 0.30))
-        min_fid_t1 = float(tier_cfg.get("min_fidelity_tier_1", 0.10))
-        boundary_discount = float(tier_cfg.get("boundary_discount", 0.5))
-        fallback_proto = float(tier_cfg.get("fallback_prototypicality", 0.30))
-        fallback_fid = float(tier_cfg.get("fallback_fidelity", 0.28))
-
-        target_nodes_norm = {str(n).lower().strip(): str(n) for n in target_nodes}
-        node_internal_deg = Counter()
-        node_boundary_deg = Counter()
-        node_fidelities = defaultdict(list)
-        node_quotes = defaultdict(list)
-
-        for t in triplets:
-            s_raw = str(t.get("subject", "")).strip()
-            o_raw = str(t.get("object", "")).strip()
-            s_k = s_raw.lower()
-            o_k = o_raw.lower()
-            fid = float(t.get("contextual_fidelity", 0.30))
-            quote = str(t.get("source_quote", "")).strip()
-
-            is_s_in = s_k in target_nodes_norm
-            is_o_in = o_k in target_nodes_norm
-
-            if is_s_in and is_o_in:
-                node_internal_deg[s_k] += 1
-                node_internal_deg[o_k] += 1
-            elif is_s_in:
-                node_boundary_deg[s_k] += 1
-            elif is_o_in:
-                node_boundary_deg[o_k] += 1
-
-            if is_s_in:
-                node_fidelities[s_k].append(fid)
-                if quote:
-                    node_quotes[s_k].append((fid, quote))
-            if is_o_in:
-                node_fidelities[o_k].append(fid)
-                if quote:
-                    node_quotes[o_k].append((fid, quote))
-
-        vec_dim = 384
-        for vec in concept_embeddings.values():
-            vec_dim = len(vec)
-            break
-
-        weighted_vecs = []
-        weight_sum = 0.0
-        for n_k in target_nodes_norm.keys():
-            vec = concept_embeddings.get(n_k)
-            if vec is not None:
-                deg = node_internal_deg[n_k]
-                w = 1.0 + math.log(1.0 + deg)
-                weighted_vecs.append(vec * w)
-                weight_sum += w
-
-        if weighted_vecs and weight_sum > 0:
-            c_sum = np.sum(weighted_vecs, axis=0)
-            c_norm = np.linalg.norm(c_sum)
-            centroid = c_sum / c_norm if c_norm > 0 else c_sum
-        else:
-            centroid = np.zeros(vec_dim)
-
-        scored_entities = []
-        max_effective_deg = 1.0
-        effective_degrees = {}
-        for n_k in target_nodes_norm.keys():
-            deg_int = node_internal_deg[n_k]
-            deg_bound = node_boundary_deg[n_k]
-            eff_deg = deg_int + boundary_discount * deg_bound
-            effective_degrees[n_k] = eff_deg
-            if eff_deg > max_effective_deg:
-                max_effective_deg = eff_deg
-
-        for n_k, orig_name in target_nodes_norm.items():
-            vec = concept_embeddings.get(n_k)
-            if vec is not None and np.linalg.norm(centroid) > 0:
-                proto = float(np.dot(vec, centroid))
-            else:
-                proto = fallback_proto
-
-            eff_deg = effective_degrees[n_k]
-            cent = eff_deg / max_effective_deg
-
-            fids = node_fidelities.get(n_k, [])
-            fid = float(np.mean(fids)) if fids else fallback_fid
-
-            s_proto = max(0.001, proto) ** w_proto
-            s_cent = cent ** w_cent
-            s_fid = max(0.001, fid) ** w_fid
-            composite_s = float(s_proto * s_cent * s_fid)
-
-            quotes = node_quotes.get(n_k, [])
-            if quotes:
-                quotes.sort(key=lambda x: x[0], reverse=True)
-                top_quote = quotes[0][1]
-            else:
-                top_quote = ""
-
-            scored_entities.append({
-                "entity": orig_name,
-                "composite_score": round(composite_s, 4),
-                "prototypicality": round(proto, 4),
-                "centrality": round(cent, 4),
-                "fidelity": round(fid, 4),
-                "internal_degree": int(node_internal_deg[n_k]),
-                "boundary_degree": int(node_boundary_deg[n_k]),
-                "exemplar_quote": top_quote[:240],
-            })
-
-        scored_entities.sort(key=lambda x: x["composite_score"], reverse=True)
-
-        s_values = np.array([x["composite_score"] for x in scored_entities])
-        p80_val = float(np.percentile(s_values, p_t1 * 100)) if len(s_values) > 0 else 0.5
-        p30_val = float(np.percentile(s_values, p_t2 * 100)) if len(s_values) > 0 else 0.2
-
-        t1_candidates = []
-        demoted_from_t1 = []
-        remaining = []
-
-        for item in scored_entities:
-            if item["composite_score"] >= p80_val:
-                if item["fidelity"] >= min_fid_t1:
-                    t1_candidates.append(item)
-                else:
-                    item_copy = dict(item)
-                    item_copy["demoted_due_to_low_fidelity"] = True
-                    demoted_from_t1.append(item_copy)
-            else:
-                remaining.append(item)
-
-        effective_max_t1 = max(min_t1, max_t1)
-        if len(t1_candidates) < min_t1 and scored_entities:
-            tier_1 = scored_entities[: min(min_t1, len(scored_entities))]
-            t1_names = {x["entity"] for x in tier_1}
-            pool_for_t2 = [x for x in scored_entities if x["entity"] not in t1_names]
-        elif len(t1_candidates) > effective_max_t1:
-            tier_1 = t1_candidates[:effective_max_t1]
-            t1_names = {x["entity"] for x in tier_1}
-            pool_for_t2 = [x for x in (t1_candidates[effective_max_t1:] + remaining) if x["entity"] not in t1_names]
-        else:
-            tier_1 = t1_candidates
-            t1_names = {x["entity"] for x in tier_1}
-            pool_for_t2 = [x for x in remaining if x["entity"] not in t1_names]
-
-        tier_2 = []
-        tier_3_pool = list(demoted_from_t1)
-
-        for item in pool_for_t2:
-            if item["composite_score"] >= p30_val and (item["internal_degree"] > 0 or item["boundary_degree"] > 1):
-                tier_2.append(item)
-            else:
-                tier_3_pool.append(item)
-
-        tier_3 = tier_3_pool
-        tier_3.sort(key=lambda x: x["composite_score"], reverse=True)
-
-        return {
-            "community_id": community_id,
-            "community_label": community_label,
-            "total_nodes": len(target_nodes),
-            "tier_counts": {
-                "tier_1_nucleus": len(tier_1),
-                "tier_2_mechanics": len(tier_2),
-                "tier_3_modifiers": len(tier_3),
-            },
-            "tier_1_nucleus": tier_1,
-            "tier_2_mechanics": tier_2,
-            "tier_3_modifiers": tier_3,
-        }
-
-    @staticmethod
     def export_resolved_targets_json(
         topology: Dict[str, Any],
         path_type: str = "community",
         refined_triplets: Optional[List[Dict[str, Any]]] = None,
         config: Optional[Dict[str, Any]] = None,
-        output_dir: Path = Path("outputs/03_topology/03_paths/community"),
+        output_dir: Optional[Path] = None,
     ) -> Path:
         """
-        Executes target qualification and triplet PageRank capping, and exports
-        resolved_<path_type>_targets.json to output_dir with explicit rank scores.
-        Also computes and exports geometric-topological architectural tiers.
+        Executes target qualification and triplet centrality capping, and exports
+        resolved_community_targets.json to output_dir with explicit rank scores.
         """
+        if output_dir is None:
+            output_dir = Path(RESOLVED_TARGETS_OUTPUT_DIR)
         output_dir.mkdir(parents=True, exist_ok=True)
         synth_cfg = config.get("synthesis", {}) if config else {}
-        min_cluster_size = synth_cfg.get("min_cluster_size", 15)
-        max_triplets_cap = synth_cfg.get("max_triplets_per_target", 1800)
+        min_cluster_size = synth_cfg.get("min_cluster_size", MIN_CLUSTER_SIZE)
+        max_triplets_cap = synth_cfg.get("max_triplets_per_target", MAX_TRIPLETS_PER_TARGET)
 
-        targets, all_enum_nodes = TargetResolver.qualify_and_resolve_targets(topology, path_type, config)
-
-        tier_cfg = (
-            config.get("topology", {}).get("architectural_tiers", {})
-            if config and "topology" in config
-            else (config.get("architectural_tiers", {}) if config else {})
-        )
-        tier_enabled = tier_cfg.get("enabled", True)
-
-        concept_embeddings = {}
-        if tier_enabled:
-            all_target_nodes = set()
-            for target in targets:
-                all_target_nodes.update(target.get("nodes", []))
-            ref_cfg = config.get("refinement", {}) if config and "refinement" in config else (config or {})
-            model_name = ref_cfg.get("embedding_model") or (config.get("embedding_model") if config else None)
-            cache_dir = Path(ref_cfg.get("vector_cache_dir", "outputs/02_refinement/cache"))
-            concept_embeddings = TargetResolver._get_or_load_concept_embeddings(
-                list(all_target_nodes),
-                cache_dir=cache_dir,
-                model_name=model_name,
-            )
-            topo_cfg = config.get("topology", {}) if config and "topology" in config else (config or {})
-            if topo_cfg.get("center_agglomeration_embeddings", True) and concept_embeddings:
-                concept_embeddings, _ = TargetResolver.center_concept_embeddings(concept_embeddings)
+        targets = TargetResolver.qualify_and_resolve_targets(topology, config)
 
         target_payloads = []
-        all_tiers_records = []
-        csv_rows = []
-
         for i, target in enumerate(targets, start=1):
             target_type = target["type"]
             c_id = target["id"]
             target_nodes = set(target["nodes"])
-            comm_label = f"Community #{c_id}"
 
             capped_triplets = TargetResolver.filter_and_cap_triplets(
                 target_nodes,
                 refined_triplets or [],
-                topology,
-                max_triplets_cap,
-                target_id=c_id,
-                path_type=path_type,
+                max_triplets_cap=max_triplets_cap,
                 config=config,
             )
-
-            if tier_enabled:
-                tiers_data = TargetResolver.compute_architectural_tiers(
-                    target_nodes=target_nodes,
-                    triplets=capped_triplets,
-                    config=config or {},
-                    concept_embeddings=concept_embeddings,
-                    community_id=c_id,
-                    community_label=comm_label,
-                )
-                all_tiers_records.append(tiers_data)
-
-                for tier_key, tier_label in [
-                    ("tier_1_nucleus", "Tier 1: Nucleus"),
-                    ("tier_2_mechanics", "Tier 2: Mechanics"),
-                    ("tier_3_modifiers", "Tier 3: Modifiers"),
-                ]:
-                    for rank, item in enumerate(tiers_data.get(tier_key, []), start=1):
-                        csv_rows.append({
-                            "Community ID": f"Community #{c_id}",
-                            "Community Label": comm_label,
-                            "Tier": tier_label,
-                            "Rank in Tier": rank,
-                            "Entity Name": item["entity"],
-                            "Composite Score": item["composite_score"],
-                            "Prototypicality": item["prototypicality"],
-                            "Centrality": item["centrality"],
-                            "Fidelity": item["fidelity"],
-                            "Internal Degree": item["internal_degree"],
-                            "Boundary Degree": item["boundary_degree"],
-                            "Exemplar Quote": item["exemplar_quote"],
-                        })
-            else:
-                tiers_data = {
-                    "community_id": c_id,
-                    "community_label": comm_label,
-                    "target_node_count": len(target_nodes),
-                    "tier_1_nucleus": [],
-                    "tier_2_mechanics": [],
-                    "tier_3_modifiers": [],
-                }
 
             filename_suffix = f"community_{c_id}"
             output_module_name = f"{i:02d}_{filename_suffix}.py"
@@ -1006,7 +425,6 @@ class TargetResolver:
                 "nodes": sorted(list(target_nodes)),
                 "triplets_count": len(capped_triplets),
                 "triplets": capped_triplets,
-                "architectural_tiers": tiers_data,
             }
             target_payloads.append(payload_item)
 
@@ -1014,9 +432,6 @@ class TargetResolver:
             "path_type": path_type,
             "min_cluster_size": min_cluster_size,
             "max_triplets_per_target": max_triplets_cap,
-            "global_hubs": list(topology.get("global_hubs", [])),
-            "enum_nodes_count": len(all_enum_nodes),
-            "enum_nodes": all_enum_nodes,
             "targets_count": len(target_payloads),
             "targets": target_payloads,
         }
@@ -1026,234 +441,88 @@ class TargetResolver:
             json.dump(audit_payload, f, indent=2)
 
         print(f"   [OK] Resolved Targets Saved: {target_file}")
-
-        if path_type == "community" and tier_enabled:
-            tier_json_file = output_dir / "community_architectural_tiers.json"
-            with open(tier_json_file, "w", encoding="utf-8") as f:
-                json.dump(all_tiers_records, f, indent=2)
-            print(f"   [OK] Community Architectural Tiers JSON Saved: {tier_json_file}")
-
-            if tier_cfg.get("export_tier_csv", True) and csv_rows:
-                tier_csv_file = output_dir / "community_architectural_tiers.csv"
-                fieldnames = [
-                    "Community ID", "Community Label", "Tier", "Rank in Tier", "Entity Name",
-                    "Composite Score", "Prototypicality", "Centrality", "Fidelity",
-                    "Internal Degree", "Boundary Degree", "Exemplar Quote",
-                ]
-                with open(tier_csv_file, "w", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(f, fieldnames=fieldnames)
-                    writer.writeheader()
-                    writer.writerows(csv_rows)
-                print(f"   [OK] Community Architectural Tiers CSV Saved: {tier_csv_file} ({len(csv_rows)} rows)")
-
-            if tier_cfg.get("export_diagnostics", True):
-                diag_file = output_dir / "tier_partitioning_diagnostics.json"
-                t1_scores = [r["Composite Score"] for r in csv_rows if r["Tier"] == "Tier 1: Nucleus"]
-                t2_scores = [r["Composite Score"] for r in csv_rows if r["Tier"] == "Tier 2: Mechanics"]
-                t3_scores = [r["Composite Score"] for r in csv_rows if r["Tier"] == "Tier 3: Modifiers"]
-                diag = {
-                    "total_communities": len(all_tiers_records),
-                    "total_partitioned_entities": len(csv_rows),
-                    "tier_counts": {
-                        "tier_1_nucleus": len(t1_scores),
-                        "tier_2_mechanics": len(t2_scores),
-                        "tier_3_modifiers": len(t3_scores),
-                    },
-                    "score_distributions": {
-                        "tier_1": {
-                            "mean": round(float(np.mean(t1_scores)), 4) if t1_scores else 0.0,
-                            "median": round(float(np.median(t1_scores)), 4) if t1_scores else 0.0,
-                            "min": round(float(np.min(t1_scores)), 4) if t1_scores else 0.0,
-                            "max": round(float(np.max(t1_scores)), 4) if t1_scores else 0.0,
-                        },
-                        "tier_2": {
-                            "mean": round(float(np.mean(t2_scores)), 4) if t2_scores else 0.0,
-                            "median": round(float(np.median(t2_scores)), 4) if t2_scores else 0.0,
-                            "min": round(float(np.min(t2_scores)), 4) if t2_scores else 0.0,
-                            "max": round(float(np.max(t2_scores)), 4) if t2_scores else 0.0,
-                        },
-                        "tier_3": {
-                            "mean": round(float(np.mean(t3_scores)), 4) if t3_scores else 0.0,
-                            "median": round(float(np.median(t3_scores)), 4) if t3_scores else 0.0,
-                            "min": round(float(np.min(t3_scores)), 4) if t3_scores else 0.0,
-                            "max": round(float(np.max(t3_scores)), 4) if t3_scores else 0.0,
-                        },
-                    },
-                    "separation_margin": round(
-                        float(np.mean(t1_scores) - np.mean(t3_scores)), 4
-                    ) if t1_scores and t3_scores else 0.0,
-                }
-                with open(diag_file, "w", encoding="utf-8") as f:
-                    json.dump(diag, f, indent=2)
-                print(f"   [OK] Tier Partitioning Diagnostics Saved: {diag_file}")
-
         return target_file
 
 
 # ============================================================================
-# AST CLEANING, DEDUPLICATION, AND ENUM CLUSTERING HELPERS
-# (Exact match with src/synthesis/synthesizer.py)
+# DOMAIN-AGNOSTIC STRUCTURAL AST SANITIZERS & DEDUPLICATION HELPERS
 # ============================================================================
 
-def _normalize_candidate_enum_term(term: str) -> Optional[str]:
+def _log_sanitization_detail(
+    context_label: str,
+    class_name: str,
+    class_kind: str,
+    kept_count: int,
+    stripped_items: List[str],
+    collapsed_items: Optional[List[str]] = None,
+    extra_note: Optional[str] = None,
+) -> None:
     """
-    Strips conversational boilerplate from candidate Enum terms and rejects
-    verbose multi-clause sentence fragments (e.g., 'within the average range for his age group...').
+    Logs detailed post-processing AST sanitization events (stripped or collapsed Enum members
+    and BaseModel fields) to both the console and `outputs/04_synthesis/logs/schema_sanitization.log`.
     """
-    cleaned = str(term).strip()
-    if not cleaned:
-        return None
-    lower = cleaned.lower()
+    if not stripped_items and not collapsed_items and not extra_note:
+        return
 
-    # Strip leading conversational prefixes
-    for prefix in ("within the ", "in the ", "within ", "at the "):
-        if lower.startswith(prefix):
-            cleaned = cleaned[len(prefix):].strip()
-            lower = cleaned.lower()
-
-    # Strip trailing comparison / age-group clauses
-    cleaned = re.sub(
-        r"\s+(?:as compared to|compared to|relative to|for (?:his|her|their|its) age group|for the .*?subtest|for the .*?task|for the .*?measure|for the .*?assessment|for the .*?index).*$",
-        "",
-        cleaned,
-        flags=re.IGNORECASE,
-    ).strip()
-    cleaned = re.sub(r"\s+range$", "", cleaned, flags=re.IGNORECASE).strip()
-    lower = cleaned.lower()
-
-    # Reject if still a multi-clause fragment or overly long
-    words = [w for w in re.split(r"[\s_-]+", lower) if w]
-    if not words or len(words) > MAX_ENUM_MEMBER_WORDS or len(cleaned) > MAX_ENUM_MEMBER_CHARS:
-        return None
-    if any(
-        marker in f" {lower} "
-        for marker in (" for his ", " for her ", " age group ", " same aged ", " subtest ", " compared to ")
-    ):
-        return None
-    return cleaned
-
-
-def cluster_enum_candidates(
-    enum_nodes: List[str],
-    concept_embeddings: Dict[str, np.ndarray],
-    config: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    """
-    Groups orphan and low-density nodes into high-cohesion semantic clusters
-    using pre-computed concept vectors. Discards isolated terms, conversational
-    sentence fragments, and weak clusters.
-    """
-    enum_cfg = config.get("synthesis", {}).get("enum_clustering", {})
-    min_cluster_size = enum_cfg.get("min_cluster_size", ENUM_MIN_CLUSTER_SIZE)
-    dist_threshold = enum_cfg.get("distance_threshold", ENUM_DISTANCE_THRESHOLD)
-    min_cohesion = enum_cfg.get("min_cohesion_score", ENUM_MIN_COHESION_SCORE)
-    max_terms_per_cluster = enum_cfg.get("max_terms_per_cluster", ENUM_MAX_TERMS_PER_CLUSTER)
-
-    valid_terms = []
-    vector_list = []
-    seen_norm = set()
-    for term in enum_nodes:
-        raw_key = str(term).lower().strip()
-        if raw_key not in concept_embeddings:
-            continue
-        cleaned_term = _normalize_candidate_enum_term(term)
-        if not cleaned_term:
-            continue
-        norm_cleaned = cleaned_term.lower()
-        if norm_cleaned in seen_norm:
-            continue
-        seen_norm.add(norm_cleaned)
-        valid_terms.append(cleaned_term)
-        vector_list.append(concept_embeddings[raw_key])
-
-    if len(valid_terms) < min_cluster_size:
-        return []
-
-    X = np.vstack(vector_list)
-
-    clustering = AgglomerativeClustering(
-        n_clusters=None,
-        distance_threshold=dist_threshold,
-        metric="cosine",
-        linkage="average",
+    ts = datetime.now().strftime("%H:%M:%S")
+    iso_ts = datetime.now().isoformat()
+    header = (
+        f"[{ts} | AST Sanitizer | {context_label}] {class_kind} '{class_name}' "
+        f"(kept={kept_count}, stripped={len(stripped_items)}"
+        f"{f', collapsed_groups={len(collapsed_items)}' if collapsed_items else ''})"
     )
-    labels = clustering.fit_predict(X)
+    detail_lines: List[str] = [header]
+    if extra_note:
+        detail_lines.append(f"      * Note: {extra_note}")
+    if collapsed_items:
+        for c_item in collapsed_items:
+            detail_lines.append(f"      ~ Collapsed: {c_item}")
+    for s_item in stripped_items:
+        detail_lines.append(f"      - Stripped : {s_item}")
 
-    clusters_by_id = defaultdict(lambda: {"terms": [], "vectors": []})
-    for term, vec, lbl in zip(valid_terms, X, labels):
-        clusters_by_id[lbl]["terms"].append(term)
-        clusters_by_id[lbl]["vectors"].append(vec)
+    full_msg = "\n".join(detail_lines)
+    if PRINT_CHECKPOINTS:
+        print(full_msg, flush=True)
 
-    strong_clusters = []
-    for c_id, data in clusters_by_id.items():
-        terms = data["terms"]
-        if len(terms) < min_cluster_size:
-            continue
-
-        vecs = np.array(data["vectors"])
-        centroid = np.mean(vecs, axis=0)
-        norm = np.linalg.norm(centroid)
-        if norm > 0:
-            centroid = centroid / norm
-
-        sims = np.dot(vecs, centroid)
-        avg_cohesion = float(np.mean(sims))
-
-        if avg_cohesion >= min_cohesion:
-            ranked_indices = np.argsort(sims)[::-1]
-            top_indices = ranked_indices[:max_terms_per_cluster]
-            prototypical_idx = int(ranked_indices[0])
-            capped_terms = [terms[int(i)] for i in top_indices]
-            strong_clusters.append({
-                "cluster_id": int(c_id),
-                "suggested_category": terms[prototypical_idx],
-                "cohesion_score": round(avg_cohesion, 3),
-                "member_count": len(capped_terms),
-                "terms": capped_terms,
-            })
-
-    strong_clusters.sort(key=lambda c: (c["member_count"], c["cohesion_score"]), reverse=True)
-    return strong_clusters
+    try:
+        log_dir = Path(OUTPUTS_DIR) / "04_synthesis" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        audit_log_path = log_dir / "schema_sanitization.log"
+        with open(audit_log_path, "a", encoding="utf-8") as lf:
+            lf.write(f"[{iso_ts}] {full_msg}\n")
+    except Exception:
+        pass
 
 
 def _is_verbose_or_runaway_enum_member(member_name: str, member_val: Optional[str] = None) -> bool:
     """
-    Returns True if an Enum member identifier or string value is a verbose sentence fragment
-    or combinatorial permutation (e.g. WITHIN_THE_AVERAGE_RANGE_FOR_HIS_AGE_GROUP_FOR_THE_...).
+    Domain-agnostic structural check: returns True if an Enum member identifier or string value
+    exceeds atomic token/character bounds (> 4 tokens or > 35 characters), preventing sentence
+    fragments or combinatorial permutations from becoming Enum members in any domain.
     """
+    max_words = 4
+    max_chars = 35
     ident = str(member_name).strip().upper()
     if not ident:
         return True
     words = [w for w in ident.split("_") if w]
-    if len(words) > MAX_ENUM_MEMBER_WORDS or len(ident) > MAX_ENUM_MEMBER_CHARS:
-        return True
-    banned_substrings = (
-        "WITHIN_THE_",
-        "_FOR_HIS_",
-        "_FOR_HER_",
-        "_FOR_THEIR_",
-        "_FOR_THE_",
-        "_AGE_GROUP",
-        "_SAME_AGED",
-        "_AS_COMPARED_TO",
-        "_COMPARED_TO_",
-        "_SUBTEST",
-        "_IN_THE_RANGE",
-    )
-    if any(b in ident for b in banned_substrings):
+    if len(words) > max_words or len(ident) > max_chars:
         return True
     if member_val is not None:
         val_str = str(member_val).strip()
         val_words = [w for w in re.split(r"[\s_-]+", val_str) if w]
-        if len(val_words) > MAX_ENUM_MEMBER_WORDS + 1 or len(val_str) > MAX_ENUM_MEMBER_CHARS + 5:
+        if len(val_words) > max_words + 1 or len(val_str) > max_chars + 5:
             return True
     return False
 
 
-def _sanitize_ast_enums(code: str) -> str:
+def _sanitize_ast_enums(code: str, context_label: str = "schema") -> str:
     """
-    AST post-processor that strips verbose sentence-fragment Enum members, deduplicates
-    Enum members within each class, and caps Enum classes to MAX_ENUM_MEMBERS_PER_CLASS.
+    Domain-agnostic AST post-processor for Enum classes that:
+      1. Strips non-atomic (> 4 token / > 35 char) Enum members.
+      2. Deduplicates Enum member names and values within each class.
+      3. Caps each Enum class at MAX_ENUM_MEMBERS_PER_CLASS (12).
+      4. Rewrites any BaseModel field annotation referencing a dropped/empty Enum to `str`.
     """
     try:
         tree = ast.parse(code)
@@ -1269,6 +538,7 @@ def _sanitize_ast_enums(code: str) -> str:
         return False
 
     new_body: List[ast.AST] = []
+    dropped_enum_names: set = set()
     modified = False
 
     for node in tree.body:
@@ -1277,6 +547,7 @@ def _sanitize_ast_enums(code: str) -> str:
             seen_names: set = set()
             seen_vals: set = set()
             member_count = 0
+            stripped_details: List[str] = []
 
             for stmt in node.body:
                 m_name = None
@@ -1291,30 +562,63 @@ def _sanitize_ast_enums(code: str) -> str:
                         m_val = stmt.value.value
 
                 if m_name is not None:
-                    if (
-                        _is_verbose_or_runaway_enum_member(m_name, m_val)
-                        or m_name in seen_names
-                        or (m_val is not None and str(m_val).lower().strip() in seen_vals)
-                        or member_count >= MAX_ENUM_MEMBERS_PER_CLASS
-                    ):
+                    reason: Optional[str] = None
+                    if _is_verbose_or_runaway_enum_member(m_name, m_val):
+                        reason = "verbose/non-atomic member (>4 words or >35 chars)"
+                    elif m_name in seen_names:
+                        reason = "duplicate member name"
+                    elif m_val is not None and str(m_val).lower().strip() in seen_vals:
+                        reason = "duplicate member value"
+                    elif member_count >= MAX_ENUM_MEMBERS_PER_CLASS:
+                        reason = f"exceeded MAX_ENUM_MEMBERS_PER_CLASS ({MAX_ENUM_MEMBERS_PER_CLASS})"
+
+                    if reason is not None:
                         modified = True
+                        stripped_details.append(f"{m_name} = {m_val!r} [reason: {reason}]")
                         continue
+
                     seen_names.add(m_name)
                     if m_val is not None:
                         seen_vals.add(str(m_val).lower().strip())
                     member_count += 1
                     kept_stmts.append(stmt)
                 else:
-                    # Docstring or pass statement
                     kept_stmts.append(stmt)
 
             if member_count > 0:
                 node.body = kept_stmts
                 new_body.append(node)
+                if stripped_details:
+                    _log_sanitization_detail(
+                        context_label=context_label,
+                        class_name=node.name,
+                        class_kind="Enum",
+                        kept_count=member_count,
+                        stripped_items=stripped_details,
+                    )
             else:
+                dropped_enum_names.add(node.name)
                 modified = True
+                _log_sanitization_detail(
+                    context_label=context_label,
+                    class_name=node.name,
+                    class_kind="Enum",
+                    kept_count=0,
+                    stripped_items=stripped_details,
+                    extra_note="Enum class had 0 valid members remaining and was removed (field references rewritten to 'str').",
+                )
         else:
             new_body.append(node)
+
+    if dropped_enum_names:
+        class _DroppedEnumRewriter(ast.NodeTransformer):
+            def visit_Name(self, n: ast.Name) -> ast.AST:
+                if n.id in dropped_enum_names and isinstance(n.ctx, ast.Load):
+                    return ast.copy_location(ast.Name(id="str", ctx=ast.Load()), n)
+                return n
+
+        rewriter = _DroppedEnumRewriter()
+        new_body = [rewriter.visit(n) for n in new_body]
 
     if not modified:
         return code
@@ -1326,7 +630,236 @@ def _sanitize_ast_enums(code: str) -> str:
         return code
 
 
-def clean_python_code(code: str) -> str:
+def _sanitize_ast_models(code: str, context_label: str = "schema") -> str:
+    """
+    Domain-agnostic AST post-processor for Pydantic BaseModel classes that:
+      1. Deduplicates fields within each BaseModel.
+      2. Caps/collapses shared 2-token snake_case prefixes (prevents flattened sub-entity attribute dumps).
+      3. Caps/collapses shared non-generic suffix tokens and boolean flag series.
+      4. Enforces MAX_BASEMODEL_FIELDS_PER_CLASS (12) per BaseModel, prioritizing core/typed/collection fields.
+    """
+    max_shared_prefix = 2
+    max_shared_suffix = 2
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return code
+
+    def is_enum_class(node: ast.ClassDef) -> bool:
+        for b in node.bases:
+            if isinstance(b, ast.Name) and "Enum" in b.id:
+                return True
+            if isinstance(b, ast.Attribute) and "Enum" in b.attr:
+                return True
+        return False
+
+    exempt_suffixes = {
+        "id", "name", "type", "types", "status", "level", "score", "range",
+        "date", "time", "plan", "notes", "summary", "description", "details",
+        "count", "rate", "list", "items", "category", "mode", "source",
+    }
+
+    modified = False
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or is_enum_class(node):
+            continue
+
+        non_field_prefix_stmts: List[ast.stmt] = []
+        non_field_suffix_stmts: List[ast.stmt] = []
+        field_entries: List[Tuple[int, str, ast.stmt, bool, List[str], str]] = []
+        seen_fields: set = set()
+        stripped_details: List[str] = []
+        collapsed_details: List[str] = []
+
+        for idx, stmt in enumerate(node.body):
+            f_name: Optional[str] = None
+            ann_str = ""
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                f_name = stmt.target.id
+                try:
+                    ann_str = ast.unparse(stmt.annotation)
+                except Exception:
+                    ann_str = ""
+            elif isinstance(stmt, ast.Assign) and stmt.targets and isinstance(stmt.targets[0], ast.Name):
+                f_name = stmt.targets[0].id
+
+            if f_name is None:
+                if not field_entries:
+                    non_field_prefix_stmts.append(stmt)
+                else:
+                    non_field_suffix_stmts.append(stmt)
+                continue
+
+            norm_name = f_name.strip().lower()
+            if norm_name in seen_fields:
+                modified = True
+                stripped_details.append(f"{f_name}: {ann_str or 'Any'} [reason: duplicate field name]")
+                continue
+            seen_fields.add(norm_name)
+
+            is_bool = bool(re.search(r"\bbool\b", ann_str))
+            parts = [p for p in norm_name.split("_") if p]
+            field_entries.append((idx, norm_name, stmt, is_bool, parts, ann_str or "Any"))
+
+        if not field_entries:
+            continue
+
+        # Pass 1: Structural prefix-entropy, suffix-repetition & boolean-series filtering
+        raw_prefix2_counts: Counter = Counter(
+            f"{e[4][0]}_{e[4][1]}" for e in field_entries if len(e[4]) >= 3
+        )
+        raw_suffix_counts: Counter = Counter(
+            e[4][-1] for e in field_entries if len(e[4]) >= 2
+        )
+        prefix2_counts: Counter = Counter()
+        suffix_counts: Counter = Counter()
+        bool_series_counts: int = 0
+        filtered_entries: List[Tuple[int, str, ast.stmt, bool, List[str], str]] = []
+
+        for entry in field_entries:
+            idx, norm_name, stmt, is_bool, parts, ann_str = entry
+
+            # 1a. Shared 2-token prefix collapse/cap (collapses 3+ flattened sub-entity fields into a List[str] field)
+            if len(parts) >= 3:
+                prefix2 = f"{parts[0]}_{parts[1]}"
+                if raw_prefix2_counts[prefix2] >= 3:
+                    modified = True
+                    if prefix2_counts[prefix2] == 0:
+                        collapsed_name = prefix2 if prefix2.endswith("s") else f"{prefix2}s"
+                        grouped_names = [
+                            e[1] for e in field_entries if len(e[4]) >= 3 and f"{e[4][0]}_{e[4][1]}" == prefix2
+                        ]
+                        if collapsed_name not in seen_fields:
+                            seen_fields.add(collapsed_name)
+                            human_label = collapsed_name.replace("_", " ")
+                            stmt = ast.parse(
+                                f'{collapsed_name}: Optional[List[str]] = Field(default=None, description="Associated {human_label}.")'
+                            ).body[0]
+                            norm_name = collapsed_name
+                            is_bool = False
+                            parts = [p for p in collapsed_name.split("_") if p]
+                            ann_str = "Optional[List[str]]"
+                        prefix2_counts[prefix2] += 1
+                        filtered_entries.append((idx, norm_name, stmt, is_bool, parts, ann_str))
+                        collapsed_details.append(
+                            f"{grouped_names} -> '{norm_name}: Optional[List[str]]' "
+                            f"[reason: collapsed {len(grouped_names)} fields sharing prefix '{prefix2}_*']"
+                        )
+                    continue
+                if prefix2_counts[prefix2] >= max_shared_prefix:
+                    modified = True
+                    stripped_details.append(
+                        f"{norm_name}: {ann_str} [reason: exceeded shared prefix cap ({max_shared_prefix}) for '{prefix2}_*']"
+                    )
+                    continue
+            else:
+                prefix2 = None
+
+            # 1b. Shared suffix collapse/cap (collapses 3+ repeated suffix/checklist fields into a List[str] field)
+            suffix1 = parts[-1] if len(parts) >= 2 else None
+            if suffix1 and suffix1 not in exempt_suffixes:
+                if raw_suffix_counts[suffix1] >= 3:
+                    modified = True
+                    if suffix_counts[suffix1] == 0:
+                        collapsed_name = suffix1 if suffix1.endswith("s") else f"{suffix1}s"
+                        grouped_names = [
+                            e[1] for e in field_entries if len(e[4]) >= 2 and e[4][-1] == suffix1
+                        ]
+                        if collapsed_name not in seen_fields:
+                            seen_fields.add(collapsed_name)
+                            human_label = collapsed_name.replace("_", " ")
+                            stmt = ast.parse(
+                                f'{collapsed_name}: Optional[List[str]] = Field(default=None, description="Associated {human_label}.")'
+                            ).body[0]
+                            norm_name = collapsed_name
+                            is_bool = False
+                            parts = [p for p in collapsed_name.split("_") if p]
+                            ann_str = "Optional[List[str]]"
+                        suffix_counts[suffix1] += 1
+                        filtered_entries.append((idx, norm_name, stmt, is_bool, parts, ann_str))
+                        collapsed_details.append(
+                            f"{grouped_names} -> '{norm_name}: Optional[List[str]]' "
+                            f"[reason: collapsed {len(grouped_names)} fields sharing suffix '*_{suffix1}']"
+                        )
+                    continue
+                if suffix_counts[suffix1] >= max_shared_suffix:
+                    modified = True
+                    stripped_details.append(
+                        f"{norm_name}: {ann_str} [reason: exceeded shared suffix cap ({max_shared_suffix}) for '*_{suffix1}']"
+                    )
+                    continue
+
+            # 1c. Boolean flag proliferation cap
+            if is_bool:
+                if (len(parts) >= 3 or (suffix1 and raw_suffix_counts[suffix1] > 1)) and bool_series_counts >= 1:
+                    modified = True
+                    stripped_details.append(
+                        f"{norm_name}: {ann_str} [reason: boolean flag series cap]"
+                    )
+                    continue
+                if bool_series_counts >= 2:
+                    modified = True
+                    stripped_details.append(
+                        f"{norm_name}: {ann_str} [reason: boolean field proliferation cap (max 2 boolean flags)]"
+                    )
+                    continue
+
+            if prefix2:
+                prefix2_counts[prefix2] += 1
+            if suffix1 and suffix1 not in exempt_suffixes:
+                suffix_counts[suffix1] += 1
+            if is_bool:
+                bool_series_counts += 1
+
+            filtered_entries.append((idx, norm_name, stmt, is_bool, parts, ann_str))
+
+        # Pass 2: Enforce hard cap of MAX_BASEMODEL_FIELDS_PER_CLASS (12)
+        if len(filtered_entries) > MAX_BASEMODEL_FIELDS_PER_CLASS:
+            modified = True
+            scored = sorted(
+                filtered_entries,
+                key=lambda item: (
+                    1 if item[3] else 0,                 # non-bool before bool
+                    1 if (len(item[4]) >= 3 and raw_prefix2_counts[f"{item[4][0]}_{item[4][1]}"] > 1) else 0,
+                    1 if len(item[4]) >= 3 else 0,       # 1-2 token core fields before 3+ token compound fields
+                    item[0],                             # original declaration order
+                ),
+            )
+            kept_top = scored[:MAX_BASEMODEL_FIELDS_PER_CLASS]
+            dropped_overflow = sorted(scored[MAX_BASEMODEL_FIELDS_PER_CLASS:], key=lambda item: item[0])
+            for d_item in dropped_overflow:
+                stripped_details.append(
+                    f"{d_item[1]}: {d_item[5]} [reason: exceeded MAX_BASEMODEL_FIELDS_PER_CLASS ({MAX_BASEMODEL_FIELDS_PER_CLASS})]"
+                )
+            kept_top.sort(key=lambda item: item[0])
+            filtered_entries = kept_top
+
+        if stripped_details or collapsed_details:
+            _log_sanitization_detail(
+                context_label=context_label,
+                class_name=node.name,
+                class_kind="BaseModel",
+                kept_count=len(filtered_entries),
+                stripped_items=stripped_details,
+                collapsed_items=collapsed_details,
+            )
+
+        if filtered_entries:
+            node.body = non_field_prefix_stmts + [e[2] for e in filtered_entries] + non_field_suffix_stmts
+        else:
+            node.body = non_field_prefix_stmts + [ast.Pass()] + non_field_suffix_stmts
+            modified = True
+
+    if not modified:
+        return code
+
+    try:
+        return ast.unparse(tree)
+    except Exception:
+        return code
+
+
+def clean_python_code(code: str, context_label: str = "schema") -> str:
     """Removes markdown formatting, invalid characters, and escapes that LLMs often inject."""
     if not code:
         return ""
@@ -1343,9 +876,6 @@ def clean_python_code(code: str) -> str:
 
     # Replace literal \n escape sequences that some LLMs emit outside raw strings
     code = code.replace("\\n", "\n")
-
-    # Specific fix to prevent un-escaping the one known problematic Enum string
-    code = code.replace('"the "firstthen" principle"', '\'the "firstthen" principle\'')
 
     def fix_line(line: str) -> str:
         # 1. Assignment '=' fix
@@ -1380,16 +910,18 @@ def clean_python_code(code: str) -> str:
         code,
         flags=re.DOTALL,
     )
-    code = _sanitize_ast_enums(code.strip())
+    code = _sanitize_ast_enums(code.strip(), context_label=context_label)
+    code = _sanitize_ast_models(code.strip(), context_label=context_label)
     return code.strip()
 
 
-def deduplicate_consolidated_classes(code: str) -> str:
+def deduplicate_consolidated_classes(code: str, context_label: str = "master_ontology") -> str:
     """
     Programmatic AST post-processor for consolidated ontologies (master_ontology.py and comprehensive_ontology.py).
-    Merges duplicate Enums and BaseModels, and disambiguates Enum vs BaseModel naming collisions.
+    Merges duplicate Enums and BaseModels, disambiguates Enum vs BaseModel naming collisions,
+    and enforces MAX_ENUM_MEMBERS_PER_CLASS and MAX_BASEMODEL_FIELDS_PER_CLASS.
     """
-    clean_code = clean_python_code(code)
+    clean_code = clean_python_code(code, context_label=context_label)
     try:
         tree = ast.parse(clean_code)
     except Exception:
@@ -1458,7 +990,10 @@ def deduplicate_consolidated_classes(code: str) -> str:
 
     tree.body = other_nodes + list(enums_by_name.values()) + list(models_by_name.values())
     try:
-        return ast.unparse(tree)
+        merged_code = ast.unparse(tree)
+        merged_code = _sanitize_ast_enums(merged_code, context_label=f"{context_label} (merged)")
+        merged_code = _sanitize_ast_models(merged_code, context_label=f"{context_label} (merged)")
+        return merged_code
     except Exception:
         return clean_code
 
@@ -1495,11 +1030,9 @@ def validate_python_syntax(code: str) -> Tuple[bool, Optional[str]]:
 class SynthesisPipeline:
     """
     Stage 4 Synthesis Pipeline using PrismRunner for batch local LLM execution.
-    Replicates SemanticPrism's 4-phase ontological synthesis workflow:
-      - Phase 1: Semantic Enum Clustering & Synthesis (`enums.py`)
-      - Phase 2: Community Schema Synthesis (`normalized/<id>_<module>.py` & `raw/<id>_<module>.py`)
-      - Phase 3: Global Consolidation (`normalized/master_ontology.py` & `raw/master_ontology.py`)
-      - Phase 4: Comprehensive Ontology Synthesis (`comprehensive_ontology.py`)
+    Executes single-pass ontological synthesis from raw source sentence text:
+      - Phase 1: Community Schema Synthesis (`<id>_<module>.py`)
+      - Phase 2: Global Consolidation (`master_ontology.py` & `comprehensive_ontology.py`)
     """
 
     def __init__(self, config: Dict[str, Any], prism_pipeline: Optional[PrismPipeline] = None):
@@ -1516,7 +1049,6 @@ class SynthesisPipeline:
             raise ValueError(
                 f"MODEL_NAME is set to '{self.model_name}', which is an encoder-only embedding model, "
                 f"not a generative causal LLM.\n"
-                f"  -> Keep '{self.model_name}' in EMBEDDING_MODEL.\n"
                 f"  -> Set MODEL_NAME to a causal/coding LLM (e.g. 'Qwen/Qwen3-Coder-Next', 'Qwen/Qwen3.6-27B', "
                 f"or 'Qwen/Qwen2.5-Coder-32B-Instruct')."
             )
@@ -1605,14 +1137,14 @@ class SynthesisPipeline:
         for item in items:
             if isinstance(item, GeneratedModule):
                 mod_name = sanitize_module_name(item.module_name, fallback=fallback_name)
-                code = clean_python_code(item.source_code)
+                code = clean_python_code(item.source_code, context_label=mod_name or fallback_name)
                 if code:
                     return mod_name, code
             elif isinstance(item, dict):
                 try:
                     parsed = GeneratedModule.model_validate(item)
                     mod_name = sanitize_module_name(parsed.module_name, fallback=fallback_name)
-                    code = clean_python_code(parsed.source_code)
+                    code = clean_python_code(parsed.source_code, context_label=mod_name or fallback_name)
                     if code:
                         return mod_name, code
                 except Exception:
@@ -1857,9 +1389,6 @@ class SynthesisPipeline:
         self,
         comm_targets: Optional[Dict[str, Any]] = None,
         refined_triplets: Optional[List[Dict[str, Any]]] = None,
-        original_triplets: Optional[List[Dict[str, Any]]] = None,
-        taxonomic_map: Optional[Dict[str, str]] = None,
-        master_themes: Optional[List[str]] = None,
     ) -> None:
         print("[Synthesis] Starting Stage 4 Pipeline...")
         try:
@@ -1869,8 +1398,6 @@ class SynthesisPipeline:
                     comm_targets,
                     "community",
                     refined_triplets or [],
-                    original_triplets or [],
-                    master_themes or [],
                 )
             else:
                 print("   [Warning] Community resolved targets file not found. Skipping synthesis.")
@@ -1884,18 +1411,12 @@ class SynthesisPipeline:
         targets_data: Dict[str, Any],
         path_type: str,
         refined_triplets: List[dict],
-        original_triplets: List[dict],
-        master_themes: List[str],
     ) -> None:
         path_label = "Community Workflow" if path_type == "community" else f"Path: {path_type.title()}"
-        print(f"   -> Starting Synthesis Pass for [{path_label}]...")
+        print(f"   -> Starting Single-Pass Synthesis for [{path_label}] (Raw Source Sentence Text)...")
 
         synth_cfg = self.config.get("synthesis", {})
-        schema_pass_mode = synth_cfg.get("schema_pass_mode", "both")
-        min_cluster_size = synth_cfg.get("min_cluster_size", 15)
-        run_norm = schema_pass_mode in ("both", "normalized")
-        run_raw = schema_pass_mode in ("both", "raw")
-        print(f"      -> Schema Pass Mode: '{schema_pass_mode}' (Normalized: {run_norm}, Raw: {run_raw})")
+        min_cluster_size = synth_cfg.get("min_cluster_size", MIN_CLUSTER_SIZE)
         print(f"      -> Entity Threshold (min_cluster_size): {min_cluster_size}")
 
         # Setup logging
@@ -1909,24 +1430,15 @@ class SynthesisPipeline:
             with open(log_file, "a", encoding="utf-8") as lf:
                 lf.write(f"[{datetime.now().isoformat()}] {msg}\n")
 
-        # Path-isolated Output directories
-        output_base_dir = Path(SYNTHESIS_OUTPUT_DIR) / "schemas" / path_type
-        norm_dir = output_base_dir / "normalized"
-        raw_dir = output_base_dir / "raw"
-
+        # Single-pass output directory
+        output_base_dir = Path(outputs_dir) / "04_synthesis" / "schemas" / path_type
         if not RESUME_EXISTING_SCHEMAS and output_base_dir.exists():
             shutil.rmtree(output_base_dir)
-
         output_base_dir.mkdir(parents=True, exist_ok=True)
-        if run_norm:
-            norm_dir.mkdir(parents=True, exist_ok=True)
-        if run_raw:
-            raw_dir.mkdir(parents=True, exist_ok=True)
 
         # Payload dumping directory
-        save_llm_payloads = synth_cfg.get("save_llm_payloads", False)
-        default_payload_dir = Path(outputs_dir) / "payload_text" / "stage_04_synthesis"
-        payload_base_dir = Path(synth_cfg.get("payload_output_dir", default_payload_dir)) / path_type
+        save_llm_payloads = synth_cfg.get("save_llm_payloads", SAVE_LLM_PAYLOADS)
+        payload_base_dir = Path(outputs_dir) / "payload_text" / "stage_04_synthesis" / path_type
         if save_llm_payloads:
             if not RESUME_EXISTING_SCHEMAS and payload_base_dir.exists():
                 shutil.rmtree(payload_base_dir)
@@ -1941,133 +1453,18 @@ class SynthesisPipeline:
                     log_error(f"[Synthesis {path_type}] Error saving payload {filename}: {err}")
 
         targets = targets_data.get("targets", [])
-        all_enum_nodes = targets_data.get("enum_nodes", [])
 
         # =====================================================================
-        # PHASE 1: Semantic Enum Clustering & Synthesis
+        # PHASE 1: Community Schema Generation (Single Pass from Raw Source Text)
         # =====================================================================
-        print(f"   -> [{path_label}] Phase 1: Semantic Enum Clustering & Synthesis...")
-        print(f"      -> Total Raw Enum Candidates: {len(all_enum_nodes)}")
-        global_enums_code = ""
+        print(f"   -> [{path_label}] Phase 1: Community Schema Generation...")
+        print(f"      -> Target Composition: {len(targets)} qualified schema targets")
 
-        enum_clustering_cfg = synth_cfg.get("enum_clustering", {})
-        clustering_enabled = enum_clustering_cfg.get("enabled", True)
-
-        if all_enum_nodes:
-            if clustering_enabled:
-                ref_cfg = self.config.get("refinement", {})
-                emb_model_name = ref_cfg.get("embedding_model", EMBEDDING_MODEL)
-                cache_dir = Path(ref_cfg.get("vector_cache_dir", VECTOR_CACHE_DIR))
-
-                concept_embeddings = TargetResolver._get_or_load_concept_embeddings(
-                    all_enum_nodes,
-                    cache_dir=cache_dir,
-                    model_name=emb_model_name,
-                )
-                topo_cfg = self.config.get("topology", {}) if "topology" in self.config else self.config
-                if topo_cfg.get("center_agglomeration_embeddings", True) and concept_embeddings:
-                    concept_embeddings, _ = TargetResolver.center_concept_embeddings(concept_embeddings)
-
-                qualified_clusters = cluster_enum_candidates(all_enum_nodes, concept_embeddings, self.config)
-                retained_terms = sum(c["member_count"] for c in qualified_clusters)
-                discarded_terms = len(all_enum_nodes) - retained_terms
-
-                print(f"      -> Qualified Strong Clusters: {len(qualified_clusters)} ({retained_terms} concepts)")
-                print(f"      -> Filtered Outliers / Noise Discarded: {discarded_terms} concepts")
-
-                clusters_audit_file = log_dir / f"enum_clusters_{path_type}.json"
-                try:
-                    with open(clusters_audit_file, "w", encoding="utf-8") as f:
-                        json.dump(
-                            {
-                                "total_raw_nodes": len(all_enum_nodes),
-                                "retained_terms_count": retained_terms,
-                                "discarded_noise_count": discarded_terms,
-                                "clusters_count": len(qualified_clusters),
-                                "clusters": qualified_clusters,
-                            },
-                            f,
-                            indent=2,
-                        )
-                    self._checkpoint("Phase 1: Enum Clusters", "Saved enum clustering diagnostics", clusters_audit_file)
-                except Exception as err:
-                    log_error(f"[Synthesis {path_type}] Error saving enum clusters audit: {err}")
-
-                if qualified_clusters:
-                    max_clusters_per_batch = enum_clustering_cfg.get("max_clusters_per_batch", 25)
-                    selected_clusters = qualified_clusters[:max_clusters_per_batch]
-                    if len(qualified_clusters) > max_clusters_per_batch:
-                        print(f"      -> Selected Top {max_clusters_per_batch} clusters for primary enum synthesis")
-
-                    payload_data = {
-                        "instructions": "Synthesize standardized Python Enum and Literal classes for each strongly grouped semantic cluster.",
-                        "candidate_clusters": [
-                            {
-                                "cluster_id": c["cluster_id"],
-                                "category_hint": c["suggested_category"],
-                                "cohesion_score": c["cohesion_score"],
-                                "terms": c["terms"],
-                            }
-                            for c in selected_clusters
-                        ],
-                    }
-                    payload = json.dumps(payload_data, indent=2)
-                else:
-                    payload = ""
-            else:
-                payload = json.dumps(all_enum_nodes)
-
-            if payload:
-                orphan_sys_prompt = (
-                    f"{ORPHAN_SYNTHESIS_SYSTEM_PROMPT}\n"
-                    f"Master Themes Context: {json.dumps(master_themes)}"
-                )
-                save_payload_file(
-                    "phase1_enums_payload.txt",
-                    f"=== SYSTEM PROMPT ===\n{ORPHAN_SYNTHESIS_SYSTEM_PROMPT}\n\n"
-                    f"=== SYSTEM CONTEXT ===\nMaster Themes Context: {json.dumps(master_themes)}\n\n"
-                    f"=== USER PAYLOAD ===\n{payload}",
-                )
-
-                enum_results = self._run_module_batch(
-                    items=[{"id": "phase1_enums", "payload": payload, "fallback_module_name": "enums"}],
-                    system_prompt=orphan_sys_prompt,
-                    phase_label="Phase 1: Enums",
-                    default_module_name="enums",
-                    allow_reformat_repair=True,
-                )
-                if enum_results and enum_results[0]["success"]:
-                    global_enums_code = enum_results[0]["source_code"]
-                else:
-                    err_msg = enum_results[0]["error"] if enum_results else "Unknown error"
-                    log_error(f"[Synthesis {path_type}] Error generating enums: {err_msg}")
-                    global_enums_code = "# Error generating enums"
-            else:
-                print("      -> No candidate terms passed cohesion thresholds. Skipping enum generation.")
-                global_enums_code = "# No strongly grouped enums qualified"
-
-            if run_norm and global_enums_code and not global_enums_code.startswith("# Error"):
-                with open(norm_dir / "enums.py", "w", encoding="utf-8") as f:
-                    f.write(global_enums_code)
-                self._checkpoint("Phase 1: Enums", "Saved normalized enums.py", norm_dir / "enums.py")
-            if run_raw and global_enums_code and not global_enums_code.startswith("# Error"):
-                with open(raw_dir / "enums.py", "w", encoding="utf-8") as f:
-                    f.write(global_enums_code)
-                self._checkpoint("Phase 1: Enums", "Saved raw enums.py", raw_dir / "enums.py")
-
-        # =====================================================================
-        # PHASE 2: Schema Generation (Community Targets)
-        # =====================================================================
-        print(f"   -> [{path_label}] Phase 2: Schema Generation...")
-        print(f"      -> Target Composition: {len(targets)} qualified schema targets (global hubs routed to enums.py)")
-
-        payload_mode = synth_cfg.get("payload_values", PAYLOAD_VALUES_MODE)
         max_triplets_per_target = int(synth_cfg.get("max_triplets_per_target", MAX_TRIPLETS_PER_TARGET))
         max_sentences_per_target = int(synth_cfg.get("max_sentences_per_target", MAX_SENTENCES_PER_TARGET))
         top_domain_terms_count = int(synth_cfg.get("top_domain_terms_count", TOP_DOMAIN_TERMS_COUNT))
         min_sentence_length = int(synth_cfg.get("min_sentence_length", MIN_SENTENCE_LENGTH))
         domain_terms_idf_exponent = float(synth_cfg.get("domain_terms_idf_exponent", DOMAIN_TERMS_IDF_EXPONENT))
-        domain_terms_multi_word_boost = float(synth_cfg.get("domain_terms_multi_word_boost", DOMAIN_TERMS_MULTI_WORD_BOOST))
         observation_overlap_weight = float(synth_cfg.get("observation_overlap_weight", OBSERVATION_OVERLAP_WEIGHT))
         observation_overlap_max_cap = int(synth_cfg.get("observation_overlap_max_cap", OBSERVATION_OVERLAP_MAX_CAP))
         print(
@@ -2075,16 +1472,67 @@ class SynthesisPipeline:
             f"max_sentences_per_target={max_sentences_per_target}, top_domain_terms={top_domain_terms_count}"
         )
 
-        # Precompute global target counts to score community-specificity of terms (C-TF-IDF)
-        global_target_counts = Counter()
-        for t in targets:
+        # Precompute cross-cluster presence (n_targets) for C-TF-IDF so "strong" concepts that
+        # connect to or appear across multiple clusters are penalized by DOMAIN_TERMS_IDF_EXPONENT,
+        # even though Leiden allocates each node to a single cluster's `nodes` list.
+        node_to_cluster: Dict[str, int] = {}
+        term_clusters: Dict[str, set] = defaultdict(set)
+        cluster_quote_blobs: List[Tuple[int, str]] = []
+
+        for c_idx, t in enumerate(targets):
             for n in t.get("nodes", []):
-                global_target_counts[str(n).lower().strip()] += 1
+                nk = str(n).lower().strip()
+                if nk:
+                    node_to_cluster[nk] = c_idx
+                    term_clusters[nk].add(c_idx)
+            t_quotes = {
+                str(tr.get("source_quote", "")).lower()
+                for tr in t.get("triplets", [])
+                if tr.get("source_quote")
+            }
+            for tr in t.get("triplets", []):
+                s_tr = str(tr.get("subject", "")).lower().strip()
+                o_tr = str(tr.get("object", "")).lower().strip()
+                if s_tr:
+                    term_clusters[s_tr].add(c_idx)
+                if o_tr:
+                    term_clusters[o_tr].add(c_idx)
+            if t_quotes:
+                cluster_quote_blobs.append((c_idx, "\n".join(t_quotes)))
 
-        cfg_exclusions = synth_cfg.get("generic_exclusions", GENERIC_EXCLUSIONS)
-        generic_exclusions_set = {str(x).lower().strip() for x in cfg_exclusions}
+        # 1. Track cross-cluster graph edges in refined_triplets
+        for tr in refined_triplets or []:
+            s = str(tr.get("subject", "")).lower().strip()
+            o = str(tr.get("object", "")).lower().strip()
+            c_s = node_to_cluster.get(s)
+            c_o = node_to_cluster.get(o)
+            if s and c_o is not None:
+                term_clusters[s].add(c_o)
+            if o and c_s is not None:
+                term_clusters[o].add(c_s)
 
-        def extract_top_domain_terms(target_nodes: List[str], triplets: List[dict], top_k: int = 12) -> List[str]:
+        # 2. Track cross-cluster lexical presence in other clusters' source quotes
+        for nk in list(node_to_cluster.keys()):
+            if len(nk) <= 2:
+                continue
+            for c_idx, blob in cluster_quote_blobs:
+                if c_idx not in term_clusters[nk] and nk in blob:
+                    term_clusters[nk].add(c_idx)
+
+        global_target_counts: Dict[str, int] = {
+            nk: max(1, len(clusters)) for nk, clusters in term_clusters.items()
+        }
+
+        closed_class_pronouns = {
+            "someone", "something", "anyone", "anything",
+            "everyone", "everything", "other", "none",
+        }
+
+        def extract_top_domain_terms(
+            target_nodes: List[str],
+            triplets: List[dict],
+            top_k: int = TOP_DOMAIN_TERMS_COUNT,
+        ) -> List[str]:
             target_nodes_norm = {str(n).lower().strip(): str(n) for n in target_nodes}
             local_deg = Counter()
             for tr in triplets:
@@ -2097,12 +1545,11 @@ class SynthesisPipeline:
 
             scored = []
             for nk, orig in target_nodes_norm.items():
-                if nk in generic_exclusions_set or len(nk) <= 2 or nk.isdigit() or not any(c.isalnum() for c in nk):
+                if nk in closed_class_pronouns or len(nk) <= 2 or nk.isdigit() or not any(c.isalnum() for c in nk):
                     continue
                 n_targets = global_target_counts.get(nk, 1)
                 deg = local_deg.get(nk, 0)
-                multi_word_boost = domain_terms_multi_word_boost if " " in nk else 1.0
-                score = ((deg + 1.0) / (n_targets ** domain_terms_idf_exponent)) * multi_word_boost
+                score = (deg + 1.0) / (n_targets ** domain_terms_idf_exponent)
                 scored.append((score, deg, orig))
 
             scored.sort(key=lambda x: x[0], reverse=True)
@@ -2124,34 +1571,23 @@ class SynthesisPipeline:
         def extract_thematic_observations(
             triplets: List[dict],
             target_nodes: List[str],
-            max_sentences: int = 60,
-            mode: str = "raw_text",
+            max_sentences: int = MAX_SENTENCES_PER_TARGET,
         ) -> Dict[str, List[str]]:
             target_nodes_norm = {str(n).lower().strip() for n in target_nodes}
             quote_info: Dict[str, Dict[str, Any]] = {}
 
             for tr in triplets:
-                subj = str(tr.get("subject", "")).strip()
-                pred = str(tr.get("predicate", "")).strip()
-                obj = str(tr.get("object", "")).strip()
-                svo = f"{subj} {pred} {obj}." if (subj and pred and obj) else ""
-
                 quote = str(tr.get("source_quote", "")).strip()
                 if not quote or len(quote) < min_sentence_length:
-                    if mode in ["triples", "both"] and svo:
-                        quote = svo
-                    else:
-                        continue
+                    continue
 
                 theme = tr.get("theme_association", "General Domain Observations") or "General Domain Observations"
                 fid = float(tr.get("contextual_fidelity", 0.50))
 
                 if quote not in quote_info:
-                    quote_info[quote] = {"theme": theme, "fidelities": [fid], "svos": [svo] if svo else []}
+                    quote_info[quote] = {"theme": theme, "fidelities": [fid]}
                 else:
                     quote_info[quote]["fidelities"].append(fid)
-                    if svo and svo not in quote_info[quote]["svos"]:
-                        quote_info[quote]["svos"].append(svo)
 
             scored_quotes = []
             for q, info in quote_info.items():
@@ -2161,16 +1597,7 @@ class SynthesisPipeline:
                 sentence_score = avg_fid * (
                     1.0 + observation_overlap_weight * min(observation_overlap_max_cap, node_overlap)
                 )
-
-                if mode == "triples":
-                    text_item = " ".join(info["svos"]) if info["svos"] else q
-                elif mode == "both":
-                    svo_summary = f" [Facts: {'; '.join(info['svos'][:2])}]" if info["svos"] else ""
-                    text_item = f"{q}{svo_summary}"
-                else:
-                    text_item = q
-
-                scored_quotes.append((sentence_score, text_item, info["theme"]))
+                scored_quotes.append((sentence_score, q, info["theme"]))
 
             scored_quotes.sort(key=lambda x: x[0], reverse=True)
             selected = scored_quotes[:max_sentences]
@@ -2181,17 +1608,16 @@ class SynthesisPipeline:
 
             return dict(theme_groups)
 
-        def format_phase2_payload(
+        def format_phase1_payload(
             target_id: Any,
             target_nodes: List[str],
             subset: List[dict],
-            mode: str,
             merged_from: Optional[List[Any]] = None,
         ) -> str:
             capped_subset = subset[:max_triplets_per_target] if max_triplets_per_target > 0 else subset
             top_terms = extract_top_domain_terms(target_nodes, capped_subset, top_k=top_domain_terms_count)
             observations = extract_thematic_observations(
-                capped_subset, target_nodes, max_sentences=max_sentences_per_target, mode=mode
+                capped_subset, target_nodes, max_sentences=max_sentences_per_target
             )
 
             theme_counts = Counter(
@@ -2217,168 +1643,85 @@ class SynthesisPipeline:
                 payload_dict["consolidated_sub_communities"] = merged_from
             return json.dumps(payload_dict, indent=2)
 
-        sem_cfg = (
-            self.config.get("topology", {}).get("semantic_clustering", {})
-            if "topology" in self.config
-            else self.config.get("semantic_clustering", {})
-        )
-        exclude_hubs = sem_cfg.get("exclude_hub_triplets_from_communities", False)
-        strictly_intra = sem_cfg.get("triplet_payload_mode", "include_boundary") == "strictly_intra_only"
-        raw_hubs_norm = {str(h).lower().strip() for h in targets_data.get("global_hubs", [])}
-
-        phase2_batch_items: List[Dict[str, Any]] = []
-        active_sys_prompt = LEIDEN_SCHEMA_SYNTHESIS_PROMPT
+        phase1_batch_items: List[Dict[str, Any]] = []
+        active_sys_prompt = SCHEMA_SYNTHESIS_PROMPT
 
         for i, target in enumerate(targets, start=1):
             target_nodes = set(target["nodes"])
-            target_type = target.get("target_type", target.get("type", "spoke"))
+            target_type = target.get("target_type", target.get("type", "community"))
             target_id = target.get("target_id", target.get("id"))
             merged_from = target.get("merged_from", [target_id])
 
-            if run_norm:
-                norm_subset = list(target.get("triplets", []))
-                if max_triplets_per_target > 0:
-                    norm_subset = norm_subset[:max_triplets_per_target]
-                if norm_subset:
-                    existing_norm = list(norm_dir.glob(f"{i:02d}_*.py")) if RESUME_EXISTING_SCHEMAS else []
-                    if existing_norm:
-                        print(f"         -> [Resume] Skipping normalized Target {i}/{len(targets)} ({existing_norm[0].name} exists)")
-                    else:
-                        print(
-                            f"         -> Queuing Target {i}/{len(targets)} ({target_type} {target_id}) - normalized "
-                            f"(Size: {len(target_nodes)} nodes, {len(norm_subset)}/{max_triplets_per_target} max triplets)..."
-                        )
-                        user_payload = format_phase2_payload(
-                            target_id, list(target_nodes), norm_subset, payload_mode, merged_from=merged_from
-                        )
-                        save_payload_file(
-                            f"phase2_target_{i:02d}_normalized_{target_id}_payload.txt",
-                            f"=== SYSTEM PROMPT ===\n{active_sys_prompt}\n\n=== USER PAYLOAD ===\n{user_payload}",
-                        )
-                        phase2_batch_items.append({
-                            "id": f"target_{i:02d}_normalized_{target_id}",
-                            "target_index": i,
-                            "target_type": target_type,
-                            "target_id": target_id,
-                            "pass_name": "normalized",
-                            "target_dir": norm_dir,
-                            "payload": user_payload,
-                            "fallback_module_name": f"community_{target_id}",
-                        })
-
-            if run_raw:
-                raw_subset = list(target.get("triplets", []))
-                if original_triplets:
-                    target_nodes_norm = {str(n).lower().strip() for n in target_nodes}
-                    existing_quotes = {tr.get("source_quote") for tr in raw_subset if tr.get("source_quote")}
-                    for extra in original_triplets:
-                        s = str(extra.get("subject", "")).lower().strip()
-                        o = str(extra.get("object", "")).lower().strip()
-                        if not s or not o:
-                            continue
-                        if exclude_hubs and (s in raw_hubs_norm or o in raw_hubs_norm):
-                            continue
-                        is_s = s in target_nodes_norm
-                        is_o = o in target_nodes_norm
-                        if strictly_intra:
-                            if not (is_s and is_o):
-                                continue
-                        else:
-                            if not (is_s or is_o):
-                                continue
-                        q = extra.get("source_quote")
-                        if q and q not in existing_quotes:
-                            raw_subset.append(extra)
-                            existing_quotes.add(q)
-                if max_triplets_per_target > 0 and len(raw_subset) > max_triplets_per_target:
-                    raw_subset = TargetResolver.filter_and_cap_triplets(
-                        raw_subset,
-                        list(target_nodes),
-                        max_triplets_cap=max_triplets_per_target,
-                        exclude_hubs=exclude_hubs,
-                        raw_hubs=targets_data.get("global_hubs", []),
-                        strictly_intra_only=strictly_intra,
+            subset = list(target.get("triplets", []))
+            if max_triplets_per_target > 0:
+                subset = subset[:max_triplets_per_target]
+            if subset:
+                existing_files = list(output_base_dir.glob(f"{i:02d}_*.py")) if RESUME_EXISTING_SCHEMAS else []
+                if existing_files:
+                    print(f"         -> [Resume] Skipping Target {i}/{len(targets)} ({existing_files[0].name} exists)")
+                else:
+                    print(
+                        f"         -> Queuing Target {i}/{len(targets)} ({target_type} {target_id}) "
+                        f"(Size: {len(target_nodes)} nodes, {len(subset)}/{max_triplets_per_target} max triplets)..."
                     )
-                if max_triplets_per_target > 0 and len(raw_subset) > max_triplets_per_target:
-                    raw_subset = TargetResolver.filter_and_cap_triplets(
-                        target_nodes,
-                        raw_subset,
-                        topology=targets_data,
-                        max_triplets_cap=max_triplets_per_target,
-                        target_id=target_id,
-                        path_type=path_type,
-                        config=self.config,
+                    user_payload = format_phase1_payload(
+                        target_id, list(target_nodes), subset, merged_from=merged_from
                     )
-                if raw_subset:
-                    existing_raw = list(raw_dir.glob(f"{i:02d}_*.py")) if RESUME_EXISTING_SCHEMAS else []
-                    if existing_raw:
-                        print(f"         -> [Resume] Skipping raw Target {i}/{len(targets)} ({existing_raw[0].name} exists)")
-                    else:
-                        print(
-                            f"         -> Queuing Target {i}/{len(targets)} ({target_type} {target_id}) - raw "
-                            f"(Size: {len(target_nodes)} nodes, {len(raw_subset)}/{max_triplets_per_target} max triplets)..."
-                        )
-                        user_payload = format_phase2_payload(
-                            target_id, list(target_nodes), raw_subset, payload_mode, merged_from=merged_from
-                        )
-                        save_payload_file(
-                            f"phase2_target_{i:02d}_raw_{target_id}_payload.txt",
-                            f"=== SYSTEM PROMPT ===\n{active_sys_prompt}\n\n=== USER PAYLOAD ===\n{user_payload}",
-                        )
-                        phase2_batch_items.append({
-                            "id": f"target_{i:02d}_raw_{target_id}",
-                            "target_index": i,
-                            "target_type": target_type,
-                            "target_id": target_id,
-                            "pass_name": "raw",
-                            "target_dir": raw_dir,
-                            "payload": user_payload,
-                            "fallback_module_name": f"community_{target_id}",
-                        })
+                    save_payload_file(
+                        f"phase1_target_{i:02d}_{target_id}_payload.txt",
+                        f"=== SYSTEM PROMPT ===\n{active_sys_prompt}\n\n=== USER PAYLOAD ===\n{user_payload}",
+                    )
+                    phase1_batch_items.append({
+                        "id": f"target_{i:02d}_{target_id}",
+                        "target_index": i,
+                        "target_type": target_type,
+                        "target_id": target_id,
+                        "target_dir": output_base_dir,
+                        "payload": user_payload,
+                        "fallback_module_name": f"community_{target_id}",
+                    })
 
-        if phase2_batch_items:
-            saved_phase2_ids: set = set()
+        if phase1_batch_items:
+            saved_phase1_ids: set = set()
 
-            def _save_phase2_module(item: Dict[str, Any], mod_name: str, code: str) -> None:
-                if item["id"] in saved_phase2_ids:
+            def _save_phase1_module(item: Dict[str, Any], mod_name: str, code: str) -> None:
+                if item["id"] in saved_phase1_ids:
                     return
-                saved_phase2_ids.add(item["id"])
+                saved_phase1_ids.add(item["id"])
                 i = item["target_index"]
-                pass_name = item["pass_name"]
                 target_dir = item["target_dir"]
                 filename = f"{i:02d}_{mod_name}.py"
                 out_path = target_dir / filename
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(code)
                 self._checkpoint(
-                    f"Phase 2 ({pass_name})",
+                    "Phase 1: Community Schemas",
                     f"Saved Target {i} schema module",
                     out_path,
                 )
 
-            phase2_results = self._run_module_batch(
-                items=phase2_batch_items,
+            phase1_results = self._run_module_batch(
+                items=phase1_batch_items,
                 system_prompt=active_sys_prompt,
-                phase_label="Phase 2: Community Schemas",
+                phase_label="Phase 1: Community Schemas",
                 default_module_name="community_schema",
                 allow_reformat_repair=True,
-                on_valid_module_ready=_save_phase2_module,
+                on_valid_module_ready=_save_phase1_module,
             )
-            for item, res in zip(phase2_batch_items, phase2_results):
+            for item, res in zip(phase1_batch_items, phase1_results):
                 i = item["target_index"]
-                pass_name = item["pass_name"]
                 if res["success"] and res["source_code"]:
-                    _save_phase2_module(item, res["module_name"], res["source_code"])
+                    _save_phase1_module(item, res["module_name"], res["source_code"])
                 else:
                     log_error(
-                        f"[Synthesis {path_type}] Error generating {pass_name} schema {i} "
+                        f"[Synthesis {path_type}] Error generating schema {i} "
                         f"({item['target_type']} {item['target_id']}): {res['error']}"
                     )
 
         # =====================================================================
-        # PHASE 3: Global Consolidation
+        # PHASE 2: Global Consolidation (Master & Comprehensive Ontology)
         # =====================================================================
-        print(f"   -> [{path_label}] Phase 3: Consolidation...")
+        print(f"   -> [{path_label}] Phase 2: Global Consolidation...")
 
         def strip_comments_and_docstrings(code: str) -> str:
             code = re.sub(r"#.*", "", code)
@@ -2387,7 +1730,7 @@ class SynthesisPipeline:
             code = re.sub(r"\n\s*\n", "\n", code)
             return code.strip()
 
-        self._ensure_engine_loaded("Phase 3: Consolidation")
+        self._ensure_engine_loaded("Phase 2: Global Consolidation")
         synthesis_cap = self._apply_context_window_cap()
         sys_tokens = estimate_tokens(CONSOLIDATION_SYSTEM_PROMPT)
         max_payload_tokens = max(500, synthesis_cap - sys_tokens - CONSOLIDATION_MAX_NEW_TOKENS)
@@ -2396,7 +1739,7 @@ class SynthesisPipeline:
             res_list = self._run_module_batch(
                 items=[{"id": label, "payload": payload, "fallback_module_name": "master_ontology"}],
                 system_prompt=CONSOLIDATION_SYSTEM_PROMPT,
-                phase_label=f"Phase 3: Consolidation ({label})",
+                phase_label=f"Phase 2: Consolidation ({label})",
                 default_module_name="master_ontology",
                 allow_reformat_repair=True,
                 max_new_tokens=CONSOLIDATION_MAX_NEW_TOKENS,
@@ -2408,7 +1751,7 @@ class SynthesisPipeline:
         def process_consolidation_sync(files_list: List[dict], schema_dir: Path) -> str:
             payload = "\n".join([f"--- File: {f['name']} ---\n{f['content']}\n" for f in files_list])
             save_payload_file(
-                f"phase3_consolidation_{schema_dir.name}_payload.txt",
+                "phase2_consolidation_payload.txt",
                 f"=== SYSTEM PROMPT ===\n{CONSOLIDATION_SYSTEM_PROMPT}\n\n=== USER PAYLOAD ===\n{payload}",
             )
             if estimate_tokens(payload) <= max_payload_tokens:
@@ -2442,7 +1785,7 @@ class SynthesisPipeline:
         def consolidate_schemas(schema_dir: Path) -> None:
             py_files = sorted([
                 f for f in schema_dir.glob("*.py")
-                if f.name not in ("master_ontology.py", "enums.py", "__init__.py")
+                if f.name not in ("master_ontology.py", "comprehensive_ontology.py", "__init__.py")
             ])
             if not py_files:
                 return
@@ -2458,87 +1801,24 @@ class SynthesisPipeline:
                 out_master = schema_dir / "master_ontology.py"
                 with open(out_master, "w", encoding="utf-8") as f:
                     f.write(master_code)
-                self._checkpoint("Phase 3: Consolidation", f"Saved {schema_dir.name}/master_ontology.py", out_master)
+                self._checkpoint("Phase 2: Consolidation", "Saved master_ontology.py", out_master)
+
+                comp_path = schema_dir / "comprehensive_ontology.py"
+                with open(comp_path, "w", encoding="utf-8") as f:
+                    f.write(master_code)
+                self._checkpoint("Phase 2: Consolidation", "Saved comprehensive_ontology.py", comp_path)
             except Exception as e:
-                log_error(f"[Synthesis {path_type}] Error generating master_ontology for {schema_dir.name}: {e}")
+                log_error(f"[Synthesis {path_type}] Error generating master_ontology: {e}")
 
-        if run_norm:
-            consolidate_schemas(norm_dir)
-        if run_raw:
-            consolidate_schemas(raw_dir)
-
-        # =====================================================================
-        # PHASE 4: Path Comprehensive Ontology
-        # =====================================================================
-        print(f"   -> [{path_label}] Phase 4: Master Ontology Synthesis...")
-        norm_master = (
-            (norm_dir / "master_ontology.py").read_text(encoding="utf-8")
-            if run_norm and (norm_dir / "master_ontology.py").exists()
-            else ""
-        )
-        raw_master = (
-            (raw_dir / "master_ontology.py").read_text(encoding="utf-8")
-            if run_raw and (raw_dir / "master_ontology.py").exists()
-            else ""
-        )
-
-        enums_code = ""
-        if run_norm and (norm_dir / "enums.py").exists():
-            enums_code = (norm_dir / "enums.py").read_text(encoding="utf-8")
-        elif run_raw and (raw_dir / "enums.py").exists():
-            enums_code = (raw_dir / "enums.py").read_text(encoding="utf-8")
-
-        final_payload = (
-            f"--- ENUMS ---\n{enums_code}\n\n"
-            f"--- RAW MASTER ONTOLOGY ---\n{raw_master}\n\n"
-            f"--- NORMALIZED MASTER ONTOLOGY ---\n{norm_master}"
-        )
-        save_payload_file(
-            "phase4_comprehensive_ontology_payload.txt",
-            f"=== SYSTEM PROMPT ===\n{FINAL_ONTOLOGY_SYSTEM_PROMPT}\n\n=== USER PAYLOAD ===\n{final_payload}",
-        )
-
-        final_results = self._run_module_batch(
-            items=[{"id": "comprehensive_ontology", "payload": final_payload, "fallback_module_name": "comprehensive_ontology"}],
-            system_prompt=FINAL_ONTOLOGY_SYSTEM_PROMPT,
-            phase_label="Phase 4: Comprehensive Ontology",
-            default_module_name="comprehensive_ontology",
-            allow_reformat_repair=True,
-            max_new_tokens=CONSOLIDATION_MAX_NEW_TOKENS,
-        )
-        if final_results and final_results[0]["success"]:
-            final_code = deduplicate_consolidated_classes(final_results[0]["source_code"])
-        else:
-            err_msg = final_results[0]["error"] if final_results else "Unknown error"
-            log_error(f"[Synthesis {path_type}] Error generating comprehensive_ontology: {err_msg}")
-            final_code = "# Error generating comprehensive ontology"
-
-        comp_path = output_base_dir / "comprehensive_ontology.py"
-        with open(comp_path, "w", encoding="utf-8") as f:
-            f.write(final_code)
-        self._checkpoint("Phase 4: Comprehensive Ontology", "Saved comprehensive_ontology.py", comp_path)
+        consolidate_schemas(output_base_dir)
 
         # Finalization (__init__.py & optional ruff format)
-        if run_norm:
-            with open(norm_dir / "__init__.py", "w", encoding="utf-8") as f:
-                f.write("# Normalized Schemas")
-            try:
-                subprocess.run(["ruff", "format", str(norm_dir)], capture_output=True, text=True, check=False)
-            except Exception as e:
-                log_error(f"[Synthesis {path_type}] Error running ruff on norm: {e}")
-
-        if run_raw:
-            with open(raw_dir / "__init__.py", "w", encoding="utf-8") as f:
-                f.write("# Raw Schemas")
-            try:
-                subprocess.run(["ruff", "format", str(raw_dir)], capture_output=True, text=True, check=False)
-            except Exception as e:
-                log_error(f"[Synthesis {path_type}] Error running ruff on raw: {e}")
-
+        with open(output_base_dir / "__init__.py", "w", encoding="utf-8") as f:
+            f.write("# Synthesized Community Schemas")
         try:
-            subprocess.run(["ruff", "format", str(comp_path)], capture_output=True, text=True, check=False)
+            subprocess.run(["ruff", "format", str(output_base_dir)], capture_output=True, text=True, check=False)
         except Exception as e:
-            log_error(f"[Synthesis {path_type}] Error running ruff on comprehensive: {e}")
+            log_error(f"[Synthesis {path_type}] Error running ruff on {output_base_dir}: {e}")
 
         print(f"   [OK] [{path_label}] Synthesis complete: {output_base_dir}")
 
@@ -2553,33 +1833,9 @@ def build_default_config() -> Dict[str, Any]:
         "directories": {
             "outputs": OUTPUTS_DIR,
         },
-        "refinement": {
-            "embedding_model": EMBEDDING_MODEL,
-            "vector_cache_dir": VECTOR_CACHE_DIR,
-        },
         "topology": {
-            "center_agglomeration_embeddings": CENTER_AGGLOMERATION_EMBEDDINGS,
             "semantic_clustering": {
                 "triplet_payload_mode": TRIPLET_PAYLOAD_MODE,
-                "exclude_hub_triplets_from_communities": EXCLUDE_HUB_TRIPLETS_FROM_COMMUNITIES,
-            },
-            "architectural_tiers": {
-                "enabled": ARCHITECTURAL_TIERS_ENABLED,
-                "weights": {
-                    "prototypicality": TIER_WEIGHT_PROTOTYPICALITY,
-                    "centrality": TIER_WEIGHT_CENTRALITY,
-                    "fidelity": TIER_WEIGHT_FIDELITY,
-                },
-                "tier_1_percentile": TIER_1_PERCENTILE,
-                "tier_1_min_entities": TIER_1_MIN_ENTITIES,
-                "tier_1_max_entities": TIER_1_MAX_ENTITIES,
-                "tier_2_percentile": TIER_2_PERCENTILE,
-                "min_fidelity_tier_1": MIN_FIDELITY_TIER_1,
-                "boundary_discount": BOUNDARY_DISCOUNT,
-                "fallback_prototypicality": FALLBACK_PROTOTYPICALITY,
-                "fallback_fidelity": FALLBACK_FIDELITY,
-                "export_tier_csv": EXPORT_TIER_CSV,
-                "export_diagnostics": EXPORT_DIAGNOSTICS,
             },
         },
         "synthesis": {
@@ -2589,24 +1845,10 @@ def build_default_config() -> Dict[str, Any]:
             },
             "context_window_cap": CONTEXT_WINDOW_CAP,
             "save_llm_payloads": SAVE_LLM_PAYLOADS,
-            "payload_output_dir": PAYLOAD_OUTPUT_DIR,
-            "execution_mode": EXECUTION_MODE,
-            "schema_pass_mode": SCHEMA_PASS_MODE,
-            "payload_values": PAYLOAD_VALUES_MODE,
             "min_cluster_size": MIN_CLUSTER_SIZE,
             "max_triplets_per_target": MAX_TRIPLETS_PER_TARGET,
-            "enum_clustering": {
-                "enabled": ENUM_CLUSTERING_ENABLED,
-                "min_cluster_size": ENUM_MIN_CLUSTER_SIZE,
-                "distance_threshold": ENUM_DISTANCE_THRESHOLD,
-                "min_cohesion_score": ENUM_MIN_COHESION_SCORE,
-                "max_clusters_per_batch": ENUM_MAX_CLUSTERS_PER_BATCH,
-                "max_terms_per_cluster": ENUM_MAX_TERMS_PER_CLUSTER,
-            },
             "top_domain_terms_count": TOP_DOMAIN_TERMS_COUNT,
             "domain_terms_idf_exponent": DOMAIN_TERMS_IDF_EXPONENT,
-            "domain_terms_multi_word_boost": DOMAIN_TERMS_MULTI_WORD_BOOST,
-            "generic_exclusions": GENERIC_EXCLUSIONS,
             "max_sentences_per_target": MAX_SENTENCES_PER_TARGET,
             "min_sentence_length": MIN_SENTENCE_LENGTH,
             "observation_overlap_weight": OBSERVATION_OVERLAP_WEIGHT,
@@ -2638,7 +1880,7 @@ def main() -> None:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Reuse existing Phase 2 community schema .py files on disk.",
+        help="Reuse existing Phase 1 community schema .py files on disk.",
     )
     args, _ = parser.parse_known_args()
     if args.dry_run:
@@ -2651,23 +1893,16 @@ def main() -> None:
     config = build_default_config()
 
     refined_triplets = load_json(REFINED_TRIPLETS_PATH)
-    original_triplets = load_json(ORIGINAL_TRIPLETS_PATH)
-    taxonomic_map = load_json(TAXONOMIC_MAP_PATH, required=False) or {}
-    master_themes_raw = load_json(MASTER_THEMES_PATH, required=False) or {}
-
-    if not refined_triplets or not original_triplets:
-        print("CRITICAL ERROR: Cannot run Stage 4. Missing required preceding stage outputs (Stages 1 & 2).")
-        print("Please run preceding stages first ('python3 run_pipeline.py').")
+    if not refined_triplets:
+        print(f"CRITICAL ERROR: Cannot run Stage 4. Missing required Stage 2 output ({REFINED_TRIPLETS_PATH}).")
+        print("Please run preceding stages first.")
         sys.exit(1)
-
-    synth_mode = config.get("synthesis", {}).get("execution_mode", "community")
-    print(f"   -> Synthesis Execution Mode: '{synth_mode}'")
 
     # Phase 0: Dynamic Target Resolution using CURRENT synthesis config
     print("   -> Phase 0: Resolving Synthesis Targets from Stage 3 Graph Partitions...")
     comm_file = Path(TOPOLOGY_PARTITIONS_PATH)
     if not comm_file.exists():
-        comm_file = Path("outputs/03_topology/community/topology_partitions.json")
+        comm_file = Path(OUTPUTS_DIR) / "03_topology" / "community" / "topology_partitions.json"
     comm_topology = load_json(comm_file, required=False)
 
     resolved_targets_path = Path(RESOLVED_TARGETS_OUTPUT_DIR) / "resolved_community_targets.json"
@@ -2689,20 +1924,11 @@ def main() -> None:
         )
         sys.exit(1)
 
-    master_themes: List[str] = []
-    if isinstance(master_themes_raw, dict):
-        master_themes = master_themes_raw.get("master_themes", [])
-    elif isinstance(master_themes_raw, list):
-        master_themes = master_themes_raw
-
     try:
         pipeline = SynthesisPipeline(config)
         pipeline.execute(
             comm_targets=comm_targets,
             refined_triplets=refined_triplets,
-            original_triplets=original_triplets,
-            taxonomic_map=taxonomic_map,
-            master_themes=master_themes,
         )
         print("=== Stage 4 Synthesis Completed Successfully ===")
     except Exception as e:
