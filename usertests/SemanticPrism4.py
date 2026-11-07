@@ -109,8 +109,8 @@ MAX_TRIPLETS_PER_TARGET: int = 1200                  # Maximum triplets per sche
 TRIPLET_PAYLOAD_MODE: str = "strictly_intra_only"    # "strictly_intra_only" or "include_boundary"
 
 # --- 4. Schema Cardinality Bounds ---
-MAX_ENUM_MEMBERS_PER_CLASS: int = 12                 # Max distinct members allowed per Enum class
-MAX_BASEMODEL_FIELDS_PER_CLASS: int = 12             # Max fields allowed per Pydantic BaseModel class
+MAX_ENUM_MEMBERS_PER_CLASS: int = 15                 # Max distinct members allowed per Enum class
+MAX_BASEMODEL_FIELDS_PER_CLASS: int = 15             # Max fields allowed per Pydantic BaseModel class
 
 # --- 5. Domain Term Scoring (C-TF-IDF) ---
 TOP_DOMAIN_TERMS_COUNT: int = 5
@@ -635,7 +635,7 @@ def _sanitize_ast_models(code: str, context_label: str = "schema") -> str:
     Domain-agnostic AST post-processor for Pydantic BaseModel classes that:
       1. Deduplicates fields within each BaseModel.
       2. Caps/collapses shared 2-token snake_case prefixes (prevents flattened sub-entity attribute dumps).
-      3. Caps/collapses shared non-generic suffix tokens and boolean flag series.
+      3. Caps/collapses shared non-generic suffix tokens.
       4. Enforces MAX_BASEMODEL_FIELDS_PER_CLASS (12) per BaseModel, prioritizing core/typed/collection fields.
     """
     max_shared_prefix = 2
@@ -704,7 +704,7 @@ def _sanitize_ast_models(code: str, context_label: str = "schema") -> str:
         if not field_entries:
             continue
 
-        # Pass 1: Structural prefix-entropy, suffix-repetition & boolean-series filtering
+        # Pass 1: Structural prefix-entropy & suffix-repetition filtering
         raw_prefix2_counts: Counter = Counter(
             f"{e[4][0]}_{e[4][1]}" for e in field_entries if len(e[4]) >= 3
         )
@@ -713,7 +713,6 @@ def _sanitize_ast_models(code: str, context_label: str = "schema") -> str:
         )
         prefix2_counts: Counter = Counter()
         suffix_counts: Counter = Counter()
-        bool_series_counts: int = 0
         filtered_entries: List[Tuple[int, str, ast.stmt, bool, List[str], str]] = []
 
         for entry in field_entries:
@@ -789,27 +788,10 @@ def _sanitize_ast_models(code: str, context_label: str = "schema") -> str:
                     )
                     continue
 
-            # 1c. Boolean flag proliferation cap
-            if is_bool:
-                if (len(parts) >= 3 or (suffix1 and raw_suffix_counts[suffix1] > 1)) and bool_series_counts >= 1:
-                    modified = True
-                    stripped_details.append(
-                        f"{norm_name}: {ann_str} [reason: boolean flag series cap]"
-                    )
-                    continue
-                if bool_series_counts >= 2:
-                    modified = True
-                    stripped_details.append(
-                        f"{norm_name}: {ann_str} [reason: boolean field proliferation cap (max 2 boolean flags)]"
-                    )
-                    continue
-
             if prefix2:
                 prefix2_counts[prefix2] += 1
             if suffix1 and suffix1 not in exempt_suffixes:
                 suffix_counts[suffix1] += 1
-            if is_bool:
-                bool_series_counts += 1
 
             filtered_entries.append((idx, norm_name, stmt, is_bool, parts, ann_str))
 
@@ -904,12 +886,26 @@ def clean_python_code(code: str, context_label: str = "schema") -> str:
     code = re.sub(r"[\u4e00-\u9fff]+", "", code)
 
     # Strip any accidental meta-modeling classes that mirror the prompt/JSON wrapper
-    code = re.sub(
-        r"(?m)^class\s+(ThemeObservation|ThematicObservation|GeneratedModule)\s*\([^)]*\):.*?(?=(?:\nclass\s+|\n[A-Za-z0-9_]+\s*=|\Z))",
-        "",
+    meta_matches = re.findall(
+        r"(?m)^class\s+(ThemeObservation|ThematicObservation|GeneratedModule)\s*\([^)]*\):",
         code,
-        flags=re.DOTALL,
     )
+    if meta_matches:
+        code = re.sub(
+            r"(?m)^class\s+(ThemeObservation|ThematicObservation|GeneratedModule)\s*\([^)]*\):.*?(?=(?:\nclass\s+|\n[A-Za-z0-9_]+\s*=|\Z))",
+            "",
+            code,
+            flags=re.DOTALL,
+        )
+        for m_cls in meta_matches:
+            _log_sanitization_detail(
+                context_label=context_label,
+                class_name=m_cls,
+                class_kind="MetaModel",
+                kept_count=0,
+                stripped_items=[f"class {m_cls} [reason: banned prompt-wrapper meta-model]"],
+                extra_note="Meta-model class mirroring prompt envelope was stripped completely.",
+            )
     code = _sanitize_ast_enums(code.strip(), context_label=context_label)
     code = _sanitize_ast_models(code.strip(), context_label=context_label)
     return code.strip()
@@ -958,11 +954,24 @@ def deduplicate_consolidated_classes(code: str, context_label: str = "master_ont
                         for stmt in enums_by_name[name].body
                         if get_assigned_name(stmt) is not None
                     }
+                    added_members, skipped_members = [], []
                     for stmt in node.body:
                         m_name = get_assigned_name(stmt)
-                        if m_name and m_name not in existing_members:
-                            enums_by_name[name].body.append(stmt)
-                            existing_members.add(m_name)
+                        if m_name:
+                            if m_name not in existing_members:
+                                enums_by_name[name].body.append(stmt)
+                                existing_members.add(m_name)
+                                added_members.append(m_name)
+                            else:
+                                skipped_members.append(f"{m_name} [reason: duplicate member across merged Enum '{name}']")
+                    _log_sanitization_detail(
+                        context_label=context_label,
+                        class_name=name,
+                        class_kind="Enum (Consolidation Merge)",
+                        kept_count=len(existing_members),
+                        stripped_items=skipped_members,
+                        extra_note=f"Merged duplicate Enum class '{name}' (added {len(added_members)} unique member(s)).",
+                    )
             else:
                 if name not in models_by_name:
                     models_by_name[name] = node
@@ -972,11 +981,24 @@ def deduplicate_consolidated_classes(code: str, context_label: str = "master_ont
                         for stmt in models_by_name[name].body
                         if get_assigned_name(stmt) is not None
                     }
+                    added_fields, skipped_fields = [], []
                     for stmt in node.body:
                         f_name = get_assigned_name(stmt)
-                        if f_name and f_name not in existing_fields:
-                            models_by_name[name].body.append(stmt)
-                            existing_fields.add(f_name)
+                        if f_name:
+                            if f_name not in existing_fields:
+                                models_by_name[name].body.append(stmt)
+                                existing_fields.add(f_name)
+                                added_fields.append(f_name)
+                            else:
+                                skipped_fields.append(f"{f_name} [reason: duplicate field across merged BaseModel '{name}']")
+                    _log_sanitization_detail(
+                        context_label=context_label,
+                        class_name=name,
+                        class_kind="BaseModel (Consolidation Merge)",
+                        kept_count=len(existing_fields),
+                        stripped_items=skipped_fields,
+                        extra_note=f"Merged duplicate BaseModel class '{name}' (added {len(added_fields)} unique field(s)).",
+                    )
         else:
             other_nodes.append(node)
 
@@ -987,6 +1009,14 @@ def deduplicate_consolidated_classes(code: str, context_label: str = "master_ont
             model_node = models_by_name.pop(m_name)
             model_node.name = new_name
             models_by_name[new_name] = model_node
+            _log_sanitization_detail(
+                context_label=context_label,
+                class_name=m_name,
+                class_kind="BaseModel (Collision Rename)",
+                kept_count=len(model_node.body),
+                stripped_items=[],
+                extra_note=f"Renamed BaseModel '{m_name}' -> '{new_name}' to disambiguate collision with Enum '{m_name}'.",
+            )
 
     tree.body = other_nodes + list(enums_by_name.values()) + list(models_by_name.values())
     try:
@@ -1812,13 +1842,15 @@ class SynthesisPipeline:
 
         consolidate_schemas(output_base_dir)
 
-        # Finalization (__init__.py & optional ruff format)
+        # Finalization (__init__.py & optional ruff format if ruff is installed)
         with open(output_base_dir / "__init__.py", "w", encoding="utf-8") as f:
-            f.write("# Synthesized Community Schemas")
-        try:
-            subprocess.run(["ruff", "format", str(output_base_dir)], capture_output=True, text=True, check=False)
-        except Exception as e:
-            log_error(f"[Synthesis {path_type}] Error running ruff on {output_base_dir}: {e}")
+            f.write("# Synthesized Community Schemas\n")
+        ruff_bin = shutil.which("ruff")
+        if ruff_bin:
+            try:
+                subprocess.run([ruff_bin, "format", str(output_base_dir)], capture_output=True, text=True, check=False)
+            except Exception as e:
+                log_error(f"[Synthesis {path_type}] Error running ruff on {output_base_dir}: {e}")
 
         print(f"   [OK] [{path_label}] Synthesis complete: {output_base_dir}")
 
