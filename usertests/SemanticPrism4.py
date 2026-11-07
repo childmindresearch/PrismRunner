@@ -129,7 +129,12 @@ OBSERVATION_OVERLAP_MAX_CAP: int = 4
 
 class GeneratedModule(BaseModel):
     module_name: str = Field(
-        description="The functional title abstracting the core semantic nodes, formatted strictly as a snake_case string (e.g., 'core_database_architecture')."
+        description=(
+            "A specific 2-to-4 word snake_case module name derived directly from this cluster's highest-ranked "
+            "top_domain_terms and primary BaseModel class (e.g., 'sensory_overload_regulation' or "
+            "'visual_schedule_transition'). NEVER use broad macro theme titles or generic suffixes like "
+            "'_schema', '_module', or '_ontology'."
+        )
     )
     source_code: str = Field(
         description=(
@@ -202,7 +207,7 @@ CRITICAL MODELING RULES:
 
 OUTPUT SCHEMA INSTRUCTIONS:
 Return a JSON object conforming to the GeneratedModule schema:
-- `module_name` (string): A concise, descriptive `snake_case` name for this module (e.g., "patient_assessment_workflow").
+- `module_name` (string): A specific 2-to-4 word `snake_case` name anchored to this cluster's `top_domain_terms` and primary `BaseModel` class (e.g., "sensory_overload_regulation"). Do NOT copy the broad macro theme header and do NOT append generic suffixes like "_schema", "_module", or "_model".
 - `source_code` (string): The complete, executable Python code defining the Pydantic BaseModels and any field-referenced Enums."""
 
 
@@ -1034,7 +1039,107 @@ def sanitize_module_name(name: str, fallback: str = "domain_schema") -> str:
         return fallback
     cleaned = re.sub(r"\.py$", "", str(name).strip().lower())
     cleaned = re.sub(r"[^a-z0-9_]+", "_", cleaned).strip("_")
+    stripped_suffix = re.sub(r"_(?:schema|schemas|module|ontology|models|model)$", "", cleaned).strip("_")
+    if stripped_suffix and stripped_suffix not in ("domain", "community", "master", "comprehensive"):
+        cleaned = stripped_suffix
     return cleaned or fallback
+
+
+def _camel_to_snake(name: str) -> str:
+    """Converts a PascalCase / CamelCase identifier into snake_case."""
+    s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", str(name).strip())
+    s2 = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
+    return re.sub(r"[^a-z0-9_]+", "_", s2).strip("_")
+
+
+def _extract_ast_basemodel_names(code: str) -> List[str]:
+    """Returns snake_case names of all non-Enum BaseModel classes defined in `code`."""
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return []
+
+    def is_enum_class(node: ast.ClassDef) -> bool:
+        for b in node.bases:
+            if isinstance(b, ast.Name) and "Enum" in b.id:
+                return True
+            if isinstance(b, ast.Attribute) and "Enum" in b.attr:
+                return True
+        return False
+
+    names: List[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and not is_enum_class(node):
+            snake = sanitize_module_name(_camel_to_snake(node.name), fallback="")
+            if snake and snake not in names:
+                names.append(snake)
+    return names
+
+
+def _resolve_unique_module_name(
+    raw_mod_name: str,
+    code: str,
+    top_terms: Optional[List[str]],
+    used_names: set,
+    fallback: str,
+) -> str:
+    """
+    Ensures each community `.py` file receives a distinct, specific snake_case module name.
+    If the LLM's `raw_mod_name` is generic or collides with an already-used module name in
+    `used_names`, disambiguates using the module's AST BaseModel class names and C-TF-IDF
+    `top_domain_terms`.
+    """
+    candidate = sanitize_module_name(raw_mod_name, fallback=fallback)
+    is_generic = candidate in ("domain_schema", "community_schema", fallback) or candidate.startswith("community_")
+    model_names = _extract_ast_basemodel_names(code)
+    term_slugs = [
+        sanitize_module_name(t, fallback="")
+        for t in (top_terms or [])
+        if sanitize_module_name(t, fallback="")
+    ]
+
+    if not is_generic and candidate not in used_names:
+        used_names.add(candidate)
+        return candidate
+
+    # 1. Try primary BaseModel class names directly (in snake_case)
+    for m_name in model_names:
+        if m_name not in used_names:
+            used_names.add(m_name)
+            return m_name
+
+    # 2. Try combining the top distinctive C-TF-IDF term with the primary BaseModel name or candidate
+    for t_slug in term_slugs:
+        if model_names:
+            t_tokens = [tok for tok in t_slug.split("_") if tok and tok not in model_names[0].split("_")]
+            if t_tokens:
+                combined_model = f"{'_'.join(t_tokens[:2])}_{model_names[0]}"
+                if combined_model not in used_names:
+                    used_names.add(combined_model)
+                    return combined_model
+        if not is_generic:
+            t_tokens = [tok for tok in t_slug.split("_") if tok and tok not in candidate.split("_")]
+            if t_tokens:
+                combined_cand = f"{candidate}_{'_'.join(t_tokens[:2])}"
+                if combined_cand not in used_names:
+                    used_names.add(combined_cand)
+                    return combined_cand
+        if len(t_slug.split("_")) >= 2 and t_slug not in used_names:
+            used_names.add(t_slug)
+            return t_slug
+
+    # 3. Try combining top two BaseModel names
+    if len(model_names) >= 2:
+        pair_name = f"{model_names[0]}_{model_names[1]}"
+        if pair_name not in used_names:
+            used_names.add(pair_name)
+            return pair_name
+
+    # 4. Deterministic fallback with target suffix
+    base = model_names[0] if model_names else (term_slugs[0] if term_slugs else candidate)
+    unique_cand = f"{base}_{fallback}" if base != fallback else fallback
+    used_names.add(unique_cand)
+    return unique_cand
 
 
 def validate_python_syntax(code: str) -> Tuple[bool, Optional[str]]:
@@ -1643,7 +1748,7 @@ class SynthesisPipeline:
             target_nodes: List[str],
             subset: List[dict],
             merged_from: Optional[List[Any]] = None,
-        ) -> str:
+        ) -> Tuple[str, List[str]]:
             capped_subset = subset[:max_triplets_per_target] if max_triplets_per_target > 0 else subset
             top_terms = extract_top_domain_terms(target_nodes, capped_subset, top_k=top_domain_terms_count)
             observations = extract_thematic_observations(
@@ -1656,12 +1761,14 @@ class SynthesisPipeline:
                 if tr.get("theme_association") and tr.get("theme_association") != "Other"
             )
             primary_theme = theme_counts.most_common(1)[0][0] if theme_counts else ""
-            terms_context = f" — Focus: {', '.join(top_terms[:3])}" if top_terms else ""
-            domain_focus = (
-                f"{primary_theme}{terms_context}"
-                if primary_theme
-                else (f"Domain Focus: {', '.join(top_terms[:3])}" if top_terms else f"Community #{target_id}")
-            )
+            if top_terms and primary_theme:
+                domain_focus = f"{', '.join(top_terms[:3])} (Theme: {primary_theme})"
+            elif top_terms:
+                domain_focus = f"{', '.join(top_terms[:3])}"
+            elif primary_theme:
+                domain_focus = primary_theme
+            else:
+                domain_focus = f"Community #{target_id}"
 
             payload_dict: Dict[str, Any] = {
                 "community_id": target_id,
@@ -1671,9 +1778,10 @@ class SynthesisPipeline:
             }
             if merged_from and len(merged_from) > 1:
                 payload_dict["consolidated_sub_communities"] = merged_from
-            return json.dumps(payload_dict, indent=2)
+            return json.dumps(payload_dict, indent=2), top_terms
 
         phase1_batch_items: List[Dict[str, Any]] = []
+        used_module_names: set = set()
         active_sys_prompt = SCHEMA_SYNTHESIS_PROMPT
 
         for i, target in enumerate(targets, start=1):
@@ -1688,13 +1796,16 @@ class SynthesisPipeline:
             if subset:
                 existing_files = list(output_base_dir.glob(f"{i:02d}_*.py")) if RESUME_EXISTING_SCHEMAS else []
                 if existing_files:
+                    existing_stem = re.sub(r"^\d+_", "", existing_files[0].stem)
+                    if existing_stem:
+                        used_module_names.add(existing_stem)
                     print(f"         -> [Resume] Skipping Target {i}/{len(targets)} ({existing_files[0].name} exists)")
                 else:
                     print(
                         f"         -> Queuing Target {i}/{len(targets)} ({target_type} {target_id}) "
                         f"(Size: {len(target_nodes)} nodes, {len(subset)}/{max_triplets_per_target} max triplets)..."
                     )
-                    user_payload = format_phase1_payload(
+                    user_payload, top_terms = format_phase1_payload(
                         target_id, list(target_nodes), subset, merged_from=merged_from
                     )
                     save_payload_file(
@@ -1708,6 +1819,7 @@ class SynthesisPipeline:
                         "target_id": target_id,
                         "target_dir": output_base_dir,
                         "payload": user_payload,
+                        "top_terms": top_terms,
                         "fallback_module_name": f"community_{target_id}",
                     })
 
@@ -1720,7 +1832,14 @@ class SynthesisPipeline:
                 saved_phase1_ids.add(item["id"])
                 i = item["target_index"]
                 target_dir = item["target_dir"]
-                filename = f"{i:02d}_{mod_name}.py"
+                resolved_mod_name = _resolve_unique_module_name(
+                    raw_mod_name=mod_name,
+                    code=code,
+                    top_terms=item.get("top_terms"),
+                    used_names=used_module_names,
+                    fallback=item.get("fallback_module_name", f"community_{item['target_id']}"),
+                )
+                filename = f"{i:02d}_{resolved_mod_name}.py"
                 out_path = target_dir / filename
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(code)
