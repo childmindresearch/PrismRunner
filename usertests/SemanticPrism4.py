@@ -25,6 +25,7 @@ import ast
 from collections import Counter, defaultdict
 from datetime import datetime
 import json
+import keyword
 import os
 from pathlib import Path
 import re
@@ -131,15 +132,16 @@ class GeneratedModule(BaseModel):
     module_name: str = Field(
         description=(
             "A specific 2-to-4 word snake_case module name derived directly from this cluster's highest-ranked "
-            "top_domain_terms and primary BaseModel class (e.g., 'sensory_overload_regulation' or "
-            "'visual_schedule_transition'). NEVER use broad macro theme titles or generic suffixes like "
+            "top_domain_terms and primary BaseModel class (e.g., 'resource_allocation_workflow' or "
+            "'incident_escalation_protocol'). NEVER use broad macro theme titles or generic suffixes like "
             "'_schema', '_module', or '_ontology'."
         )
     )
     source_code: str = Field(
         description=(
             "The raw Python source code containing the generated Pydantic BaseModels and Enums, including all necessary "
-            f"import statements. Every BaseModel class MUST have at most {MAX_BASEMODEL_FIELDS_PER_CLASS} fields (decompose sub-entities into separate "
+            "import statements. Every BaseModel class MUST include a descriptive triple-quoted docstring (\"\"\"...\"\"\") "
+            f"and have at most {MAX_BASEMODEL_FIELDS_PER_CLASS} fields (decompose sub-entities into separate "
             "models instead of prefix-flattened fields, and use List/Enum fields instead of boolean flag lists). "
             f"Every Enum class MUST have at most {MAX_ENUM_MEMBERS_PER_CLASS} concise atomic members (<= 4 words each)."
         )
@@ -179,21 +181,24 @@ You will receive an extracted thematic cluster of domain concepts and real-world
 Your job is to interpret the underlying domain workflows, entities, and attributes, and synthesize a clean, practical, and coherent Pydantic (v2) schema module.
 
 INPUT STRUCTURE:
-1. `target_domain_focus`: Primary conceptual focus or theme defining this cluster.
+1. `target_domain_focus`: Overarching theme(s) defining this cluster (ordered by prominence, with 'Other' always placed last when present).
 2. `top_domain_terms`: Key domain concepts and vocabulary defining this cluster. Use these to guide the naming of classes, fields, and core entities.
-3. `thematic_observations`: Authentic source text sentences organized by theme. Study these narrative observations to understand real-world workflows, data types, entity interactions, and field constraints.
+3. `thematic_observations`: Authentic source text sentences organized by theme (with 'Other' placed last). Study these narrative observations to understand real-world workflows, data types, entity interactions, and field constraints.
 
 CRITICAL MODELING RULES:
 1. **Synthesize Domain Workflows, Do Not Transcribe:** Do NOT mechanically turn every term into a separate class. Step back, understand the domain narrative, and design 1 or more intuitive, cohesive Pydantic `BaseModel` classes modeling the core subject matter.
 2. **Strict BaseModel Field Budget (`<= {MAX_BASEMODEL_FIELDS_PER_CLASS}` Fields Maximum) & Anti-Bloat Rules:**
    - Every Pydantic `BaseModel` class MUST contain **between 4 and {MAX_BASEMODEL_FIELDS_PER_CLASS} fields maximum (`<= {MAX_BASEMODEL_FIELDS_PER_CLASS}` fields)**. Prioritize the most essential, high-level domain attributes.
-   - **NO Prefix-Flattened Sub-Object Dumps:** NEVER flatten a related sub-entity into dozens of prefixed fields on a parent model (e.g., NEVER emit `digital_tool_used`, `digital_tool_description`, `digital_tool_accessibility`, `digital_tool_subscription_cost`, etc.). Instead, either compose a separate compact `BaseModel` (`<= {MAX_BASEMODEL_FIELDS_PER_CLASS}` fields) referenced by a single field, or use 1–2 high-level summary fields.
-   - **NO Boolean-Flag Lists:** NEVER turn list items, goals, capabilities, or roles into individual `Optional[bool]` fields (e.g., NEVER emit `time_management_improvement: Optional[bool]`, `planning_skills_improvement: Optional[bool]`, `organization_improvement: Optional[bool]`). Group them into a single `Optional[List[str]]` or `Optional[List[Enum]]` field (e.g., `target_outcomes: Optional[List[str]]`).
+   - **NO Prefix-Flattened Sub-Object Dumps:** NEVER flatten a related sub-entity into dozens of prefixed fields on a parent model (e.g., NEVER emit `sub_entity_name`, `sub_entity_description`, `sub_entity_status`, `sub_entity_cost`, etc.). Instead, either compose a separate compact `BaseModel` (`<= {MAX_BASEMODEL_FIELDS_PER_CLASS}` fields) referenced by a single field, or use 1–2 high-level summary fields.
+   - **NO Boolean-Flag Lists:** NEVER turn list items, goals, capabilities, or roles into individual `Optional[bool]` fields (e.g., NEVER emit `outcome_a_achieved: Optional[bool]`, `outcome_b_achieved: Optional[bool]`, `outcome_c_achieved: Optional[bool]`). Group them into a single `Optional[List[str]]` or `Optional[List[Enum]]` field (e.g., `target_outcomes: Optional[List[str]]`).
 3. **Field-Grounded Atomic Enums/Literals (NO Orphan or Sentence-Fragment Enums):**
    - Define an `Enum` class ONLY when it is directly referenced as the type of at least one field on a `BaseModel` in this module.
    - Every `Enum` member MUST be a short, atomic category label of **at most 4 words (`<= 3` underscores, `<= 35` characters)**, with **at most {MAX_ENUM_MEMBERS_PER_CLASS} members per Enum class**.
+   - If `'Other'` / `OTHER` is included in any `Enum` or `Literal`, ALWAYS place `'Other'` last regardless of how many values are included.
    - NEVER encode full sentences, prepositional clauses, or multi-attribute combinations inside `Enum` values; decompose distinct dimensions into separate `BaseModel` fields.
-4. **Field Descriptions & Optionality:** Declare model attributes using `Field(default=None, description="...")`, providing a concise explanation of the domain meaning derived from `thematic_observations`.
+4. **Class Docstrings, Field Descriptions & Optionality:**
+   - Every `BaseModel` class MUST begin with a descriptive triple-quoted docstring (`\"\"\"...\"\"\"`) explaining what the model entails and its role in the domain.
+   - Declare model attributes using `Field(default=None, description="...")`, providing a concise explanation of the domain meaning derived from `thematic_observations`.
    - Field names MUST be valid Python identifiers in `snake_case` (alphanumeric and underscores only, NEVER hyphens like `field-name`).
 5. **Self-Contained & Valid Imports:** The source code must include all necessary imports:
    `from pydantic import BaseModel, Field`
@@ -207,8 +212,8 @@ CRITICAL MODELING RULES:
 
 OUTPUT SCHEMA INSTRUCTIONS:
 Return a JSON object conforming to the GeneratedModule schema:
-- `module_name` (string): A specific 2-to-4 word `snake_case` name anchored to this cluster's `top_domain_terms` and primary `BaseModel` class (e.g., "sensory_overload_regulation"). Do NOT copy the broad macro theme header and do NOT append generic suffixes like "_schema", "_module", or "_model".
-- `source_code` (string): The complete, executable Python code defining the Pydantic BaseModels and any field-referenced Enums."""
+- `module_name` (string): A specific 2-to-4 word `snake_case` name anchored to this cluster's `top_domain_terms` and primary `BaseModel` class (e.g., "resource_allocation_workflow"). Do NOT copy the broad macro theme header and do NOT append generic suffixes like "_schema", "_module", or "_model".
+- `source_code` (string): The complete, executable Python code defining the Pydantic BaseModels (each with a descriptive `\"\"\"...\"\"\"` class docstring) and any field-referenced Enums."""
 
 
 CONSOLIDATION_SYSTEM_PROMPT = f"""You are a Master Ontologist.
@@ -219,9 +224,9 @@ CRITICAL RULES:
    - NEVER define two classes with the exact same name in the file.
    - NEVER define an Enum and a BaseModel sharing the exact same class name.
    - Consolidate repetitive boolean flags or prefixed sub-attributes into clean `List[str]` / `Enum` fields or composed child models rather than bloating a single class past {MAX_BASEMODEL_FIELDS_PER_CLASS} fields.
-2. **Atomic Enum Hygiene:** Embed and deduplicate `Enum` classes at the top of the file (`<= {MAX_ENUM_MEMBERS_PER_CLASS}` members per Enum, `<= 4` words / `<= 35` characters per member). Discard any verbose sentence-fragment Enum members.
+2. **Atomic Enum Hygiene:** Embed and deduplicate `Enum` classes at the top of the file (`<= {MAX_ENUM_MEMBERS_PER_CLASS}` members per Enum, `<= 4` words / `<= 35` characters per member, with `OTHER = "Other"` always placed last when present). Discard any verbose sentence-fragment Enum members.
 3. **Preserve Hierarchy & Relationships:** Maintain valid class inheritance and typed cross-model references.
-4. **Preserve Field Descriptions:** Retain attributes declared as `Field(default=None, description="...")`, preserving the most detailed and descriptive `description` string across merged attributes.
+4. **Preserve Class Docstrings & Field Descriptions:** Ensure every `BaseModel` class begins with a descriptive triple-quoted docstring (`\"\"\"...\"\"\"`) explaining what it entails, and retain attributes declared as `Field(default=None, description="...")`, preserving the most detailed `description` string across merged attributes.
 5. **Valid Python Identifiers:** All attribute names must be valid Python identifiers in `snake_case` (alphanumeric and underscores only, NEVER hyphens).
 6. **Self-Contained Imports:** Ensure all necessary Pydantic and typing imports are included at the top of the file.
 
@@ -245,8 +250,8 @@ TARGET SCHEMA:
 
 REPAIR RULES:
 1. Fix all Python syntax errors, indentation issues, or missing imports (`from pydantic import BaseModel, Field`, `from enum import Enum`, `from typing import ...`).
-2. Ensure all Pydantic fields use valid syntax: `field_name: Optional[Type] = Field(default=None, description="...")`, and keep **at most {MAX_BASEMODEL_FIELDS_PER_CLASS} fields per `BaseModel` class** (removing repetitive prefixed sub-fields or boolean flag series).
-3. Ensure Enum member names use valid `UPPER_SNAKE_CASE` identifiers, inherit from `(str, Enum)`, and contain **at most {MAX_ENUM_MEMBERS_PER_CLASS} concise atomic members (`<= 4` words / `<= 35` characters each)**. Strip any multi-clause phrase Enum members.
+2. Ensure every `BaseModel` class includes a descriptive triple-quoted docstring (`\"\"\"...\"\"\"`), all Pydantic fields use valid syntax (`field_name: Optional[Type] = Field(default=None, description="...")`), and each `BaseModel` class has **at most {MAX_BASEMODEL_FIELDS_PER_CLASS} fields** (removing repetitive prefixed sub-fields or boolean flag series).
+3. Ensure Enum member names use valid `UPPER_SNAKE_CASE` identifiers, inherit from `(str, Enum)`, and contain **at most {MAX_ENUM_MEMBERS_PER_CLASS} concise atomic members (`<= 4` words / `<= 35` characters each)**, placing `OTHER = "Other"` last if present. Strip any multi-clause phrase Enum members.
 4. ABSOLUTE BAN ON META-MODELS: If the malformed input or code contains meta-models like `class ThemeObservation` or `class GeneratedModule` inside `source_code`, DISCARD them completely. Replace them with substantive domain Pydantic models based on the domain concepts and key terms.
 5. Return pure JSON matching the GeneratedModule schema only. Do NOT output markdown explanations or conversational text."""
 
@@ -591,7 +596,31 @@ def _sanitize_ast_enums(code: str, context_label: str = "schema") -> str:
                     kept_stmts.append(stmt)
 
             if member_count > 0:
-                node.body = kept_stmts
+                # Always place 'OTHER' / 'Other' last regardless of how many Enum members are included
+                non_field_stmts: List[ast.stmt] = []
+                regular_member_stmts: List[ast.stmt] = []
+                other_member_stmts: List[ast.stmt] = []
+                for k_stmt in kept_stmts:
+                    k_name = None
+                    k_val = None
+                    if isinstance(k_stmt, ast.Assign) and k_stmt.targets and isinstance(k_stmt.targets[0], ast.Name):
+                        k_name = k_stmt.targets[0].id
+                        if isinstance(k_stmt.value, ast.Constant):
+                            k_val = k_stmt.value.value
+                    elif isinstance(k_stmt, ast.AnnAssign) and isinstance(k_stmt.target, ast.Name):
+                        k_name = k_stmt.target.id
+                        if k_stmt.value and isinstance(k_stmt.value, ast.Constant):
+                            k_val = k_stmt.value.value
+                    if k_name is None:
+                        non_field_stmts.append(k_stmt)
+                    elif k_name.strip().upper() == "OTHER" or (k_val is not None and str(k_val).strip().lower() == "other"):
+                        other_member_stmts.append(k_stmt)
+                    else:
+                        regular_member_stmts.append(k_stmt)
+                reordered_stmts = non_field_stmts + regular_member_stmts + other_member_stmts
+                if reordered_stmts != kept_stmts:
+                    modified = True
+                node.body = reordered_stmts
                 new_body.append(node)
                 if stripped_details:
                     _log_sanitization_detail(
@@ -638,10 +667,14 @@ def _sanitize_ast_enums(code: str, context_label: str = "schema") -> str:
 def _sanitize_ast_models(code: str, context_label: str = "schema") -> str:
     """
     Domain-agnostic AST post-processor for Pydantic BaseModel classes that:
-      1. Deduplicates fields within each BaseModel.
-      2. Caps/collapses shared 2-token snake_case prefixes (prevents flattened sub-entity attribute dumps).
-      3. Caps/collapses shared non-generic suffix tokens.
-      4. Enforces MAX_BASEMODEL_FIELDS_PER_CLASS (12) per BaseModel, prioritizing core/typed/collection fields.
+      1. Renames fields shadowing reserved Pydantic BaseModel attributes or Python keywords.
+      2. Rewrites undefined/dangling non-builtin type annotations to `str`.
+      3. Deduplicates fields within each BaseModel.
+      4. Caps/collapses shared 2-token snake_case prefixes (prevents flattened sub-entity attribute dumps).
+      5. Caps/collapses shared non-generic suffix tokens.
+      6. Enforces MAX_BASEMODEL_FIELDS_PER_CLASS per BaseModel, prioritizing core/typed/collection fields.
+      7. Guarantees every BaseModel has a descriptive triple-quoted docstring (\"\"\"...\"\"\").
+      8. Ensures `from __future__ import annotations` and canonical top-level ordering (Imports -> Enums -> Topological BaseModels).
     """
     max_shared_prefix = 2
     max_shared_suffix = 2
@@ -664,6 +697,57 @@ def _sanitize_ast_models(code: str, context_label: str = "schema") -> str:
         "count", "rate", "list", "items", "category", "mode", "source",
     }
 
+    pydantic_reserved_attrs = {
+        "schema", "json", "copy", "dict", "validate", "fields",
+        "model_config", "model_fields", "model_computed_fields",
+        "model_extra", "model_fields_set", "model_dump",
+        "model_dump_json", "model_validate", "model_json_schema",
+        "model_construct", "model_copy", "model_rebuild",
+        "update_forward_refs", "parse_obj", "parse_raw",
+        "parse_file", "from_orm", "construct",
+    }
+    python_keywords = set(keyword.kwlist) | {"async", "await"}
+
+    # Collect all defined or imported type names to guard against dangling type references
+    known_type_names: set = {
+        "str", "int", "float", "bool", "bytes", "list", "dict", "set", "tuple",
+        "object", "None", "Any", "Optional", "List", "Dict", "Set", "Tuple",
+        "Union", "Literal", "Callable", "Sequence", "Mapping", "Iterable",
+        "Type", "ClassVar", "Final", "Annotated", "BaseModel", "Field", "Enum",
+        "date", "datetime", "time", "timedelta", "UUID", "Decimal", "Path",
+    }
+    for top_node in tree.body:
+        if isinstance(top_node, ast.ClassDef):
+            known_type_names.add(top_node.name)
+        elif isinstance(top_node, ast.Import):
+            for alias in top_node.names:
+                known_type_names.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(top_node, ast.ImportFrom):
+            for alias in top_node.names:
+                known_type_names.add(alias.asname or alias.name)
+        elif isinstance(top_node, ast.Assign):
+            for t in top_node.targets:
+                if isinstance(t, ast.Name):
+                    known_type_names.add(t.id)
+
+    class _DanglingTypeRewriter(ast.NodeTransformer):
+        def __init__(self) -> None:
+            self.replaced: List[str] = []
+
+        def visit_Subscript(self, sub_node: ast.Subscript) -> ast.AST:
+            # Do not rewrite string/identifier arguments inside Literal[...]
+            if isinstance(sub_node.value, ast.Name) and sub_node.value.id == "Literal":
+                return sub_node
+            if isinstance(sub_node.value, ast.Attribute) and sub_node.value.attr == "Literal":
+                return sub_node
+            return self.generic_visit(sub_node)
+
+        def visit_Name(self, name_node: ast.Name) -> ast.AST:
+            if isinstance(name_node.ctx, ast.Load) and name_node.id not in known_type_names:
+                self.replaced.append(name_node.id)
+                return ast.copy_location(ast.Name(id="str", ctx=ast.Load()), name_node)
+            return name_node
+
     modified = False
     for node in tree.body:
         if not isinstance(node, ast.ClassDef) or is_enum_class(node):
@@ -681,10 +765,19 @@ def _sanitize_ast_models(code: str, context_label: str = "schema") -> str:
             ann_str = ""
             if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
                 f_name = stmt.target.id
+                # Rewrite any dangling/undefined type references in field annotation to `str`
+                rewriter = _DanglingTypeRewriter()
+                stmt.annotation = rewriter.visit(stmt.annotation)
                 try:
                     ann_str = ast.unparse(stmt.annotation)
                 except Exception:
                     ann_str = ""
+                if rewriter.replaced:
+                    modified = True
+                    collapsed_details.append(
+                        f"'{f_name}' type annotation -> '{ann_str}' "
+                        f"[reason: rewrote undefined type reference(s) {sorted(set(rewriter.replaced))} to 'str']"
+                    )
             elif isinstance(stmt, ast.Assign) and stmt.targets and isinstance(stmt.targets[0], ast.Name):
                 f_name = stmt.targets[0].id
 
@@ -696,6 +789,20 @@ def _sanitize_ast_models(code: str, context_label: str = "schema") -> str:
                 continue
 
             norm_name = f_name.strip().lower()
+            # Rename fields that shadow Pydantic BaseModel attributes or Python keywords
+            if norm_name in pydantic_reserved_attrs or norm_name in python_keywords:
+                new_f_name = f"{norm_name}_field"
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                    stmt.target.id = new_f_name
+                elif isinstance(stmt, ast.Assign) and stmt.targets and isinstance(stmt.targets[0], ast.Name):
+                    stmt.targets[0].id = new_f_name
+                modified = True
+                collapsed_details.append(
+                    f"'{f_name}' -> '{new_f_name}' [reason: renamed field shadowing reserved keyword/BaseModel attribute]"
+                )
+                f_name = new_f_name
+                norm_name = new_f_name
+
             if norm_name in seen_fields:
                 modified = True
                 stripped_details.append(f"{f_name}: {ann_str or 'Any'} [reason: duplicate field name]")
@@ -800,7 +907,7 @@ def _sanitize_ast_models(code: str, context_label: str = "schema") -> str:
 
             filtered_entries.append((idx, norm_name, stmt, is_bool, parts, ann_str))
 
-        # Pass 2: Enforce hard cap of MAX_BASEMODEL_FIELDS_PER_CLASS (12)
+        # Pass 2: Enforce hard cap of MAX_BASEMODEL_FIELDS_PER_CLASS (15)
         if len(filtered_entries) > MAX_BASEMODEL_FIELDS_PER_CLASS:
             modified = True
             scored = sorted(
@@ -821,6 +928,24 @@ def _sanitize_ast_models(code: str, context_label: str = "schema") -> str:
             kept_top.sort(key=lambda item: item[0])
             filtered_entries = kept_top
 
+        # Guarantee every BaseModel class begins with a descriptive triple-quoted docstring
+        has_docstring = (
+            bool(non_field_prefix_stmts)
+            and isinstance(non_field_prefix_stmts[0], ast.Expr)
+            and isinstance(non_field_prefix_stmts[0].value, ast.Constant)
+            and isinstance(non_field_prefix_stmts[0].value.value, str)
+            and bool(str(non_field_prefix_stmts[0].value.value).strip())
+        )
+        if not has_docstring:
+            human_cls = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", node.name).strip()
+            sample_fields = [e[1].replace("_", " ") for e in filtered_entries[:4]]
+            if sample_fields:
+                synth_doc = f"Represents {human_cls} domain attributes, including {', '.join(sample_fields)}."
+            else:
+                synth_doc = f"Represents {human_cls} domain entity and its associated attributes."
+            non_field_prefix_stmts.insert(0, ast.Expr(value=ast.Constant(value=synth_doc)))
+            modified = True
+
         if stripped_details or collapsed_details:
             _log_sanitization_detail(
                 context_label=context_label,
@@ -836,6 +961,89 @@ def _sanitize_ast_models(code: str, context_label: str = "schema") -> str:
         else:
             node.body = non_field_prefix_stmts + [ast.Pass()] + non_field_suffix_stmts
             modified = True
+
+    # Canonical top-level ordering:
+    # (__future__ (if any) -> standard imports -> constants/aliases -> Enums -> topologically ordered BaseModels)
+    future_nodes: List[ast.AST] = []
+    import_nodes: List[ast.AST] = []
+    enum_nodes: List[ast.ClassDef] = []
+    model_nodes: List[ast.ClassDef] = []
+    other_top_nodes: List[ast.AST] = []
+
+    for top_node in tree.body:
+        if isinstance(top_node, ast.ImportFrom) and top_node.module == "__future__":
+            future_nodes.append(top_node)
+        elif isinstance(top_node, (ast.Import, ast.ImportFrom)):
+            import_nodes.append(top_node)
+        elif isinstance(top_node, ast.ClassDef):
+            if is_enum_class(top_node):
+                enum_nodes.append(top_node)
+            else:
+                model_nodes.append(top_node)
+        else:
+            other_top_nodes.append(top_node)
+
+    # Topologically order BaseModel classes so referenced child BaseModels precede parent BaseModels
+    if len(model_nodes) >= 1:
+        model_map = {m.name: m for m in model_nodes}
+        deps_by_model: Dict[str, List[str]] = {}
+        for m in model_nodes:
+            refs: List[str] = []
+            for st in m.body:
+                if isinstance(st, ast.AnnAssign):
+                    for sub in ast.walk(st.annotation):
+                        if isinstance(sub, ast.Name) and sub.id in model_map and sub.id != m.name and sub.id not in refs:
+                            refs.append(sub.id)
+            deps_by_model[m.name] = refs
+
+        ordered_models: List[ast.ClassDef] = []
+        visited_models: set = set()
+        visiting_models: set = set()
+
+        def _visit_model(m_name: str) -> None:
+            if m_name in visited_models or m_name in visiting_models:
+                return
+            visiting_models.add(m_name)
+            for dep in deps_by_model.get(m_name, []):
+                if dep in model_map:
+                    _visit_model(dep)
+            visiting_models.remove(m_name)
+            visited_models.add(m_name)
+            ordered_models.append(model_map[m_name])
+
+        for m in model_nodes:
+            _visit_model(m.name)
+        if [m.name for m in ordered_models] != [m.name for m in model_nodes]:
+            modified = True
+        model_nodes = ordered_models
+
+        # Quote any remaining self-reference or cyclic forward reference so class creation never raises NameError
+        defined_so_far: set = set()
+        for m in model_nodes:
+            class _ForwardRefQuoter(ast.NodeTransformer):
+                def __init__(self, current_cls: str, ready: set) -> None:
+                    self.current_cls = current_cls
+                    self.ready = ready
+                    self.quoted = False
+
+                def visit_Name(self, n: ast.Name) -> ast.AST:
+                    if isinstance(n.ctx, ast.Load) and n.id in model_map and (n.id == self.current_cls or n.id not in self.ready):
+                        self.quoted = True
+                        return ast.copy_location(ast.Constant(value=n.id), n)
+                    return n
+
+            quoter = _ForwardRefQuoter(m.name, defined_so_far)
+            for st in m.body:
+                if isinstance(st, ast.AnnAssign):
+                    st.annotation = quoter.visit(st.annotation)
+            if quoter.quoted:
+                modified = True
+            defined_so_far.add(m.name)
+
+    new_tree_body = future_nodes + import_nodes + other_top_nodes + enum_nodes + model_nodes
+    if new_tree_body != tree.body:
+        tree.body = new_tree_body
+        modified = True
 
     if not modified:
         return code
@@ -864,6 +1072,9 @@ def clean_python_code(code: str, context_label: str = "schema") -> str:
     # Replace literal \n escape sequences that some LLMs emit outside raw strings
     code = code.replace("\\n", "\n")
 
+    python_keywords = set(keyword.kwlist) | {"async", "await"}
+    keyword_renames: List[str] = []
+
     def fix_line(line: str) -> str:
         # 1. Assignment '=' fix
         m = re.match(r"^(\s+)([a-zA-Z0-9_, ]+?)(\s*=\s*.*)$", line)
@@ -876,16 +1087,29 @@ def clean_python_code(code: str, context_label: str = "schema") -> str:
                 clean_var = re.sub(r"[, ]+", "_", stripped_var)
                 line = f"{indent}{clean_var}{rest}"
 
-        # 2. Type annotation ':' fix for hyphens (e.g. 'help-seeking_barriers: ...' -> 'help_seeking_barriers: ...')
+        # 2. Type annotation ':' fix for hyphens & Python reserved keywords
         m_ann = re.match(r"^(\s+)([a-zA-Z_][a-zA-Z0-9_-]*)(\s*:\s*.*)$", line)
         if m_ann:
             indent, var, rest = m_ann.groups()
-            if "-" in var:
-                clean_var = var.replace("-", "_")
+            clean_var = var.replace("-", "_") if "-" in var else var
+            if clean_var in python_keywords:
+                renamed_kw = f"{clean_var}_field"
+                keyword_renames.append(f"'{clean_var}' -> '{renamed_kw}' [reason: Python reserved keyword used as field name]")
+                clean_var = renamed_kw
+            if clean_var != var:
                 line = f"{indent}{clean_var}{rest}"
         return line
 
     code = "\n".join(fix_line(line_str) for line_str in code.splitlines())
+    if keyword_renames:
+        _log_sanitization_detail(
+            context_label=context_label,
+            class_name="<module>",
+            class_kind="KeywordFieldFix",
+            kept_count=len(keyword_renames),
+            stripped_items=[],
+            collapsed_items=keyword_renames,
+        )
 
     # Strip rogue CJK / non-ASCII character leakage from bilingual models in comments or docstrings
     code = re.sub(r"[\u4e00-\u9fff]+", "", code)
@@ -981,6 +1205,22 @@ def deduplicate_consolidated_classes(code: str, context_label: str = "master_ont
                 if name not in models_by_name:
                     models_by_name[name] = node
                 else:
+                    # If the existing model lacks a docstring and the merged one has a docstring, adopt it
+                    existing_has_doc = (
+                        bool(models_by_name[name].body)
+                        and isinstance(models_by_name[name].body[0], ast.Expr)
+                        and isinstance(models_by_name[name].body[0].value, ast.Constant)
+                        and isinstance(models_by_name[name].body[0].value.value, str)
+                    )
+                    incoming_has_doc = (
+                        bool(node.body)
+                        and isinstance(node.body[0], ast.Expr)
+                        and isinstance(node.body[0].value, ast.Constant)
+                        and isinstance(node.body[0].value.value, str)
+                    )
+                    if not existing_has_doc and incoming_has_doc:
+                        models_by_name[name].body.insert(0, node.body[0])
+
                     existing_fields = {
                         get_assigned_name(stmt)
                         for stmt in models_by_name[name].body
@@ -1741,7 +1981,18 @@ class SynthesisPipeline:
             for _, text_item, theme in selected:
                 theme_groups[theme].append(text_item)
 
-            return dict(theme_groups)
+            # Always place 'Other' last regardless of how many theme groups are included
+            ordered_theme_groups: Dict[str, List[str]] = {}
+            other_entries: List[Tuple[str, List[str]]] = []
+            for th_key, quotes_list in theme_groups.items():
+                if str(th_key).strip().lower() == "other":
+                    other_entries.append((th_key, quotes_list))
+                else:
+                    ordered_theme_groups[th_key] = quotes_list
+            for th_key, quotes_list in other_entries:
+                ordered_theme_groups[th_key] = quotes_list
+
+            return ordered_theme_groups
 
         def format_phase1_payload(
             target_id: Any,
@@ -1756,17 +2007,32 @@ class SynthesisPipeline:
             )
 
             theme_counts = Counter(
-                tr.get("theme_association")
+                str(tr.get("theme_association")).strip()
                 for tr in capped_subset
-                if tr.get("theme_association") and tr.get("theme_association") != "Other"
+                if tr.get("theme_association") and str(tr.get("theme_association")).strip()
             )
-            primary_theme = theme_counts.most_common(1)[0][0] if theme_counts else ""
-            if top_terms and primary_theme:
-                domain_focus = f"{', '.join(top_terms[:3])} (Theme: {primary_theme})"
-            elif top_terms:
-                domain_focus = f"{', '.join(top_terms[:3])}"
-            elif primary_theme:
-                domain_focus = primary_theme
+            # Order themes by frequency descending, and ALWAYS place 'Other' last regardless of how many values are included
+            non_other_themes = [
+                theme_name
+                for theme_name, _ in theme_counts.most_common()
+                if theme_name.lower() != "other"
+            ]
+            other_themes = [
+                "Other" if theme_name.lower() == "other" else theme_name
+                for theme_name, _ in theme_counts.most_common()
+                if theme_name.lower() == "other"
+            ]
+            ordered_focus_themes = non_other_themes + (["Other"] if other_themes else [])
+
+            if not ordered_focus_themes and observations:
+                obs_non_other = [k for k in observations.keys() if str(k).strip().lower() != "other"]
+                obs_other = ["Other"] if any(str(k).strip().lower() == "other" for k in observations.keys()) else []
+                ordered_focus_themes = obs_non_other + obs_other
+
+            if len(ordered_focus_themes) == 1:
+                domain_focus: Union[str, List[str]] = ordered_focus_themes[0]
+            elif len(ordered_focus_themes) > 1:
+                domain_focus = ", ".join(ordered_focus_themes)
             else:
                 domain_focus = f"Community #{target_id}"
 
@@ -1872,10 +2138,9 @@ class SynthesisPipeline:
         # =====================================================================
         print(f"   -> [{path_label}] Phase 2: Global Consolidation...")
 
-        def strip_comments_and_docstrings(code: str) -> str:
-            code = re.sub(r"#.*", "", code)
-            code = re.sub(r'""".*?"""', "", code, flags=re.DOTALL)
-            code = re.sub(r"'''.*?'''", "", code, flags=re.DOTALL)
+        def strip_inline_comments(code: str) -> str:
+            """Strips inline '#' comments and extra blank lines while preserving triple-quoted class docstrings."""
+            code = re.sub(r"(?m)^\s*#.*$", "", code)
             code = re.sub(r"\n\s*\n", "\n", code)
             return code.strip()
 
@@ -1907,7 +2172,7 @@ class SynthesisPipeline:
                 return run_consolidation_single(payload, schema_dir.name)
 
             for f in files_list:
-                f["content"] = strip_comments_and_docstrings(f["content"])
+                f["content"] = strip_inline_comments(f["content"])
             payload = "\n".join([f"--- File: {f['name']} ---\n{f['content']}\n" for f in files_list])
             if estimate_tokens(payload) <= max_payload_tokens:
                 return run_consolidation_single(payload, schema_dir.name)

@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import json
-import logging
 import math
 import os
 from pathlib import Path
@@ -63,7 +62,7 @@ from prismrunner import (
 # GLOBAL CONFIGURATION VARIABLES
 # =============================================================================
 
-# 1. Generative LLM & Embedding Model Settings
+# 1. LLM, Embedding & Hardware Settings
 #    - MODEL_NAME      : Generative Causal LLM used in Step 3 for Taxonomic Hypernym Lifting (e.g., "Qwen/Qwen3.6-27B")
 #    - EMBEDDING_MODEL : SentenceTransformer vector encoder used in Step 2 (SVO clustering) & Step 4 (sentence fidelity)
 #                        (e.g., "all-MiniLM-L6-v2" [384d] or "BAAI/bge-large-en-v1.5" [1024d])
@@ -75,70 +74,25 @@ LOAD_IN_4BIT: bool = False                     # Enable 4-bit NF4 quantization (
 LOAD_IN_8BIT: bool = False                     # Enable 8-bit quantization (CUDA bitsandbytes)
 ATTN_IMPLEMENTATION: str = "auto"              # "auto", "flash_attention_2", "sdpa", or "eager"
 BATCH_SIZE: Union[int, str] = "auto"           # "auto" (continuous device-relative) or explicit int (e.g., 8)
-EMBEDDING_BATCH_SIZE: Union[int, str] = "auto" # "auto" (dynamically sized from device memory) or explicit int (e.g., 128)
 TEMPERATURE: float = 0.0                       # 0.0 for deterministic greedy decoding
 CONSTRAIN_JSON: bool = True                    # Force JSON '{' prefix & bracket-balanced early stopping
 MANAGE_VRAM: bool = True                       # Flush and offload GPU/MPS memory between embedding & LLM steps
 DRY_RUN: bool = False                          # Set True to preview prompts without running LLM generation
 
-# 2. Input / Output Locations & Resume Settings
+# 2. Input / Output & Execution Settings
 INPUT_DIR: str = "outputs/01_extraction"       # Directory containing Stage 1 original_triplets.json & master_themes.json
-OUTPUT_DIR: str = "outputs/02_refinement"      # Stage 2 refinement output directory
-VECTOR_CACHE_DIR: str = "outputs/02_refinement/cache"  # Cache directory for .npy embeddings and _meta.json
-LOG_DIR: str = "outputs/logs"                  # Error logs directory (stage_02_refinement_errors.json)
-PAYLOAD_DIR: str = "outputs/payload_text"      # Exported initial LLM prompt inspection directory
+OUTPUTS_DIR: str = "outputs"                   # Base outputs directory (writes 02_refinement, 02_refinement/cache, logs, payload_text)
+SAVE_LLM_PAYLOADS: bool = True                 # Save initial LLM prompts to outputs/payload_text for inspection
 RESUME_MODE: str = "skip"                      # "skip" (reuse SQLite cache in refinement_state.db) or "overwrite"
 PRINT_CHECKPOINTS: bool = True                 # Print real-time timestamped checkpoint progress to console
+PLOT_TRUSTWORTHINESS: bool = True              # Generate UMAP Trustworthiness (T_k) vs n_components .jpg charts
 
-# 3. Domain, Context & Generation Token Settings
-DOMAIN: str = "auto"                           # "auto" (load master_domain from master_themes.json) or explicit string
+# 3. Context, Token & SVO Taxonomic Lifting Settings
 CONTEXT_WINDOW_CAP: Union[int, str] = "auto"   # "auto" (detect from model config via PrismRunner) or integer token cap
 LIFT_MAX_NEW_TOKENS: int = 256                 # Max generated tokens per TaxonomicVerification JSON response
-
-# 4. SVO Taxonomic Lifting Controls (Stage 2 Hypernym Resolution)
-ENABLE_TAXONOMIC_LIFTING: bool = True          # Master switch for taxonomic lifting pipeline
 LIFT_SUBJECTS: bool = True                     # Abstract entity subjects into canonical hypernyms
 LIFT_PREDICATES: bool = False                  # Abstract relational predicates into canonical hypernyms
 LIFT_OBJECTS: bool = True                      # Abstract entity objects into canonical hypernyms
-
-# 5. Evaluation & Diagnostic Quality Exports
-PRINT_CENTROID_VECTOR: bool = True             # Include L2 Spherical Fréchet Mean vector in *_clusters.json
-PLOT_TRUSTWORTHINESS: bool = True              # Generate UMAP Trustworthiness (T_k) vs n_components .jpg charts
-
-# 6. Dimension-Aware Clustering Calibration Matrix (Tier A <=512d, Tier B <=768d, Tier C >768d)
-CALIBRATION_MATRIX: Dict[str, Dict[str, Any]] = {
-    "low_dim": {
-        "dim_ceiling": 512,
-        "umap_n_neighbors": 20,
-        "umap_min_dist": 0.00,
-        "hdbscan_min_samples": 1,
-        "hdbscan_selection": "eom",
-        "macro_linkage": "average",
-        "entity": {"rescue_tau": 0.32, "tau_macro": 0.48},
-        "predicate": {"rescue_tau": 0.28, "tau_macro": 0.38},
-    },
-    "mid_dim": {
-        "dim_ceiling": 768,
-        "umap_n_neighbors": 15,
-        "umap_min_dist": 0.03,
-        "hdbscan_min_samples": 2,
-        "hdbscan_selection": "eom",
-        "macro_linkage": "average",
-        "entity": {"rescue_tau": 0.26, "tau_macro": 0.36},
-        "predicate": {"rescue_tau": 0.22, "tau_macro": 0.30},
-    },
-    "high_dim": {
-        "umap_n_neighbors": 15,
-        "umap_min_dist": 0.05,
-        "hdbscan_min_samples": 2,
-        "hdbscan_selection": "leaf",
-        "macro_linkage": "complete",
-        "entity": {"rescue_tau": 0.18, "tau_macro": 0.22},
-        "predicate": {"rescue_tau": 0.15, "tau_macro": 0.18},
-    },
-}
-
-logger = logging.getLogger("SemanticPrism2")
 
 
 # =============================================================================
@@ -290,6 +244,32 @@ TAXONOMIC_LIFTING_USER_PROMPT = """Analyze the following cluster of terms and de
 
 {payload_json}"""
 
+PREDICATE_LIFTING_SYSTEM_PROMPT = """You are a Taxonomy and Relational Verb Categorization Expert.
+You will receive a semantic cluster of related relational predicates (verbs/verb phrases) and their top prototypical fallback terms.
+Your task is to identify the lowest common parent relational predicate ("Hypernym") that uniformly encompasses all cluster members.
+
+### FIELD INSTRUCTIONS:
+
+1. `formal_hypernym` (string):
+   - Provide the **Lowest Common Ancestor (LCA)** active relational verb phrase (1 to 3 words, lowercase active verb phrase).
+   - Do NOT nominalize verbs into nouns and do NOT over-generalize into vague verbs like `relates to` or `affects`:
+     * `["administered", "dosed", "prescribed"]` -> `administers` (NOT `Medication Administration` or `affects`)
+     * `["depends on", "relies upon", "requires"]` -> `requires` (NOT `Dependency`)
+     * `["monitored", "tracked", "observed"]` -> `monitors` (NOT `Observation`)
+   - **Centroid Anchoring**: If members are near-synonyms or inflectional variants of the centroid fallbacks, keep the predicate tightly anchored to the active present-tense form of the top fallback.
+
+2. `excluded_opposite` (string):
+   - Name a plausible, distinct relational predicate in the same domain that this cluster strictly is NOT (axiomatic negative boundary).
+
+3. `confidence_score` (float: 0.0 to 1.0):
+   - `0.80 - 1.00`: Cluster members are tightly cohesive and cleanly fit a single relational predicate.
+   - `0.50 - 0.79`: Cluster members are moderately diverse but share a clear relational meaning.
+   - `0.00 - 0.49`: Cluster members are noisy or heterogeneous; relying heavily on centroid fallbacks.
+
+### OUTPUT RULES:
+- Output pure JSON matching the requested schema.
+- Do NOT output schema definitions, markdown explanations, or commentary."""
+
 
 # =============================================================================
 # 3. STAGE 2 PIPELINE CONTEXT & REFINEMENT ORCHESTRATOR
@@ -314,14 +294,17 @@ class RefinementPipeline:
         context: Optional[PipelineRunContext] = None,
         prism_pipeline: Optional[PrismPipeline] = None,
     ):
+        base_out = Path(OUTPUTS_DIR)
         self.in_dir = Path(INPUT_DIR)
-        self.out_dir = Path(OUTPUT_DIR)
-        self.cache_dir = Path(VECTOR_CACHE_DIR)
-        self.log_dir = Path(LOG_DIR)
-        self.payload_dir = Path(PAYLOAD_DIR)
+        self.out_dir = base_out / "02_refinement"
+        self.cache_dir = self.out_dir / "cache"
+        self.log_dir = base_out / "logs"
+        self.payload_dir = base_out / "payload_text"
 
-        for d in (self.out_dir, self.cache_dir, self.log_dir, self.payload_dir):
+        for d in (self.out_dir, self.cache_dir, self.log_dir):
             d.mkdir(parents=True, exist_ok=True)
+        if SAVE_LLM_PAYLOADS:
+            self.payload_dir.mkdir(parents=True, exist_ok=True)
 
         resolved_domain = self._resolve_master_domain()
         self.context = context or PipelineRunContext(master_domain=resolved_domain)
@@ -390,18 +373,17 @@ class RefinementPipeline:
             )
 
     def _resolve_master_domain(self) -> str:
-        """Resolve master_domain from outputs/01_extraction/master_themes.json when DOMAIN == 'auto'."""
-        if DOMAIN and str(DOMAIN).lower().strip() != "auto":
-            return str(DOMAIN).strip()
-        master_path = self.in_dir / "master_themes.json"
-        if master_path.exists():
-            try:
-                data = json.loads(master_path.read_text(encoding="utf-8"))
-                dom = data.get("master_domain")
-                if dom and str(dom).strip():
-                    return str(dom).strip()
-            except Exception:
-                pass
+        """Resolve master_domain from INPUT_DIR/master_themes.json (falling back to 'General Subjects')."""
+        candidates = [self.in_dir / "master_themes.json", REPO_ROOT / self.in_dir / "master_themes.json"]
+        for master_path in candidates:
+            if master_path.exists():
+                try:
+                    data = json.loads(master_path.read_text(encoding="utf-8"))
+                    dom = data.get("master_domain")
+                    if dom and str(dom).strip():
+                        return str(dom).strip()
+                except Exception:
+                    pass
         return "General Subjects"
 
     @staticmethod
@@ -463,7 +445,10 @@ class RefinementPipeline:
             print(f"[Refinement] Failed to write error log: {e}")
 
     def _save_payload_text(self, filename: str, content: str) -> None:
-        """Export initial LLM prompt payload to outputs/payload_text/."""
+        """Export initial LLM prompt payload to outputs/payload_text/ when SAVE_LLM_PAYLOADS is enabled."""
+        if not SAVE_LLM_PAYLOADS:
+            return
+        self.payload_dir.mkdir(parents=True, exist_ok=True)
         target_path = self.payload_dir / filename
         if target_path.exists():
             return
@@ -530,7 +515,7 @@ class RefinementPipeline:
             self._load_embedding_model()
             emb_batch_size = resolve_dynamic_batch_size(
                 device=get_optimal_device(DEVICE),
-                requested_batch_size=EMBEDDING_BATCH_SIZE,
+                requested_batch_size=BATCH_SIZE,
                 items=[{"prompt": t} for t in texts],
             )
             with torch.inference_mode():
@@ -616,40 +601,42 @@ class RefinementPipeline:
     def resolve_clustering_params(embedding_dim: int, component: str = "subject") -> Dict[str, Any]:
         """
         Dynamically resolve clustering hyperparameters based on embedding dimensionality D
-        and component role ('entity' vs 'predicate') from CALIBRATION_MATRIX.
+        and component role ('entity' vs 'predicate').
         """
         is_pred = component.lower() == "predicate"
         if embedding_dim > 768:
-            tier = CALIBRATION_MATRIX.get("high_dim", {})
-            def_neighbors, def_dist, def_samples = 15, 0.05, 2
-            def_selection, def_linkage = "leaf", "complete"
-            def_rescue = 0.15 if is_pred else 0.18
-            def_macro = 0.18 if is_pred else 0.22
+            # High-dimensional embeddings (D > 768, e.g., BAAI/bge-large-en-v1.5 1024d)
+            return {
+                "umap_n_neighbors": 15,
+                "umap_min_dist": 0.05,
+                "hdbscan_min_samples": 2,
+                "hdbscan_selection": "leaf",
+                "macro_linkage": "complete",
+                "rescue_tau": 0.15 if is_pred else 0.18,
+                "tau_macro": 0.18 if is_pred else 0.22,
+            }
         elif embedding_dim > 512:
-            tier = CALIBRATION_MATRIX.get("mid_dim", {})
-            def_neighbors, def_dist, def_samples = 15, 0.03, 2
-            def_selection, def_linkage = "eom", "average"
-            def_rescue = 0.22 if is_pred else 0.26
-            def_macro = 0.30 if is_pred else 0.36
+            # Mid-dimensional embeddings (512 < D <= 768, e.g., all-mpnet-base-v2 768d)
+            return {
+                "umap_n_neighbors": 15,
+                "umap_min_dist": 0.03,
+                "hdbscan_min_samples": 2,
+                "hdbscan_selection": "eom",
+                "macro_linkage": "average",
+                "rescue_tau": 0.22 if is_pred else 0.26,
+                "tau_macro": 0.30 if is_pred else 0.36,
+            }
         else:
-            tier = CALIBRATION_MATRIX.get("low_dim", {})
-            def_neighbors, def_dist, def_samples = 20, 0.00, 1
-            def_selection, def_linkage = "eom", "average"
-            def_rescue = 0.28 if is_pred else 0.32
-            def_macro = 0.38 if is_pred else 0.48
-
-        role_key = "predicate" if is_pred else "entity"
-        role_cfg = tier.get(role_key, {})
-
-        return {
-            "umap_n_neighbors": tier.get("umap_n_neighbors", def_neighbors),
-            "umap_min_dist": tier.get("umap_min_dist", def_dist),
-            "hdbscan_min_samples": tier.get("hdbscan_min_samples", def_samples),
-            "hdbscan_selection": tier.get("hdbscan_selection", def_selection),
-            "macro_linkage": tier.get("macro_linkage", def_linkage),
-            "rescue_tau": role_cfg.get("rescue_tau", def_rescue),
-            "tau_macro": role_cfg.get("tau_macro", def_macro),
-        }
+            # Low-dimensional embeddings (D <= 512, e.g., all-MiniLM-L6-v2 384d)
+            return {
+                "umap_n_neighbors": 20,
+                "umap_min_dist": 0.00,
+                "hdbscan_min_samples": 1,
+                "hdbscan_selection": "eom",
+                "macro_linkage": "average",
+                "rescue_tau": 0.28 if is_pred else 0.32,
+                "tau_macro": 0.38 if is_pred else 0.48,
+            }
 
     @staticmethod
     def compute_spherical_centroid(
@@ -667,6 +654,124 @@ class RefinementPipeline:
         norm = np.linalg.norm(w_sum)
         return w_sum / norm if norm > 0 else w_sum
 
+    @staticmethod
+    def _compute_loo_distances(
+        vecs: np.ndarray,
+        weights: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute the frequency-weighted unit centroid and Leave-One-Out (LOO) cosine distances
+        for each member vector to eliminate self-bias in small or skewed-frequency clusters.
+        """
+        n = len(vecs)
+        w = np.asarray(weights, dtype=np.float64)
+        weighted_vecs = vecs * w[:, None]
+        total_vec = np.sum(weighted_vecs, axis=0)
+        c_norm = np.linalg.norm(total_vec)
+        c_unit = (total_vec / c_norm if c_norm > 0 else total_vec).astype(np.float32)
+
+        if n <= 1:
+            return c_unit, np.zeros(n, dtype=np.float32)
+
+        loo_vecs = total_vec[None, :] - weighted_vecs
+        loo_norms = np.linalg.norm(loo_vecs, axis=1, keepdims=True)
+        valid = loo_norms.squeeze(-1) > 1e-8
+        loo_unit = np.zeros_like(vecs, dtype=np.float32)
+        loo_unit[valid] = (loo_vecs[valid] / loo_norms[valid]).astype(np.float32)
+        loo_unit[~valid] = c_unit
+
+        loo_sims = np.sum(vecs * loo_unit, axis=1)
+        loo_dists = np.clip(1.0 - loo_sims, 0.0, 2.0).astype(np.float32)
+        return c_unit, loo_dists
+
+    @staticmethod
+    def _select_mmr_order(
+        vecs: np.ndarray,
+        loo_distances: np.ndarray,
+        seed_indices: List[int],
+        lambda_param: float = 0.50,
+    ) -> List[int]:
+        """
+        Order cluster member indices via Maximal Marginal Relevance (MMR) starting from
+        seed_indices (top centroid fallbacks) so LLM payloads span both the prototypical
+        core and the diverse semantic boundary of the cluster.
+        """
+        n = len(vecs)
+        if n <= len(seed_indices):
+            return list(range(n))
+
+        centrality = np.clip(1.0 - loo_distances, -1.0, 1.0)
+        selected: List[int] = []
+        remaining: List[int] = list(range(n))
+
+        for s_idx in seed_indices:
+            if 0 <= s_idx < n and s_idx not in selected:
+                selected.append(s_idx)
+                remaining.remove(s_idx)
+
+        sim_matrix = np.clip(np.dot(vecs, vecs.T), -1.0, 1.0)
+        while remaining:
+            rem_arr = np.array(remaining, dtype=int)
+            if not selected:
+                best_pos = int(np.argmax(centrality[rem_arr]))
+            else:
+                sel_arr = np.array(selected, dtype=int)
+                max_sim_to_sel = np.max(sim_matrix[np.ix_(rem_arr, sel_arr)], axis=1)
+                mmr_scores = lambda_param * centrality[rem_arr] - (1.0 - lambda_param) * max_sim_to_sel
+                best_pos = int(np.argmax(mmr_scores))
+            chosen = remaining.pop(best_pos)
+            selected.append(chosen)
+
+        return selected
+
+    @staticmethod
+    def _calibrate_distance_thresholds(
+        embeddings_l2: np.ndarray,
+        prior_rescue: float,
+        prior_macro: float,
+    ) -> Tuple[float, float]:
+        """
+        Self-calibrate outlier rescue_tau and macro-agglomeration tau_macro against the
+        empirical 1-NN and background pairwise cosine distance distribution of the active
+        embedding model (preventing macro-collapse on narrow-cone anisotropic models).
+        """
+        n = int(embeddings_l2.shape[0])
+        if n < 6:
+            return prior_rescue, prior_macro
+
+        sample_n = min(n, 512)
+        if sample_n < n:
+            sample_idx = np.linspace(0, n - 1, sample_n, dtype=int)
+            sample_vecs = embeddings_l2[sample_idx]
+        else:
+            sample_vecs = embeddings_l2
+
+        sim_mat = np.clip(np.dot(sample_vecs, sample_vecs.T), -1.0, 1.0)
+        dist_mat = np.clip(1.0 - sim_mat, 0.0, 2.0)
+
+        # 1-NN distance distribution
+        np.fill_diagonal(dist_mat, np.inf)
+        nn_dists = np.min(dist_mat, axis=1)
+        p15_nn, p35_nn, p60_nn = np.percentile(nn_dists, [15, 35, 60])
+
+        # Background off-diagonal distance distribution
+        triu_idx = np.triu_indices(sample_n, k=1)
+        bg_dists = dist_mat[triu_idx]
+        mu_d = float(np.mean(bg_dists))
+        sigma_d = float(np.std(bg_dists))
+
+        emp_rescue = min(mu_d - 1.0 * sigma_d, float(p35_nn))
+        min_rescue = max(0.04, 0.50 * prior_rescue)
+        max_rescue = max(min_rescue, min(1.35 * prior_rescue, mu_d - 0.75 * sigma_d))
+        eff_rescue = float(np.clip(emp_rescue, min_rescue, max_rescue))
+
+        emp_macro = min(mu_d - 0.65 * sigma_d, float(p60_nn))
+        min_macro = max(eff_rescue * 1.15, 0.50 * prior_macro)
+        max_macro = max(min_macro, min(1.30 * prior_macro, mu_d - 0.50 * sigma_d))
+        eff_macro = float(np.clip(emp_macro, min_macro, max_macro))
+
+        return round(eff_rescue, 4), round(eff_macro, 4)
+
     def _cluster_field(
         self,
         terms_list: List[str],
@@ -683,8 +788,15 @@ class RefinementPipeline:
         term_embeddings_l2 = self.get_or_compute_embeddings(terms_list, label_prefix)
         dim = int(term_embeddings_l2.shape[1])
 
-        # 2. Resolve dimension- and role-aware clustering hyperparameters
+        # 2. Resolve dimension- and role-aware clustering hyperparameters with anisotropy self-calibration
         params = self.resolve_clustering_params(dim, label_prefix)
+        eff_rescue, eff_macro = self._calibrate_distance_thresholds(
+            term_embeddings_l2,
+            params["rescue_tau"],
+            params["tau_macro"],
+        )
+        params["rescue_tau"] = eff_rescue
+        params["tau_macro"] = eff_macro
         weights = np.array([1.0 + math.log(normalized_frequencies.get(t, 1)) for t in terms_list])
 
         # Resolve UMAP and HDBSCAN backends
@@ -721,41 +833,50 @@ class RefinementPipeline:
                     "cluster_number": idx,
                     "centroid_term": t,
                     "members": [t],
+                    "centroid_vector": c_vec.tolist(),
                 }
-                if PRINT_CENTROID_VECTOR:
-                    rec["centroid_vector"] = c_vec.tolist()
                 cluster_records.append(rec)
             return cluster_records, term_embeddings_l2, terms_list
 
-        # 3. Dynamic guardrails for UMAP reduction
-        n_neighbors = min(params["umap_n_neighbors"], max(2, num_terms - 1))
-        n_components = min(5, max(2, num_terms - 2))
+        # 3. Vocabulary-scale-adaptive guardrails for UMAP reduction
+        adaptive_k = int(2 + 2.5 * math.log(max(2, num_terms)))
+        max_local_k = max(3, num_terms // 4) if num_terms >= 12 else max(2, num_terms - 1)
+        n_neighbors = int(min(params["umap_n_neighbors"], max(2, min(adaptive_k, max_local_k, num_terms - 1))))
+        adaptive_comp = int(max(2, min(8, round(math.log(max(4, num_terms))))))
+        n_components = min(adaptive_comp, max(2, num_terms - 2))
         min_dist = params["umap_min_dist"]
         metric = "cosine"
         random_state = 42
 
-        # Optional UMAP Trustworthiness evaluation plot
+        # Optional UMAP Trustworthiness evaluation plot (subsampled at <= 1,000 terms to avoid O(N^2) bottlenecks)
         if PLOT_TRUSTWORTHINESS and umap_mod is not None and trustworthiness is not None and num_terms >= 4:
             try:
                 import matplotlib
                 matplotlib.use("Agg")
                 import matplotlib.pyplot as plt
 
+                if num_terms > 1000:
+                    eval_idx = np.linspace(0, num_terms - 1, 1000, dtype=int)
+                    eval_embeddings = term_embeddings_l2[eval_idx]
+                else:
+                    eval_embeddings = term_embeddings_l2
+                eval_n = int(eval_embeddings.shape[0])
+
                 dim_candidates = [2, 3, 5, 8, 10, 15, 20, 30]
-                valid_dims = sorted(list(set([d for d in dim_candidates if d < num_terms - 1] + [n_components])))
+                valid_dims = sorted(list(set([d for d in dim_candidates if d < eval_n - 1] + [n_components])))
                 trust_scores = []
-                eval_neighbors = min(n_neighbors, max(1, (num_terms // 2) - 1))
+                eval_neighbors = min(n_neighbors, max(1, (eval_n // 2) - 1))
                 for d in valid_dims:
                     reducer_eval = umap_mod.UMAP(
                         n_components=d,
-                        n_neighbors=n_neighbors,
+                        n_neighbors=min(n_neighbors, eval_n - 1),
                         min_dist=min_dist,
                         metric=metric,
                         random_state=random_state,
                         n_jobs=1,
                     )
-                    embedded_eval = reducer_eval.fit_transform(term_embeddings_l2)
-                    score = trustworthiness(term_embeddings_l2, embedded_eval, n_neighbors=eval_neighbors, metric=metric)
+                    embedded_eval = reducer_eval.fit_transform(eval_embeddings)
+                    score = trustworthiness(eval_embeddings, embedded_eval, n_neighbors=eval_neighbors, metric=metric)
                     trust_scores.append(score)
 
                 plt.figure(figsize=(8, 5))
@@ -881,7 +1002,7 @@ class RefinementPipeline:
             final_clusters[next_id] = [s_term]
             next_id += 1
 
-        # 6. Determine Exemplar Terms & Build Output Records
+        # 6. Determine Exemplar Terms (via LOO self-bias correction) & Build Output Records
         cluster_records: List[Dict[str, Any]] = []
         for cid, mems in final_clusters.items():
             m_sorted = sorted(list(set(mems)))
@@ -890,17 +1011,15 @@ class RefinementPipeline:
                 ex_term = m_sorted[0]
             else:
                 m_idx = [term_to_idx[t] for t in m_sorted]
-                c_vec = self.compute_spherical_centroid(m_idx, term_embeddings_l2, weights)
-                dists = 1.0 - np.dot(term_embeddings_l2[m_idx], c_vec)
-                ex_term = m_sorted[int(np.argmin(dists))]
+                c_vec, loo_dists = self._compute_loo_distances(term_embeddings_l2[m_idx], weights[m_idx])
+                ex_term = m_sorted[int(np.argmin(loo_dists))]
 
             rec = {
                 "cluster_number": int(cid),
                 "centroid_term": ex_term,
                 "members": m_sorted,
+                "centroid_vector": c_vec.tolist(),
             }
-            if PRINT_CENTROID_VECTOR:
-                rec["centroid_vector"] = c_vec.tolist()
             cluster_records.append(rec)
 
         cluster_records.sort(key=lambda c: len(c["members"]), reverse=True)
@@ -944,7 +1063,12 @@ class RefinementPipeline:
             return target_map
 
         term_to_idx = {t: i for i, t in enumerate(terms_list)}
-        full_sys_prompt = f"{TAXONOMIC_LIFTING_SYSTEM_PROMPT}\nDomain Context: {self.context.master_domain}"
+        base_sys_prompt = (
+            PREDICATE_LIFTING_SYSTEM_PROMPT
+            if label_prefix.lower() == "predicate"
+            else TAXONOMIC_LIFTING_SYSTEM_PROMPT
+        )
+        full_sys_prompt = f"{base_sys_prompt}\nDomain Context: {self.context.master_domain}"
 
         if not dry_run and self.prism.engine is None:
             self._log_checkpoint(f"Step 3: {label_prefix} Lift", f"Loading LLM '{MODEL_NAME}' onto device...")
@@ -994,9 +1118,10 @@ class RefinementPipeline:
                 target_map[cluster_terms[0]] = cluster_terms[0]
                 continue
 
-            cluster_key = ",".join(sorted(cluster_terms))
+            legacy_key = ",".join(sorted(cluster_terms))
+            cluster_key = f"{self.context.master_domain}::{label_prefix}::{legacy_key}"
             if self.resume:
-                cached_mapped = self._db_get_cached_lift(cluster_key)
+                cached_mapped = self._db_get_cached_lift(cluster_key) or self._db_get_cached_lift(legacy_key)
                 if cached_mapped:
                     print(f"      -> [{label_prefix}] Using cached taxonomic lift for cluster #{label} -> '{cached_mapped}'")
                     for t in original_members:
@@ -1007,21 +1132,26 @@ class RefinementPipeline:
             cluster_vecs = term_embeddings_l2[idx]
             weights = np.array([1.0 + math.log(normalized_frequencies.get(t, 1)) for t in cluster_terms])
 
-            centroid = np.average(cluster_vecs, axis=0, weights=weights)
-            c_norm = np.linalg.norm(centroid)
-            c_unit = centroid / c_norm if c_norm > 0 else centroid
-            distances = 1.0 - np.dot(cluster_vecs, c_unit)
-            closest_indices = np.argsort(distances)[:3]
-            fallback_candidates = [cluster_terms[int(i)] for i in closest_indices]
+            _, loo_distances = self._compute_loo_distances(cluster_vecs, weights)
+            closest_indices = [int(i) for i in np.argsort(loo_distances)[:3]]
+            fallback_candidates = [cluster_terms[i] for i in closest_indices]
+
+            mmr_indices = self._select_mmr_order(
+                cluster_vecs,
+                loo_distances,
+                seed_indices=closest_indices,
+                lambda_param=0.50,
+            )
+            ordered_cluster_terms = [cluster_terms[i] for i in mmr_indices]
 
             payload = {
-                "cluster_terms": cluster_terms,
+                "cluster_terms": ordered_cluster_terms,
                 "top_3_centroid_fallbacks": fallback_candidates,
             }
 
             if _count_tokens(json.dumps(payload)) > max_payload_tokens:
                 trimmed_terms = list(fallback_candidates)
-                for term in cluster_terms:
+                for term in ordered_cluster_terms:
                     if term not in trimmed_terms:
                         test_payload = {
                             "cluster_terms": trimmed_terms + [term],
@@ -1350,10 +1480,10 @@ class RefinementPipeline:
         if object_map is None:
             object_map = {t.object: self._nlp_preprocess(t.object) for t in raw_triples}
 
-        enable_lift = ENABLE_TAXONOMIC_LIFTING
-        lift_subj = LIFT_SUBJECTS if enable_lift else False
-        lift_pred = LIFT_PREDICATES if enable_lift else False
-        lift_obj = LIFT_OBJECTS if enable_lift else False
+        lift_subj = bool(LIFT_SUBJECTS)
+        lift_pred = bool(LIFT_PREDICATES)
+        lift_obj = bool(LIFT_OBJECTS)
+        enable_lift = lift_subj or lift_pred or lift_obj
 
         subj_clusters: List[Dict[str, Any]] = []
         pred_clusters: List[Dict[str, Any]] = []
@@ -1623,7 +1753,7 @@ def main() -> None:
         DRY_RUN = False
 
     pipeline = RefinementPipeline()
-    out_dir = Path(OUTPUT_DIR)
+    out_dir = pipeline.out_dir
 
     if args.fidelity_only:
         run_fidelity_only(pipeline, out_dir)
@@ -1658,7 +1788,7 @@ def main() -> None:
         print("\n" + "=" * 60)
         print("STAGE 2 REFINEMENT PIPELINE COMPLETE!")
         print(f"Total Stage 2 Time: {total_duration:.2f} seconds")
-        print(f"Outputs saved in '{OUTPUT_DIR}':")
+        print(f"Outputs saved in '{out_dir}':")
         print(" - subject_clusters.json")
         print(" - predicate_clusters.json")
         print(" - object_clusters.json")
