@@ -947,7 +947,7 @@ class BatchInferenceEngine:
 
         if curr_rep_penalty is not None:
             gen_kwargs["repetition_penalty"] = curr_rep_penalty
-        elif (temp is None or temp <= 0.0) and curr_max_tokens >= 2048:
+        elif (temp is None or temp <= 0.0) and tokens_to_gen >= 2048:
             # Guard long-form greedy generations against degenerate n-gram repetition loops
             gen_kwargs["repetition_penalty"] = 1.05
 
