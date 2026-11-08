@@ -140,7 +140,8 @@ class GeneratedModule(BaseModel):
     source_code: str = Field(
         description=(
             "The raw Python source code containing the generated Pydantic BaseModels and Enums, including all necessary "
-            "import statements. Every BaseModel class MUST include a descriptive triple-quoted docstring (\"\"\"...\"\"\") "
+            "import statements. Every BaseModel class MUST include a descriptive triple-quoted docstring "
+            "(escaped as \\\"\\\"\\\"...\\\"\\\"\\\" or written as '''...''' inside JSON) "
             f"and have at most {MAX_BASEMODEL_FIELDS_PER_CLASS} fields (decompose sub-entities into separate "
             "models instead of prefix-flattened fields, and use List/Enum fields instead of boolean flag lists). "
             f"Every Enum class MUST have at most {MAX_ENUM_MEMBERS_PER_CLASS} concise atomic members (<= 4 words each)."
@@ -197,7 +198,7 @@ CRITICAL MODELING RULES:
    - If `'Other'` / `OTHER` is included in any `Enum` or `Literal`, ALWAYS place `'Other'` last regardless of how many values are included.
    - NEVER encode full sentences, prepositional clauses, or multi-attribute combinations inside `Enum` values; decompose distinct dimensions into separate `BaseModel` fields.
 4. **Class Docstrings, Field Descriptions & Optionality:**
-   - Every `BaseModel` class MUST begin with a descriptive triple-quoted docstring (`\"\"\"...\"\"\"`) explaining what the model entails and its role in the domain.
+   - Every `BaseModel` class MUST begin with a descriptive triple-quoted docstring (`\"\"\"...\"\"\"`, escaped as `\\\"\\\"\\\"...\\\"\\\"\\\"` or written as `'''...'''` inside the JSON `"source_code"` string) explaining what the model entails and its role in the domain.
    - Declare model attributes using `Field(default=None, description="...")`, providing a concise explanation of the domain meaning derived from `thematic_observations`.
    - Field names MUST be valid Python identifiers in `snake_case` (alphanumeric and underscores only, NEVER hyphens like `field-name`).
 5. **Self-Contained & Valid Imports:** The source code must include all necessary imports:
@@ -250,7 +251,7 @@ TARGET SCHEMA:
 
 REPAIR RULES:
 1. Fix all Python syntax errors, indentation issues, or missing imports (`from pydantic import BaseModel, Field`, `from enum import Enum`, `from typing import ...`).
-2. Ensure every `BaseModel` class includes a descriptive triple-quoted docstring (`\"\"\"...\"\"\"`), all Pydantic fields use valid syntax (`field_name: Optional[Type] = Field(default=None, description="...")`), and each `BaseModel` class has **at most {MAX_BASEMODEL_FIELDS_PER_CLASS} fields** (removing repetitive prefixed sub-fields or boolean flag series).
+2. Ensure every `BaseModel` class includes a descriptive triple-quoted docstring (escaped as `\\\"\\\"\\\"...\\\"\\\"\\\"` or `'''...'''` inside the JSON `"source_code"` string), all Pydantic fields use valid syntax (`field_name: Optional[Type] = Field(default=None, description="...")`), and each `BaseModel` class has **at most {MAX_BASEMODEL_FIELDS_PER_CLASS} fields** (removing repetitive prefixed sub-fields or boolean flag series).
 3. Ensure Enum member names use valid `UPPER_SNAKE_CASE` identifiers, inherit from `(str, Enum)`, and contain **at most {MAX_ENUM_MEMBERS_PER_CLASS} concise atomic members (`<= 4` words / `<= 35` characters each)**, placing `OTHER = "Other"` last if present. Strip any multi-clause phrase Enum members.
 4. ABSOLUTE BAN ON META-MODELS: If the malformed input or code contains meta-models like `class ThemeObservation` or `class GeneratedModule` inside `source_code`, DISCARD them completely. Replace them with substantive domain Pydantic models based on the domain concepts and key terms.
 5. Return pure JSON matching the GeneratedModule schema only. Do NOT output markdown explanations or conversational text."""
@@ -1507,23 +1508,112 @@ class SynthesisPipeline:
             clear_device_memory()
 
     @staticmethod
-    def _extract_generated_module(items: List[Any], fallback_name: str) -> Tuple[Optional[str], Optional[str]]:
-        """Extracts (module_name, cleaned_source_code) from parsed PrismRunner items."""
+    def _salvage_module_from_raw_text(
+        raw_text: str,
+        fallback_name: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Fallback extractor when standard JSON parsing fails on `GeneratedModule` output
+        (e.g., due to unescaped triple-quoted docstrings `\"\"\"...\"\"\"`, unescaped inner quotes,
+        literal newlines inside `"source_code"`, or token truncation at MAX_NEW_TOKENS).
+        """
+        if not raw_text or not raw_text.strip():
+            return None, None
+
+        text = re.sub(r"<think>[\s\S]*?</think>", "", raw_text, flags=re.IGNORECASE).strip()
+        if "</think>" in text.lower():
+            idx = text.lower().rfind("</think>")
+            text = text[idx + len("</think>") :].strip()
+
+        m_mod = re.search(
+            r'"(?:module_name|name|filename|module)"\s*:\s*"([^"\r\n]+)"',
+            text,
+        )
+        mod_name = sanitize_module_name(
+            m_mod.group(1) if m_mod else fallback_name,
+            fallback=fallback_name,
+        )
+
+        raw_code_candidates: List[str] = []
+
+        # 1. Extract value of "source_code": "..." even if inner quotes are unescaped or closing '}' is truncated
+        m_src = re.search(r'"(?:source_code|code|python_code|content)"\s*:\s*"', text)
+        if m_src:
+            body = text[m_src.end() :]
+            # Strip trailing "module_name" field if "source_code" was emitted first
+            body = re.sub(
+                r'",\s*"(?:module_name|name|filename|module)"\s*:\s*"[^"]*"\s*\}?\s*(?:```)?\s*$',
+                "",
+                body,
+                flags=re.DOTALL,
+            )
+            # Strip closing JSON quote + brace
+            body = re.sub(r'"\s*\}\s*(?:```)?\s*$', "", body, flags=re.DOTALL)
+            raw_code_candidates.append(body)
+
+        # 2. Extract fenced ```python ... ``` block or raw Python code if LLM omitted the JSON wrapper
+        m_fence = re.search(r"```python\s*([\s\S]*?)(?:```|$)", text, flags=re.IGNORECASE)
+        if m_fence:
+            raw_code_candidates.append(m_fence.group(1))
+        elif "BaseModel" in text and "class " in text and not m_src:
+            m_py_start = re.search(r"(?m)^(?:from\s+\S+\s+import|import\s+\S+|class\s+\w+)", text)
+            if m_py_start:
+                raw_code_candidates.append(text[m_py_start.start() :])
+
+        for raw_cand in raw_code_candidates:
+            unescaped = (
+                raw_cand.replace('\\"', '"')
+                .replace("\\n", "\n")
+                .replace("\\t", "    ")
+                .replace("\\r", "")
+                .strip()
+            )
+            if not unescaped:
+                continue
+
+            lines = unescaped.splitlines()
+            max_trim = min(25, max(0, len(lines) - 2))
+            for trim in range(max_trim + 1):
+                candidate_slice = "\n".join(lines[: len(lines) - trim]) if trim > 0 else unescaped
+                cleaned = clean_python_code(candidate_slice, context_label=mod_name or fallback_name)
+                if cleaned:
+                    is_valid, _ = validate_python_syntax(cleaned)
+                    if is_valid:
+                        return mod_name, cleaned
+
+        return None, None
+
+    @classmethod
+    def _extract_generated_module(
+        cls,
+        items: List[Any],
+        fallback_name: str,
+        raw_text: str = "",
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Extracts (module_name, cleaned_source_code) from parsed PrismRunner items or salvages from raw_text."""
         for item in items:
             if isinstance(item, GeneratedModule):
                 mod_name = sanitize_module_name(item.module_name, fallback=fallback_name)
                 code = clean_python_code(item.source_code, context_label=mod_name or fallback_name)
                 if code:
-                    return mod_name, code
+                    is_valid, _ = validate_python_syntax(code)
+                    if is_valid:
+                        return mod_name, code
             elif isinstance(item, dict):
                 try:
                     parsed = GeneratedModule.model_validate(item)
                     mod_name = sanitize_module_name(parsed.module_name, fallback=fallback_name)
                     code = clean_python_code(parsed.source_code, context_label=mod_name or fallback_name)
                     if code:
-                        return mod_name, code
+                        is_valid, _ = validate_python_syntax(code)
+                        if is_valid:
+                            return mod_name, code
                 except Exception:
                     pass
+        if raw_text:
+            salvaged_mod, salvaged_code = cls._salvage_module_from_raw_text(raw_text, fallback_name)
+            if salvaged_code:
+                return salvaged_mod, salvaged_code
         return None, None
 
     def _run_module_batch(
@@ -1596,7 +1686,7 @@ class SynthesisPipeline:
             fallback_name = item.get("fallback_module_name", default_module_name)
             p_items = chunk_res.get("parsed_items") or chunk_res.get("extracted_items") or []
             raw_out = str(chunk_res.get("raw_output") or "")
-            mod_name, cleaned_code = self._extract_generated_module(p_items, fallback_name)
+            mod_name, cleaned_code = self._extract_generated_module(p_items, fallback_name, raw_text=raw_out)
 
             with lock:
                 if uid in notified_uids:
@@ -1742,7 +1832,12 @@ class SynthesisPipeline:
             for (idx, item, _, _), rep_res in zip(repair_candidates, repair_results):
                 fallback_name = item.get("fallback_module_name", default_module_name)
                 rep_items = rep_res.get("extracted_items") or rep_res.get("parsed_items") or []
-                mod_name, cleaned_code = self._extract_generated_module(rep_items, fallback_name)
+                rep_raw_out = (rep_res.get("raw_outputs") or [""])[0] if rep_res.get("raw_outputs") else ""
+                mod_name, cleaned_code = self._extract_generated_module(
+                    rep_items,
+                    fallback_name,
+                    raw_text=rep_raw_out,
+                )
                 if cleaned_code:
                     parsed_outputs[idx] = {
                         "id": item["id"],
@@ -1750,7 +1845,7 @@ class SynthesisPipeline:
                         "module_name": mod_name or fallback_name,
                         "source_code": cleaned_code,
                         "error": None,
-                        "raw_text": (rep_res.get("raw_outputs") or [""])[0] if rep_res.get("raw_outputs") else "",
+                        "raw_text": rep_raw_out,
                     }
                     print(f"            -> Reformat successful for {item['id']}!")
                     if on_valid_module_ready is not None:

@@ -651,18 +651,31 @@ def is_json_bracket_balanced(text: str, open_char: str = "[", close_char: str = 
     in_string = False
     escape = False
     started = False
+    n = len(text)
+    i = 0
 
-    for ch in text:
+    while i < n:
+        ch = text[i]
         if escape:
             escape = False
+            i += 1
             continue
         if ch == "\\" and in_string:
             escape = True
+            i += 1
             continue
         if ch == '"':
+            # Guard against unescaped Python triple-quoted docstrings ("""...""") inside a JSON string value
+            if in_string and i + 2 < n and text[i : i + 3] == '"""':
+                after_triple = text[i + 3 :].lstrip()
+                if not after_triple or after_triple[0] not in (",", "}", "]"):
+                    i += 3
+                    continue
             in_string = not in_string
+            i += 1
             continue
         if in_string:
+            i += 1
             continue
 
         if ch == open_char:
@@ -672,6 +685,7 @@ def is_json_bracket_balanced(text: str, open_char: str = "[", close_char: str = 
             depth -= 1
             if depth == 0:
                 return True
+        i += 1
     return False
 
 

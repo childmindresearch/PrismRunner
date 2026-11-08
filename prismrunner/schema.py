@@ -303,7 +303,11 @@ def _strip_markdown_fences(text: str) -> str:
 
 
 def _repair_common_json_glitches(text: str) -> str:
-    return TRAILING_COMMA_PATTERN.sub(r"\1", text)
+    repaired = TRAILING_COMMA_PATTERN.sub(r"\1", text)
+    # Escape unescaped Python triple quotes ("""...""") that LLMs often emit inside JSON string values
+    if '"""' in repaired:
+        repaired = re.sub(r'(?<!\\)"""', r'\"\"\"', repaired)
+    return repaired
 
 
 def _salvage_truncated_json(text: str) -> Optional[Any]:
@@ -367,10 +371,13 @@ def _salvage_truncated_json(text: str) -> Optional[Any]:
 
 def _extract_bracket_substring(text: str) -> Optional[str]:
     first_bracket, last_bracket = text.find("["), text.rfind("]")
+    first_brace, last_brace = text.find("{"), text.rfind("}")
+
+    if first_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
+        if last_brace != -1 and last_brace > first_brace:
+            return text[first_brace : last_brace + 1]
     if first_bracket != -1 and last_bracket != -1 and last_bracket > first_bracket:
         return text[first_bracket : last_bracket + 1]
-
-    first_brace, last_brace = text.find("{"), text.rfind("}")
     if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
         return text[first_brace : last_brace + 1]
     return None
@@ -389,13 +396,11 @@ def sanitize_json_output(raw_text: str) -> Any:
     first_bracket, last_bracket = text.find("["), text.rfind("]")
     first_brace, last_brace = text.find("{"), text.rfind("}")
 
-    if first_bracket != -1 and last_bracket != -1 and last_bracket > first_bracket:
-        if first_brace != -1 and first_brace < first_bracket and last_brace > last_bracket:
+    if first_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
+        if last_brace != -1 and last_brace > first_brace:
             text = text[first_brace : last_brace + 1].strip()
-        else:
-            text = text[first_bracket : last_bracket + 1].strip()
-    elif first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-        text = text[first_brace : last_brace + 1].strip()
+    elif first_bracket != -1 and last_bracket != -1 and last_bracket > first_bracket:
+        text = text[first_bracket : last_bracket + 1].strip()
 
     text = _repair_common_json_glitches(text)
     try:
