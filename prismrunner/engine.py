@@ -7,6 +7,7 @@ import gc
 import logging
 import os
 from pathlib import Path
+import re
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 # Mitigate CUDA caching allocator fragmentation on large 27B-70B models
@@ -645,6 +646,9 @@ def restore_original_order(
     return sorted_recs
 
 
+_TRIPLE_QUOTE_RE = re.compile(r'(?:\\?"){3}')
+
+
 def is_json_bracket_balanced(text: str, open_char: str = "[", close_char: str = "]") -> bool:
     """Check if text contains a complete, balanced top-level JSON array or object (ignoring brackets inside strings)."""
     depth = 0
@@ -660,17 +664,19 @@ def is_json_bracket_balanced(text: str, open_char: str = "[", close_char: str = 
             escape = False
             i += 1
             continue
+        if in_string and ch in ("\\", '"'):
+            # Guard against unescaped or partially escaped Python triple-quoted docstrings (""", \""", \""", etc.)
+            m = _TRIPLE_QUOTE_RE.match(text, i)
+            if m and m.group(0) != r'\"\"\"':
+                after_triple = text[m.end() :].lstrip()
+                if not after_triple or after_triple[0] not in (",", "}", "]", ":"):
+                    i = m.end()
+                    continue
         if ch == "\\" and in_string:
             escape = True
             i += 1
             continue
         if ch == '"':
-            # Guard against unescaped Python triple-quoted docstrings ("""...""") inside a JSON string value
-            if in_string and i + 2 < n and text[i : i + 3] == '"""':
-                after_triple = text[i + 3 :].lstrip()
-                if not after_triple or after_triple[0] not in (",", "}", "]"):
-                    i += 3
-                    continue
             in_string = not in_string
             i += 1
             continue

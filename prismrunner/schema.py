@@ -264,6 +264,7 @@ FENCE_PATTERN = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
 THINK_BLOCK_PATTERN = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
 TRAILING_COMMA_PATTERN = re.compile(r",\s*([\]}])")
 BULLET_PATTERN = re.compile(r"^[-*•]\s+(.*)$|^\d+[\.\)]\s+(.*)$")
+TRIPLE_QUOTE_PATTERN = re.compile(r'(?:\\?"){3}')
 
 
 @dataclass
@@ -304,10 +305,61 @@ def _strip_markdown_fences(text: str) -> str:
 
 def _repair_common_json_glitches(text: str) -> str:
     repaired = TRAILING_COMMA_PATTERN.sub(r"\1", text)
-    # Escape unescaped Python triple quotes ("""...""") that LLMs often emit inside JSON string values
-    if '"""' in repaired:
-        repaired = re.sub(r'(?<!\\)"""', r'\"\"\"', repaired)
-    return repaired
+    out: List[str] = []
+    in_string = False
+    escape = False
+    n = len(repaired)
+    i = 0
+
+    while i < n:
+        ch = repaired[i]
+        if escape:
+            out.append(ch)
+            escape = False
+            i += 1
+            continue
+
+        # Normalize unescaped or partially escaped Python triple-quoted docstrings (""", \""", \""", etc.)
+        # only when already inside a JSON string literal and not closing the JSON string before , } ] :
+        if in_string and ch in ("\\", '"'):
+            m = TRIPLE_QUOTE_PATTERN.match(repaired, i)
+            if m and m.group(0) != r'\"\"\"':
+                after = repaired[m.end() :].lstrip()
+                if not after or after[0] not in (",", "}", "]", ":"):
+                    out.append(r'\"\"\"')
+                    i = m.end()
+                    continue
+
+        if ch == "\\" and in_string:
+            out.append(ch)
+            escape = True
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            i += 1
+            continue
+
+        if in_string:
+            if ch == "\n":
+                out.append("\\n")
+                i += 1
+                continue
+            if ch == "\r":
+                out.append("\\r")
+                i += 1
+                continue
+            if ch == "\t":
+                out.append("\\t")
+                i += 1
+                continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
 
 
 def _salvage_truncated_json(text: str) -> Optional[Any]:
@@ -353,6 +405,8 @@ def _salvage_truncated_json(text: str) -> Optional[Any]:
             elif ch in ("]", "}") and stack and stack[-1] == ch:
                 stack.pop()
 
+        if in_string and escape and fragment.endswith("\\"):
+            fragment = fragment[:-1]
         closed = fragment + ('"' if in_string else "")
         closed = re.sub(r"[,:\s]+$", "", closed)
         closed = _repair_common_json_glitches(closed + "".join(reversed(stack)))
@@ -436,13 +490,20 @@ def parse_raw_text(text: str) -> Any:
                 return json.loads(s)
             except Exception:
                 pass
+        salvaged_slice = _salvage_truncated_json(bracket_slice)
+        if salvaged_slice is not None:
+            return salvaged_slice
+
+    salvaged_full = _salvage_truncated_json(stripped)
+    if salvaged_full is not None:
+        return salvaged_full
 
     jsonl_candidates = []
     for line in stripped.splitlines():
         line = line.strip()
         if (line.startswith("{") and line.endswith("}")) or (line.startswith("[") and line.endswith("]")):
             try:
-                jsonl_candidates.append(json.loads(line))
+                jsonl_candidates.append(json.loads(_repair_common_json_glitches(line)))
             except Exception:
                 continue
     if jsonl_candidates:
@@ -499,13 +560,45 @@ class UniversalOutputParser:
         else:
             candidates = [raw_parsed]
 
+        can_wrap_scalar = (
+            len(model_cls.model_fields) == 1
+            or any(fallback_field in model_cls.model_fields for fallback_field in ("item", "name", "text"))
+        )
+
+        # If parse_raw_text fell back to splitting non-JSON lines on a multi-field schema that cannot wrap scalars,
+        # surface the actual JSON parse error instead of emitting "Expected dict but got str" per line.
+        if (
+            not can_wrap_scalar
+            and isinstance(raw_parsed, list)
+            and raw_parsed
+            and all(isinstance(c, str) and not (c.strip().startswith("{") and c.strip().endswith("}")) for c in raw_parsed)
+        ):
+            salvaged = _salvage_truncated_json(text)
+            if isinstance(salvaged, dict):
+                candidates = [salvaged]
+            elif isinstance(salvaged, list) and any(isinstance(x, dict) for x in salvaged):
+                candidates = salvaged
+            else:
+                json_err_msg = "Failed to parse JSON object from model output"
+                try:
+                    sanitize_json_output(text)
+                except Exception as exc:
+                    json_err_msg = f"JSON parse error: {exc}"
+                return ParseResult(
+                    items=[],
+                    raw_text=text,
+                    success=False,
+                    parsing_strategy="failed_validation",
+                    error=json_err_msg,
+                )
+
         validated_items: List[BaseModel] = []
         errors: List[str] = []
 
         for cand in candidates:
             if isinstance(cand, str) and cand.strip().startswith("{") and cand.strip().endswith("}"):
                 try:
-                    cand = json.loads(cand)
+                    cand = json.loads(_repair_common_json_glitches(cand))
                 except Exception:
                     pass
 
